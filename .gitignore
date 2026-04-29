@@ -4,7 +4,7 @@
 
 # ---- Rust (Client) ----
 /Client/target/
-Cargo.lock           # 本项目作�?binary，Cargo.lock 可以提交；如不需要则取消注释
+Cargo.lock           # 本项目作�?binary，Cargo.lock 可以提交；如不需要则取消注释
 
 # ---- Go (Server) ----
 /server/dist/        # Go embed 打包用的前端产物
@@ -19,19 +19,19 @@ Cargo.lock           # 本项目作�?binary，Cargo.lock 可以提交；如不�
 /server/frontend-v2/auto-imports.d.ts
 /server/frontend-v2/components.d.ts
 
-# ---- 本地数据库（含账�?密码/Agent记录等敏感数据）----
+# ---- 本地数据库（含账�?密码/Agent记录等敏感数据）----
 /server/storage/*.db
 /server/storage/*.db-shm
 /server/storage/*.db-wal
 
-# ---- Storage 运行时目录（含已编译 Payload，勿上传�?---
+# ---- Storage 运行时目录（含已编译 Payload，勿上传�?---
 /server/storage/payloads/
 /server/storage/agent_files/
 /server/storage/logs/
 /server/storage/build_cache/
 /server/storage/public_tools/
 
-# ---- IDE & 编辑�?----
+# ---- IDE & 编辑�?----
 .idea/
 .vscode/
 *.iml
@@ -52,3 +52,6 @@ desktop.ini
 *.p12
 *.pfx
 secrets.*
+
+# ---- Claude Code ----
+.claude/
