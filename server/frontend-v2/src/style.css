@@ -1,0 +1,333 @@
+/* ========================================
+   Cupcake C2 - Premium SaaS Design System
+   ======================================== */
+
+/* CSS Variables for Theme */
+:root {
+  /* Premium White & Purple Palette */
+  --bg-main: #f8fafc;
+  --bg-sidebar: #ffffff;
+  --accent-purple: #7c3aed;
+  --accent-purple-light: rgba(124, 58, 237, 0.1);
+  --accent-purple-dark: #6d28d9;
+  
+  /* Text Colors */
+  --text-title: #1e1b4b;
+  --text-body: #475569;
+  --text-muted: #94a3b8;
+  
+  /* Glassmorphism & Borders */
+  --glass-bg: rgba(255, 255, 255, 0.75);
+  --glass-border: rgba(124, 58, 237, 0.08);
+  --glass-shadow: 0 12px 40px -10px rgba(124, 58, 237, 0.08);
+  
+  --border-subtle: rgba(124, 58, 237, 0.05);
+  
+  /* Radius Tokens - Global Standard */
+  --radius-xl: 32px;
+  --radius-lg: 24px;
+  --radius-md: 16px;
+  --radius-sm: 10px;
+  --radius-xs: 6px;
+  
+  /* Element Plus Overrides Colors */
+  --el-color-primary: #7c3aed !important;
+  --el-color-success: #10b981 !important;
+  --el-border-radius-base: 12px !important;
+  --el-border-radius-small: 8px !important;
+  --el-border-radius-round: 24px !important;
+  --el-menu-bg-color: transparent !important;
+  --el-menu-text-color: #64748b !important;
+  --el-menu-hover-bg-color: rgba(124, 58, 237, 0.05) !important;
+  --el-menu-active-color: #7c3aed !important;
+}
+
+/* Hard override for menu items if variables fail */
+.el-menu-item,
+.el-sub-menu__title {
+  color: #ffffff !important;
+  font-weight: 500;
+}
+
+/* Sidebar Title / Brand Name */
+.sidebar-title,
+.brand-text {
+  color: #ffffff !important;
+  font-weight: bold;
+}
+
+/* ========================================
+   Global Resets & Base Styles
+   ======================================== */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  overflow: hidden;
+}
+
+#app {
+  height: 100vh;
+  width: 100vw;
+}
+
+/* ========================================
+   Element Plus Card Overrides
+   ======================================== */
+.el-card {
+  background-color: var(--bg-secondary);
+  border: none;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  margin-bottom: var(--spacing-lg);
+  overflow: hidden;
+}
+
+.el-card__header {
+  background-color: var(--bg-secondary) !important;
+  border-bottom: 1px solid var(--border-light);
+  padding: var(--spacing-lg) var(--spacing-xl);
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--text-primary);
+}
+
+.el-card__body {
+  padding: var(--spacing-xl);
+}
+
+/* Remove dark card variants */
+.el-card.is-always-shadow,
+.el-card.is-hover-shadow {
+  box-shadow: var(--shadow-md);
+}
+
+/* ========================================
+   Element Plus Table Overrides
+   ======================================== */
+/* Rounded Corners for Table Containers */
+.el-table {
+  background-color: transparent !important;
+  color: #1e1b4b;
+  font-size: 14px;
+  border-radius: var(--radius-md) !important; /* Force rounding on table */
+  overflow: hidden;
+}
+
+.el-table th.el-table__cell {
+  background-color: #f8fafc !important;
+  color: #1e1b4b;
+  font-weight: 800;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  border-bottom: 2px solid rgba(124, 58, 237, 0.05) !important;
+  padding: 16px 12px;
+}
+
+.el-table td.el-table__cell {
+  border-bottom: 1px solid var(--border-light);
+  padding: 16px 12px;
+}
+
+.el-table__body tr:hover>td {
+  background-color: #fafbfc !important;
+}
+
+.el-table__empty-text {
+  color: var(--text-tertiary);
+}
+
+/* Remove default table borders */
+.el-table--border::after,
+.el-table--group::after,
+.el-table::before {
+  background-color: transparent;
+}
+
+.el-table--border .el-table__cell {
+  border-right: none;
+}
+
+/* ========================================
+   Element Plus Button Overrides
+   ======================================== */
+/* Rounded Buttons */
+.el-button {
+  border-radius: var(--radius-sm) !important;
+  font-weight: 800;
+  padding: 10px 22px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  letter-spacing: 0.5px;
+}
+
+.el-button.is-round {
+  border-radius: var(--radius-xl) !important;
+}
+
+/* Rounded Tags */
+.el-tag {
+  border-radius: var(--radius-xs) !important;
+  font-weight: 800;
+  padding: 4px 14px;
+  border: none;
+  font-size: 11px;
+}
+
+.el-tag.is-round {
+  border-radius: var(--radius-xl) !important;
+}
+
+/* Rounded Tooltips & Popovers */
+.el-popper {
+  border-radius: var(--radius-md) !important;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.05) !important;
+  border: 1px solid rgba(124, 58, 237, 0.08) !important;
+}
+
+/* Rounded Inputs */
+.el-input__wrapper, .el-textarea__inner {
+  border-radius: var(--radius-sm) !important;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.el-input__wrapper:hover {
+  box-shadow: 0 0 0 1px var(--accent-primary) inset;
+}
+
+.el-input__wrapper.is-focus {
+  box-shadow: 0 0 0 2px var(--accent-primary) inset;
+}
+
+.el-select .el-input__wrapper {
+  border-radius: var(--radius-md);
+}
+
+.el-form-item__label {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+/* Rounded Dialogs */
+.el-dialog {
+  border-radius: var(--radius-lg) !important;
+  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.1) !important;
+  overflow: hidden;
+}
+
+.el-message-box {
+  border-radius: var(--radius-lg) !important;
+}
+
+.el-dropdown-menu {
+  border-radius: var(--radius-md) !important;
+  padding: 8px !important;
+  border: 1px solid rgba(124, 58, 237, 0.1) !important;
+}
+
+.el-dialog__header {
+  padding: var(--spacing-lg) var(--spacing-xl);
+  border-bottom: 1px solid var(--border-light);
+}
+
+.el-dialog__title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.el-dialog__body {
+  padding: var(--spacing-xl);
+}
+
+.el-dialog__footer {
+  padding: var(--spacing-lg) var(--spacing-xl);
+  border-top: 1px solid var(--border-light);
+}
+
+/* ========================================
+   Element Plus Badge Overrides
+   ======================================== */
+.el-badge__content {
+  border-radius: 10px;
+  font-weight: 600;
+}
+
+/* ========================================
+   Custom Utility Classes
+   ======================================== */
+.card-header-custom {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* .stat-card - 已移至 Dashboard.vue 的 scoped 样式中，全局版本已废弃 */
+
+
+/* ========================================
+   Scrollbar Styling
+   ======================================== */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
+}
+
+/* ========================================
+   Animations
+   ======================================== */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fadeIn 0.3s ease-out;
+}
+
+/* ========================================
+   Responsive Utilities
+   ======================================== */
+@media (max-width: 768px) {
+  .el-card__header {
+    padding: var(--spacing-md) var(--spacing-lg);
+  }
+
+  .el-card__body {
+    padding: var(--spacing-lg);
+  }
+}

@@ -1,0 +1,362 @@
+<template>
+  <div class="tunnel-manager-container">
+    <!-- Header Section -->
+    <div class="page-header glass-panel mb-24">
+      <div class="header-content">
+        <div class="title-section">
+          <h2 class="main-title">全局 <span class="purple-text">隧道路由</span></h2>
+          <p class="sub-title">内网穿透数据转发管理 (Network Routing Control Center)</p>
+        </div>
+        <div class="action-section">
+          <el-button class="premium-btn refresh-btn" :loading="loading" @click="fetchData">
+            <el-icon><Refresh /></el-icon> 刷新状态
+          </el-button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Stats Matrix -->
+    <div class="stats-row mb-24">
+      <div class="stat-module glass-panel">
+        <div class="stat-icon-box blue">
+          <el-icon><Connection /></el-icon>
+        </div>
+        <div class="stat-info">
+          <div class="stat-label">活跃隧道</div>
+          <div class="stat-value">{{ tunnels.filter(t => t.status === 'running').length }}</div>
+        </div>
+      </div>
+      <div class="stat-module glass-panel">
+        <div class="stat-icon-box purple">
+          <el-icon><Share /></el-icon>
+        </div>
+        <div class="stat-info">
+          <div class="stat-label">注册端口数</div>
+          <div class="stat-value">{{ tunnels.length }}</div>
+        </div>
+      </div>
+      <div class="stat-module glass-panel">
+        <div class="stat-icon-box green">
+          <el-icon><User /></el-icon>
+        </div>
+        <div class="stat-info">
+          <div class="stat-label">转发后端</div>
+          <div class="stat-value">{{ Array.from(new Set(tunnels.map(t => t.agent_id))).length }}</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Table Section -->
+    <div class="table-module glass-panel">
+      <el-table :data="tunnels" v-loading="loading" class="premium-table">
+        <el-table-column label="本端侦听 (Local Listener)" width="200">
+          <template #default="scope">
+             <div class="local-addr">
+                <span class="addr-prefix">0.0.0.0:</span><span class="addr-port">{{ scope.row.port }}</span>
+                <el-tag size="small" class="protocol-tag">{{ scope.row.type.toUpperCase() }}</el-tag>
+             </div>
+          </template>
+        </el-table-column>
+        
+        <el-table-column label="隧道出口 (Agent Asset)" min-width="280">
+          <template #default="scope">
+            <div v-if="scope.row.agent_ip" class="agent-trace">
+              <router-link :to="'/client/' + scope.row.agent_id" class="asset-link">
+                <el-icon><Monitor /></el-icon>
+                <span class="asset-ip">{{ scope.row.agent_ip }}</span>
+                <span class="asset-sep">»</span>
+                <span class="asset-name">{{ scope.row.agent_name }}</span>
+              </router-link>
+              <div class="asset-uuid">UUID: {{ scope.row.agent_id.substring(0, 16) }}...</div>
+            </div>
+            <div v-else>
+               <el-tag type="info" class="premium-tag" effect="plain" round>资源暂不可用</el-tag>
+            </div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="身份验证" width="140">
+           <template #default="scope">
+              <div class="auth-status" :class="{ enabled: scope.row.username }">
+                 <el-icon><Lock /></el-icon>
+                 {{ scope.row.username ? '已启用认证' : '匿名访问' }}
+              </div>
+           </template>
+        </el-table-column>
+        
+        <el-table-column label="路由状态" width="120" align="center">
+           <template #default="scope">
+              <div class="status-indicator" :class="scope.row.status">
+                <span class="dot"></span>
+                {{ scope.row.status === 'running' ? '已激活' : '已断开' }}
+              </div>
+           </template>
+        </el-table-column>
+
+        <el-table-column label="管理" width="100" align="center" fixed="right">
+          <template #default="scope">
+            <el-dropdown trigger="click" @command="handleCommand($event, scope.row)">
+              <div class="manage-trigger">
+                <el-icon><Setting /></el-icon>
+              </div>
+              <template #dropdown>
+                <el-dropdown-menu class="premium-dropdown">
+                  <el-dropdown-item command="start" v-if="scope.row.status !== 'running'" icon="VideoPlay" class="item-green">
+                    远程激活
+                  </el-dropdown-item>
+                  <el-dropdown-item command="stop" v-if="scope.row.status === 'running'" icon="VideoPause" class="item-orange">
+                    强制熔断
+                  </el-dropdown-item>
+                  <el-dropdown-item command="edit" icon="Edit" divided>
+                    编辑路由
+                  </el-dropdown-item>
+                  <el-dropdown-item command="delete" icon="Delete" class="item-red">
+                    永久移除
+                  </el-dropdown-item>
+                </el-dropdown-menu>
+              </template>
+            </el-dropdown>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <!-- Edit Dialog -->
+    <el-dialog 
+      :title="isEdit ? '修正隧道路由' : '建立新转发链路'" 
+      v-model="editDialogVisible" 
+      width="480px" 
+      class="premium-dialog"
+      center
+    >
+      <div class="dialog-inner">
+         <el-form label-position="top">
+            <el-row :gutter="20">
+               <el-col :span="24">
+                  <el-form-item label="核心监听端口 (Local Management Port)">
+                    <el-input-number v-model="editForm.port" :min="1" style="width: 100%" controls-position="right" />
+                  </el-form-item>
+               </el-col>
+            </el-row>
+            <el-form-item label="隧道载体协议">
+               <el-radio-group v-model="editForm.type" class="platform-tabs">
+                  <el-radio-button label="socks5">SOCKS5 (PROXY)</el-radio-button>
+                  <el-radio-button label="http">HTTP (PROXY)</el-radio-button>
+               </el-radio-group>
+            </el-form-item>
+
+            <div class="auth-section-box glass-panel">
+               <div class="section-title-line">
+                  <el-switch v-model="editForm.enableAuth" />
+                  <span class="label">ACL 访问控制验证</span>
+               </div>
+               
+               <transition name="fade">
+                  <div v-if="editForm.enableAuth" class="auth-fields mt-15">
+                     <el-row :gutter="15">
+                        <el-col :span="12">
+                           <el-form-item label="用户名">
+                              <el-input v-model="editForm.username" prefix-icon="User" />
+                           </el-form-item>
+                        </el-col>
+                        <el-col :span="12">
+                           <el-form-item label="密码">
+                              <el-input v-model="editForm.password" type="password" show-password prefix-icon="Key" />
+                           </el-form-item>
+                        </el-col>
+                     </el-row>
+                  </div>
+               </transition>
+            </div>
+         </el-form>
+      </div>
+      <template #footer>
+        <div class="dialog-footer">
+          <el-button @click="editDialogVisible = false" class="plain-btn">取消</el-button>
+          <el-button type="primary" class="purple-btn" :loading="submitting" @click="submitEdit">保存并同步核心</el-button>
+        </div>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { ref, reactive, onMounted } from 'vue'
+import { getActiveTunnels, stopTunnel, startTunnel, deleteTunnel } from '@/api/socks'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import { 
+  Refresh, Connection, Share, Monitor, User, Lock, Setting, 
+  VideoPlay, VideoPause, Edit, Delete, Key
+} from '@element-plus/icons-vue'
+
+const tunnels = ref([])
+const loading = ref(false)
+const editDialogVisible = ref(false)
+const submitting = ref(false)
+const isEdit = ref(false)
+const currentAgentId = ref('')
+const oldPort = ref('')
+
+const editForm = reactive({
+    port: 1080,
+    type: 'socks5',
+    enableAuth: false,
+    username: '',
+    password: ''
+})
+
+const fetchData = async () => {
+  loading.value = true
+  try {
+    const res = await getActiveTunnels()
+    tunnels.value = res.data?.tunnels || []
+  } catch (e) { ElMessage.error('无法同步数据') }
+  finally { loading.value = false }
+}
+
+const handleCommand = (command, row) => {
+  if (command === 'start') handleRestart(row)
+  else if (command === 'stop') handleStop(row.port)
+  else if (command === 'delete') handleDelete(row.port)
+  else if (command === 'edit') handleEdit(row)
+}
+
+const handleRestart = async (row) => {
+    try {
+        await startTunnel({
+            uuid: row.agent_id,
+            port: String(row.port),
+            type: row.type,
+            username: row.username || '',
+            password: row.password || ''
+        })
+        ElMessage.success('隧道已重启')
+        fetchData()
+    } catch (e) { ElMessage.error('激活请求被拒绝') }
+}
+
+const handleStop = async (port) => {
+  await stopTunnel({ port })
+  ElMessage.warning('链路已手动熔断')
+  fetchData()
+}
+
+const handleDelete = (port) => {
+  ElMessageBox.confirm('彻底移除该路由配置？', '注销确认', { type: 'error' }).then(async () => {
+    await deleteTunnel({ port })
+    ElMessage.success('已移除')
+    fetchData()
+  })
+}
+
+const handleEdit = (row) => {
+    isEdit.value = true
+    currentAgentId.value = row.agent_id
+    oldPort.value = row.port
+    editForm.port = parseInt(row.port)
+    editForm.type = row.type || 'socks5'
+    editForm.username = row.username || ''
+    editForm.password = row.password || ''
+    editForm.enableAuth = !!editForm.username
+    editDialogVisible.value = true
+}
+
+const submitEdit = async () => {
+    submitting.value = true
+    try {
+        await startTunnel({
+            uuid: currentAgentId.value,
+            port: String(editForm.port),
+            type: editForm.type,
+            username: editForm.enableAuth ? editForm.username : '',
+            password: editForm.enableAuth ? editForm.password : ''
+        })
+        if (String(editForm.port) !== oldPort.value) await deleteTunnel({ port: oldPort.value })
+        ElMessage.success('同步成功')
+        editDialogVisible.value = false
+        fetchData()
+    } catch (e) { ElMessage.error('变更同步失败') }
+    finally { submitting.value = false }
+}
+
+onMounted(fetchData)
+</script>
+
+<style scoped>
+.tunnel-manager-container { padding: 0; animation: slideIn 0.5s ease-out; }
+@keyframes slideIn { from { opacity: 0; transform: scale(0.98); } to { opacity: 1; transform: scale(1); } }
+
+.mb-24 { margin-bottom: 24px; }
+.mt-15 { margin-top: 15px; }
+
+/* Panes */
+.glass-panel {
+  background: rgba(255, 255, 255, 0.75);
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(124, 58, 237, 0.08); border-radius: 24px;
+  box-shadow: 0 10px 30px rgba(124, 58, 237, 0.05);
+}
+
+.page-header { padding: 24px 32px; }
+.header-content { display: flex; justify-content: space-between; align-items: center; }
+.main-title { font-size: 26px; font-weight: 900; color: #1e1b4b; margin: 0; }
+.purple-text { color: #7c3aed; }
+.sub-title { font-size: 13px; color: #94a3b8; font-weight: 600; margin-top: 4px; }
+
+.premium-btn { background: #7c3aed !important; border: none !important; color: white !important; font-weight: 800; border-radius: 12px; height: 42px; padding: 0 20px; transition: all 0.2s; }
+.premium-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 15px rgba(124, 58, 237, 0.3); }
+
+/* Stats Matrix */
+.stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+.stat-module { padding: 20px; display: flex; align-items: center; gap: 16px; }
+.stat-icon-box { width: 48px; height: 48px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 22px; }
+.stat-icon-box.purple { background: rgba(124, 58, 237, 0.1); color: #7c3aed; }
+.stat-icon-box.green { background: rgba(16, 185, 129, 0.1); color: #10b981; }
+.stat-icon-box.blue { background: rgba(14, 165, 233, 0.1); color: #0ea5e9; }
+.stat-label { font-size: 11px; font-weight: 800; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
+.stat-value { font-family: 'JetBrains Mono'; font-size: 26px; font-weight: 800; color: #1e1b4b; }
+
+/* Table */
+.table-module { padding: 12px; }
+.premium-table { background: transparent !important; }
+
+.local-addr { display: flex; align-items: center; gap: 8px; font-family: 'JetBrains Mono'; }
+.addr-prefix { color: #94a3b8; font-weight: 600; }
+.addr-port { color: #1e1b4b; font-weight: 800; font-size: 15px; }
+.protocol-tag { background: #7c3aed !important; border: none !important; color: white !important; font-weight: 900; font-size: 10px; border-radius: 6px; }
+
+.agent-trace { display: flex; flex-direction: column; gap: 4px; }
+.asset-link { text-decoration: none; display: flex; align-items: center; gap: 6px; font-family: 'JetBrains Mono'; font-size: 14px; color: #7c3aed; font-weight: 700; }
+.asset-ip { color: #7c3aed; }
+.asset-sep { color: #cbd5e1; }
+.asset-name { color: #475569; }
+.asset-uuid { font-size: 10px; color: #94a3b8; font-weight: 600; }
+
+.auth-status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #cbd5e1; font-weight: 700; }
+.auth-status.enabled { color: #10b981; }
+
+.status-indicator { display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 800; }
+.status-indicator.running { background: rgba(16, 185, 129, 0.1); color: #059669; }
+.status-indicator.stopped { background: #f1f5f9; color: #94a3b8; }
+.status-indicator.running .dot { width: 6px; height: 6px; background: #10b981; border-radius: 50%; box-shadow: 0 0 8px #10b981; }
+
+.manage-trigger { width: 32px; height: 32px; border-radius: 10px; background: rgba(124, 58, 237, 0.05); color: #7c3aed; display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s; }
+.manage-trigger:hover { background: #7c3aed; color: white; transform: rotate(45deg); }
+
+/* Dialog */
+.platform-tabs { width: 100%; display: flex; }
+:deep(.el-radio-button) { flex: 1; }
+:deep(.el-radio-button__inner) { width: 100%; font-weight: 800; padding: 12px 0; border-radius: 10px !important; }
+
+.auth-section-box { padding: 20px; margin-top: 20px; border: 1px dashed rgba(124, 58, 237, 0.2); }
+.section-title-line { display: flex; align-items: center; gap: 12px; }
+.section-title-line .label { font-size: 13px; font-weight: 800; color: #1e1b4b; }
+
+.dialog-footer { display: flex; justify-content: flex-end; gap: 12px; }
+.plain-btn { border-radius: 10px; font-weight: 700; }
+.purple-btn { background: #7c3aed !important; border: none !important; color: white !important; font-weight: 800; border-radius: 10px; padding: 0 25px; height: 42px; }
+
+/* Dropdown */
+.premium-dropdown { border-radius: 14px !important; border: 1px solid rgba(124, 58, 237, 0.1) !important; padding: 8px !important; }
+.item-green { color: #10b981 !important; } .item-orange { color: #f59e0b !important; } .item-red { color: #ef4444 !important; }
+</style>

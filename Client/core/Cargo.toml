@@ -1,0 +1,66 @@
+[package]
+name = "cupcake-core"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "cupcake_core"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["ws"]  # Default to WebSocket if not specified
+ws = ["dep:tokio-tungstenite", "dep:url"]
+tcp = []  # TCP protocol (uses tokio's built-in TcpStream)
+tcp_bind = [] # TCP Bind protocol (Agent listens for connection)
+dns = ["dep:trust-dns-resolver"]  # DNS 隧道协议实现
+
+[dependencies]
+tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time", "sync", "process"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+tokio-util = { version = "0.7", features = ["codec", "compat"] }
+yamux = "0.10"
+url = { version = "2.5", optional = true }
+trust-dns-resolver = { version = "0.23", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.6", features = ["v4"] }
+sha2 = "0.10"
+thiserror = "1.0"
+log = { version = "0.4", features = ["release_max_level_off"] }
+# env_logger = "0.11" # Moved to dev or removed
+# hostname = "0.3" # Removed for optimization
+# whoami = "1.4" # Removed for optimization
+futures-util = "0.3"
+encoding_rs = "0.8"
+base64 = "0.21"
+async-trait = "0.1"
+aes-gcm = { version = "0.10", features = ["aes", "getrandom"] }
+rand = "0.8"
+
+portable-pty = "0.8"
+# sysinfo = "0.29" # Removed for optimization
+hex = "0.4"
+lazy_static = "1.4"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = [
+    "winnt", "processthreadsapi", "memoryapi", "handleapi", 
+    "errhandlingapi", "winbase", "tlhelp32", "winuser",
+    "oleauto", "combaseapi", "objbase", "unknwnbase",
+    "debugapi", "sysinfoapi", "lmjoin", "lmcons", "lmapibuf",
+    "namedpipeapi", "ioapiset", "synchapi", "fileapi",
+    "threadpoollegacyapiset", "psapi", "securitybaseapi",
+    "wtypes", "winerror", "guiddef", "minwinbase", "heapapi"
+] }
+widestring = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+nix = { version = "0.27", features = ["process", "fs", "user"] }
+
+[dev-dependencies]
+proptest = "1.4"
+mockall = "0.12"
+tempfile = "3.8"
+
+# Release profile optimization moved to workspace root

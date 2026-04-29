@@ -1,0 +1,54 @@
+# ==================================================
+# Cupcake C2 - .gitignore
+# ==================================================
+
+# ---- Rust (Client) ----
+/Client/target/
+Cargo.lock           # 本项目作�?binary，Cargo.lock 可以提交；如不需要则取消注释
+
+# ---- Go (Server) ----
+/server/dist/        # Go embed 打包用的前端产物
+/server/*.exe        # Windows 编译产物
+/server/cupcake-server  # Linux 编译产物
+/server/temp_builds/
+
+# ---- Vue / Node.js (Frontend) ----
+/server/frontend-v2/node_modules/
+/server/frontend-v2/dist/
+/server/frontend-v2/.vite/
+/server/frontend-v2/auto-imports.d.ts
+/server/frontend-v2/components.d.ts
+
+# ---- 本地数据库（含账�?密码/Agent记录等敏感数据）----
+/server/storage/*.db
+/server/storage/*.db-shm
+/server/storage/*.db-wal
+
+# ---- Storage 运行时目录（含已编译 Payload，勿上传�?---
+/server/storage/payloads/
+/server/storage/agent_files/
+/server/storage/logs/
+/server/storage/build_cache/
+/server/storage/public_tools/
+
+# ---- IDE & 编辑�?----
+.idea/
+.vscode/
+*.iml
+
+# ---- 操作系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 日志 ----
+*.log
+*.log.*
+
+# ---- 敏感文件 ----
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets.*

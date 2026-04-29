@@ -1,0 +1,47 @@
+{
+    "intranet-commander": {
+        "type": "domain",
+        "enforcement": "suggest",
+        "priority": "high",
+        "promptTriggers": {
+            "keywords": [
+                "内网渗透",
+                "提权",
+                "域渗透",
+                "Docker提权",
+                "K8s",
+                "kubernetes",
+                "横向移动",
+                "域控",
+                "commander",
+                "指挥官",
+                "MCP",
+                "自动化指挥",
+                "工具调用"
+            ],
+            "intentPatterns": [
+                "(获取|提升)权限",
+                "渗透(进入|到)内网",
+                "docker.*?逃逸",
+                "域.*?攻击",
+                "调用.*?MCP"
+            ]
+        }
+    },
+    "safety-guardrail": {
+        "type": "guardrail",
+        "enforcement": "block",
+        "priority": "critical",
+        "promptTriggers": {
+            "intentPatterns": [
+                "(删除|清空|drop|delete|truncate|remove).*?(数据库|database|数据表|table)",
+                "(删除|损毁|format|destroy).*?(系统文件|驱动|操作系统|windows|linux|关键信息)",
+                "rm\\s+-rf\\s+/",
+                "del\\s+/s\\s+/f\\s+C:\\\\Windows",
+                "drop\\s+database",
+                "truncate\\s+table"
+            ]
+        },
+        "blockMessage": "【指挥官警告】：该操作具有破坏性（删库或损毁系统），违反了『业务连续性第一』的核心准则。操作已被拦截。请重新制定非侵入式的渗透方案。"
+    }
+}
