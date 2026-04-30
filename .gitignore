@@ -55,3 +55,4 @@ secrets.*
 
 # ---- Claude Code ----
 .claude/
+.worktrees/
