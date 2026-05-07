@@ -62,15 +62,6 @@
       destroy-on-close
       center
     >
-      <el-alert
-        v-if="!isEdit"
-        title="功能说明"
-        type="info"
-        :closable="false"
-        show-icon
-        description="在服务端 启动一个监听端口，将流量透明转发至该终端所在的内网环境。适用于内网渗透、扫描等场景。"
-        style="margin-bottom: 20px;"
-      />
 
       <el-form label-position="top">
         <el-form-item label="服务端监听端口">
@@ -325,7 +316,7 @@ onMounted(() => {
 .addr-code {
   background: rgba(64, 158, 255, 0.1);
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: 10px;
   color: var(--primary-color);
   font-family: 'JetBrains Mono', monospace;
   border: 1px solid rgba(64, 158, 255, 0.2);
@@ -345,8 +336,23 @@ onMounted(() => {
 .auth-box {
   background-color: rgba(0, 0, 0, 0.05);
   padding: 15px;
-  border-radius: 4px;
+  border-radius: 14px;
   border: 1px dashed rgba(64, 158, 255, 0.3);
   margin-bottom: 20px;
+}
+
+@media (max-width: 820px) {
+  .card-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .card-header > div:last-child {
+    display: flex;
+    gap: 10px;
+    justify-content: flex-start;
+    flex-wrap: wrap;
+  }
 }
 </style>

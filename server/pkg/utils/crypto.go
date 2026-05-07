@@ -142,5 +142,18 @@ func DeobfuscatePacket(data []byte, mode string, key []byte) []byte {
 func randInt(min, max int) int {
 	b := make([]byte, 1)
 	_, _ = rand.Read(b)
-	return int(b[0])%(max-min) + min
+	return int(b[0]) % (max - min) + min
+}
+
+// RandomAlphaString generates a cryptographically random alphabetic string of given length.
+func RandomAlphaString(length int) (string, error) {
+	charset := "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	result := make([]byte, length)
+	if _, err := rand.Read(result); err != nil {
+		return "", err
+	}
+	for i, b := range result {
+		result[i] = charset[int(b)%len(charset)]
+	}
+	return string(result), nil
 }

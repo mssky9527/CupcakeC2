@@ -2,6 +2,8 @@ package services
 
 import (
 	"bufio"
+	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/utils"
 	"fmt"
 	"io"
 	"os"
@@ -10,7 +12,6 @@ import (
 	"runtime"
 	"strings"
 	"github.com/google/uuid"
-	"cupcake-server/pkg/store"
 )
 
 const (
@@ -239,7 +240,8 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 
 	ext := ""
 	if conf.OSType == "windows" { ext = ".exe" }
-	finalPath := filepath.Join(ArtifactDir, fmt.Sprintf("agent_%s_%s%s", conf.Arch, buildID[:8], ext))
+	randSuffix, _ := utils.RandomAlphaString(8)
+	finalPath := filepath.Join(ArtifactDir, fmt.Sprintf("agent_%s_%s%s", conf.Arch, randSuffix, ext))
 
 
 	if logChan != nil { logChan <- "[Builder] 正在对本地 Loader 执行配置补丁..." }

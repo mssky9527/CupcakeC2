@@ -1,22 +1,26 @@
 <template>
   <div class="plugin-manager">
-    <!-- Header with Stats -->
-    <div class="header-banner">
-      <div class="banner-stat">
-        <el-icon><Tools /></el-icon>
-        <div class="stat-info">
-          <span class="label">可用插件</span>
-          <span class="value">{{ plugins.length }}</span>
+    <section class="stat-grid">
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
+          <el-icon><Tools /></el-icon>
         </div>
-      </div>
-      <div class="banner-stat active">
-        <el-icon><Monitor /></el-icon>
-        <div class="stat-info">
-          <span class="label">正在执行</span>
-          <span class="value">{{ runningTasks.length }}</span>
+        <div>
+          <span class="stat-card__label">可用插件</span>
+          <div class="stat-card__value">{{ plugins.length }}</div>
         </div>
-      </div>
-    </div>
+      </article>
+
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
+          <el-icon><Monitor /></el-icon>
+        </div>
+        <div>
+          <span class="stat-card__label">正在执行</span>
+          <div class="stat-card__value">{{ runningTasks.length }}</div>
+        </div>
+      </article>
+    </section>
 
     <el-row :gutter="20">
       <!-- Left: Plugin List -->
@@ -442,4 +446,29 @@ onMounted(() => {
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+@media (max-width: 960px) {
+  :deep(.el-row) {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  :deep(.el-col) {
+    max-width: 100%;
+    width: 100%;
+    flex: 0 0 100%;
+  }
+
+  .card-header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 12px;
+  }
+
+  .search-input {
+    width: 100%;
+  }
+}
+
 </style>

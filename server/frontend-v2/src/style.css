@@ -1,333 +1,517 @@
-/* ========================================
-   Cupcake C2 - Premium SaaS Design System
-   ======================================== */
-
-/* CSS Variables for Theme */
-:root {
-  /* Premium White & Purple Palette */
-  --bg-main: #f8fafc;
+﻿:root {
+  color-scheme: light;
+  font-family: "Bahnschrift", "Segoe UI Variable Display", "Trebuchet MS", sans-serif;
+  --bg-canvas: #ffffff;
+  --bg-elevated: rgba(255, 255, 255, 0.96);
+  --bg-panel: #ffffff;
+  --bg-panel-strong: #ffffff;
   --bg-sidebar: #ffffff;
-  --accent-purple: #7c3aed;
-  --accent-purple-light: rgba(124, 58, 237, 0.1);
-  --accent-purple-dark: #6d28d9;
-  
-  /* Text Colors */
-  --text-title: #1e1b4b;
-  --text-body: #475569;
-  --text-muted: #94a3b8;
-  
-  /* Glassmorphism & Borders */
-  --glass-bg: rgba(255, 255, 255, 0.75);
-  --glass-border: rgba(124, 58, 237, 0.08);
-  --glass-shadow: 0 12px 40px -10px rgba(124, 58, 237, 0.08);
-  
-  --border-subtle: rgba(124, 58, 237, 0.05);
-  
-  /* Radius Tokens - Global Standard */
-  --radius-xl: 32px;
-  --radius-lg: 24px;
-  --radius-md: 16px;
-  --radius-sm: 10px;
-  --radius-xs: 6px;
-  
-  /* Element Plus Overrides Colors */
-  --el-color-primary: #7c3aed !important;
-  --el-color-success: #10b981 !important;
-  --el-border-radius-base: 12px !important;
-  --el-border-radius-small: 8px !important;
-  --el-border-radius-round: 24px !important;
-  --el-menu-bg-color: transparent !important;
-  --el-menu-text-color: #64748b !important;
-  --el-menu-hover-bg-color: rgba(124, 58, 237, 0.05) !important;
-  --el-menu-active-color: #7c3aed !important;
+  --bg-sidebar-soft: rgba(17, 17, 17, 0.04);
+  --text-strong: #111111;
+  --text-body: #3d3d3d;
+  --text-muted: #767676;
+  --text-inverse: #111111;
+  --line-soft: rgba(17, 17, 17, 0.08);
+  --line-strong: rgba(17, 17, 17, 0.14);
+  --accent: #111111;
+  --accent-strong: #000000;
+  --accent-soft: rgba(17, 17, 17, 0.06);
+  --accent-focus: rgba(17, 17, 17, 0.08);
+  --success: #111111;
+  --danger: #111111;
+  --surface-soft: #fafafa;
+  --surface-muted: #f5f5f5;
+  --surface-subtle: #f4f4f4;
+  --line-muted: #e8e8e8;
+  --line-control: #dfdfdf;
+  --terminal-bg: #000000;
+  --terminal-surface: #111111;
+  --terminal-fg: #f2f2f2;
+  --terminal-cursor: #ffffff;
+  --shadow-soft: 0 20px 48px rgba(17, 17, 17, 0.05);
+  --shadow-panel: 0 14px 32px rgba(17, 17, 17, 0.04);
+  --radius-xs: 10px;
+  --radius-sm: 14px;
+  --radius-md: 20px;
+  --radius-lg: 28px;
+  --radius-xl: 40px;
+  --space-1: 8px;
+  --space-2: 12px;
+  --space-3: 16px;
+  --space-4: 20px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --el-color-primary: var(--accent);
+  --el-color-success: var(--success);
+  --el-color-warning: #111111;
+  --el-color-danger: var(--danger);
+  --el-border-radius-base: var(--radius-sm);
+  --el-border-radius-small: var(--radius-xs);
+  --el-border-radius-round: 999px;
+  --el-bg-color: var(--bg-panel-strong);
+  --el-fill-color-blank: var(--bg-panel-strong);
+  --el-border-color: var(--line-soft);
+  --el-text-color-primary: var(--text-strong);
+  --el-text-color-regular: var(--text-body);
+  --el-text-color-secondary: var(--text-muted);
+  --el-box-shadow-light: var(--shadow-soft);
 }
 
-/* Hard override for menu items if variables fail */
-.el-menu-item,
-.el-sub-menu__title {
-  color: #ffffff !important;
-  font-weight: 500;
-}
-
-/* Sidebar Title / Brand Name */
-.sidebar-title,
-.brand-text {
-  color: #ffffff !important;
-  font-weight: bold;
-}
-
-/* ========================================
-   Global Resets & Base Styles
-   ======================================== */
 * {
   box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
+}
+
+html,
+body {
   margin: 0;
-  padding: 0;
 }
 
 body {
-  margin: 0;
-  padding: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif;
+  overflow: hidden;
+  color: var(--text-strong);
+  font-family: var(--font-family, "Bahnschrift", "Segoe UI Variable Display", "Trebuchet MS", sans-serif);
+  background: linear-gradient(180deg, #ffffff 0%, #fbfbfb 100%);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  background-color: var(--bg-primary);
-  color: var(--text-primary);
-  overflow: hidden;
+}
+
+a {
+  color: inherit;
 }
 
 #app {
-  height: 100vh;
-  width: 100vw;
+  isolation: isolate;
 }
 
-/* ========================================
-   Element Plus Card Overrides
-   ======================================== */
-.el-card {
-  background-color: var(--bg-secondary);
-  border: none;
+.surface-card,
+.glass-panel,
+.module {
+  background: var(--bg-elevated);
+  border: 1px solid var(--line-soft);
   border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-md);
-  margin-bottom: var(--spacing-lg);
-  overflow: hidden;
+  box-shadow: var(--shadow-panel);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
 }
 
-.el-card__header {
-  background-color: var(--bg-secondary) !important;
-  border-bottom: 1px solid var(--border-light);
-  padding: var(--spacing-lg) var(--spacing-xl);
-  font-weight: 600;
-  font-size: 16px;
-  color: var(--text-primary);
+.surface-card--soft {
+  background: rgba(255, 255, 255, 0.62);
 }
 
-.el-card__body {
-  padding: var(--spacing-xl);
+.view-shell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-2);
+  min-height: 100%;
 }
 
-/* Remove dark card variants */
-.el-card.is-always-shadow,
-.el-card.is-hover-shadow {
-  box-shadow: var(--shadow-md);
+.view-hero {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-6);
 }
 
-/* ========================================
-   Element Plus Table Overrides
-   ======================================== */
-/* Rounded Corners for Table Containers */
-.el-table {
-  background-color: transparent !important;
-  color: #1e1b4b;
-  font-size: 14px;
-  border-radius: var(--radius-md) !important; /* Force rounding on table */
-  overflow: hidden;
+.view-hero__copy {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
-.el-table th.el-table__cell {
-  background-color: #f8fafc !important;
-  color: #1e1b4b;
-  font-weight: 800;
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.8px;
-  border-bottom: 2px solid rgba(124, 58, 237, 0.05) !important;
-  padding: 16px 12px;
-}
-
-.el-table td.el-table__cell {
-  border-bottom: 1px solid var(--border-light);
-  padding: 16px 12px;
-}
-
-.el-table__body tr:hover>td {
-  background-color: #fafbfc !important;
-}
-
-.el-table__empty-text {
-  color: var(--text-tertiary);
-}
-
-/* Remove default table borders */
-.el-table--border::after,
-.el-table--group::after,
-.el-table::before {
-  background-color: transparent;
-}
-
-.el-table--border .el-table__cell {
-  border-right: none;
-}
-
-/* ========================================
-   Element Plus Button Overrides
-   ======================================== */
-/* Rounded Buttons */
-.el-button {
-  border-radius: var(--radius-sm) !important;
-  font-weight: 800;
-  padding: 10px 22px;
-  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-  letter-spacing: 0.5px;
-}
-
-.el-button.is-round {
-  border-radius: var(--radius-xl) !important;
-}
-
-/* Rounded Tags */
-.el-tag {
-  border-radius: var(--radius-xs) !important;
-  font-weight: 800;
-  padding: 4px 14px;
-  border: none;
+.view-hero__eyebrow {
   font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--accent-strong);
+  font-weight: 700;
 }
 
-.el-tag.is-round {
-  border-radius: var(--radius-xl) !important;
+.view-hero__title {
+  margin: 0;
+  font-size: clamp(28px, 4vw, 42px);
+  line-height: 1;
+  letter-spacing: -0.04em;
 }
 
-/* Rounded Tooltips & Popovers */
-.el-popper {
-  border-radius: var(--radius-md) !important;
-  box-shadow: 0 10px 25px rgba(0,0,0,0.05) !important;
-  border: 1px solid rgba(124, 58, 237, 0.08) !important;
+.view-hero__subtitle {
+  max-width: 680px;
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-body);
 }
 
-/* Rounded Inputs */
-.el-input__wrapper, .el-textarea__inner {
-  border-radius: var(--radius-sm) !important;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+.view-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
 }
 
-.el-input__wrapper:hover {
-  box-shadow: 0 0 0 1px var(--accent-primary) inset;
+.view-actions--between {
+  justify-content: space-between;
 }
 
-.el-input__wrapper.is-focus {
-  box-shadow: 0 0 0 2px var(--accent-primary) inset;
-}
-
-.el-select .el-input__wrapper {
-  border-radius: var(--radius-md);
-}
-
-.el-form-item__label {
-  color: var(--text-secondary);
-  font-weight: 500;
-}
-
-/* Rounded Dialogs */
-.el-dialog {
-  border-radius: var(--radius-lg) !important;
-  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.1) !important;
-  overflow: hidden;
-}
-
-.el-message-box {
-  border-radius: var(--radius-lg) !important;
-}
-
-.el-dropdown-menu {
-  border-radius: var(--radius-md) !important;
-  padding: 8px !important;
-  border: 1px solid rgba(124, 58, 237, 0.1) !important;
-}
-
-.el-dialog__header {
-  padding: var(--spacing-lg) var(--spacing-xl);
-  border-bottom: 1px solid var(--border-light);
-}
-
-.el-dialog__title {
+.view-actions__copy h3 {
+  margin: 4px 0 0;
   font-size: 18px;
-  font-weight: 600;
-  color: var(--text-primary);
+  font-weight: 700;
+  color: var(--text-strong);
 }
 
-.el-dialog__body {
-  padding: var(--spacing-xl);
+.page-header {
+  padding: 16px 22px;
+  border-radius: 22px;
 }
 
-.el-dialog__footer {
-  padding: var(--spacing-lg) var(--spacing-xl);
-  border-top: 1px solid var(--border-light);
-}
-
-/* ========================================
-   Element Plus Badge Overrides
-   ======================================== */
-.el-badge__content {
-  border-radius: 10px;
-  font-weight: 600;
-}
-
-/* ========================================
-   Custom Utility Classes
-   ======================================== */
-.card-header-custom {
+.header-content {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--text-primary);
+  gap: 16px;
 }
 
-/* .stat-card - 已移至 Dashboard.vue 的 scoped 样式中，全局版本已废弃 */
+.main-title {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.2;
+  font-weight: 800;
+  color: var(--text-strong);
+}
 
+.sub-title {
+  margin: 4px 0 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
 
-/* ========================================
-   Scrollbar Styling
-   ======================================== */
-::-webkit-scrollbar {
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+}
+
+.stat-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 84px;
+  padding: 16px 20px;
+}
+
+.stat-card__icon {
+  flex: 0 0 42px;
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 14px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-size: 18px;
+}
+
+.stat-card__label {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--text-muted);
+}
+
+.stat-card__value {
+  margin-top: 6px;
+  font-size: 26px;
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+
+.section-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.panel-head--tight {
+  margin-bottom: 12px;
+}
+
+.panel-kicker {
+  display: inline-block;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--accent-strong);
+}
+
+.panel-head h3 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.04em;
+  color: var(--text-strong);
+}
+
+.chip,
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid var(--line-soft);
+  color: var(--text-body);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.status-pill::before {
+  content: "";
   width: 8px;
   height: 8px;
+  border-radius: 999px;
+  background: var(--success);
+  box-shadow: 0 0 0 6px rgba(36, 115, 92, 0.12);
+}
+
+.table-shell {
+  padding: var(--space-4);
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+.mono {
+  font-family: "Consolas", "SFMono-Regular", monospace;
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.purple-text {
+  color: var(--accent-strong) !important;
+}
+
+.premium-btn,
+.purple-btn {
+  border-radius: 999px !important;
+  font-weight: 700;
+}
+
+.premium-dialog :is(.el-dialog, .el-message-box) {
+  border-radius: var(--radius-lg) !important;
+}
+
+.premium-table {
+  width: 100%;
+  min-width: 760px;
+}
+
+.mb-24 {
+  margin-bottom: 24px;
+}
+
+.mt-20 {
+  margin-top: 20px;
+}
+
+.el-button {
+  height: 42px;
+  padding: 0 18px;
+  border-radius: 999px !important;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  transition: transform 0.16s ease, box-shadow 0.16s ease, border-color 0.16s ease;
+}
+
+.el-button:hover {
+  transform: translateY(-1px);
+}
+
+.el-button--primary {
+  box-shadow: none;
+}
+
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper,
+.el-select .el-input__wrapper {
+  min-height: 44px;
+  border-radius: 16px !important;
+  box-shadow: none !important;
+  background: rgba(255, 255, 255, 0.92) !important;
+  border: 1px solid transparent;
+}
+
+.el-input__wrapper.is-focus,
+.el-select__wrapper.is-focused {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 4px rgba(17, 17, 17, 0.08) !important;
+}
+
+.el-card,
+.el-dialog,
+.el-message-box,
+.el-dropdown-menu,
+.el-popper,
+.el-table,
+.el-table__inner-wrapper,
+.el-tabs__nav-wrap {
+  border-radius: var(--radius-md);
+}
+
+.el-dialog,
+.el-message-box,
+.el-dropdown-menu,
+.el-popper {
+  border: 1px solid var(--line-soft) !important;
+  box-shadow: var(--shadow-soft) !important;
+}
+
+.el-form-item__label {
+  font-weight: 700;
+  color: var(--text-body);
+}
+
+.el-table {
+  background: transparent !important;
+  color: var(--text-strong) !important;
+}
+
+.el-table th.el-table__cell {
+  background: #fafafa !important;
+  color: var(--text-muted) !important;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  border-bottom: 1px solid var(--line-soft) !important;
+}
+
+.el-table td.el-table__cell {
+  background: transparent !important;
+  border-bottom: 1px solid rgba(66, 48, 31, 0.06) !important;
+}
+
+.el-table__body tr:hover > td.el-table__cell {
+  background: rgba(255, 255, 255, 0.72) !important;
+}
+
+.el-table::before,
+.el-table--border::after,
+.el-table--group::after {
+  display: none;
+}
+
+.el-menu {
+  border-right: none !important;
+  background: transparent !important;
+}
+
+.el-tag {
+  border-radius: 999px !important;
+  font-weight: 700;
+}
+
+.el-progress-bar__outer {
+  background: rgba(17, 17, 17, 0.08) !important;
+}
+
+@media (max-width: 1100px) {
+  .stat-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .header-content {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .panel-head {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .view-actions {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 820px) {
+  .table-shell {
+    padding: 14px;
+  }
+
+  .premium-table {
+    min-width: 680px;
+  }
+
+  .panel-head h3 {
+    font-size: 20px;
+  }
+
+  .chip,
+  .status-pill {
+    padding: 7px 12px;
+    font-size: 11px;
+  }
+
+  .el-button {
+    height: 40px;
+    padding: 0 16px;
+  }
+}
+
+@media (max-width: 640px) {
+  .view-shell {
+    gap: 18px;
+    padding: 10px;
+  }
+
+  .panel-head h3 {
+    font-size: 18px;
+  }
+
+  .premium-table {
+    min-width: 620px;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #f1f1f1;
-  border-radius: 4px;
+  background: rgba(17, 17, 17, 0.05);
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #c1c1c1;
-  border-radius: 4px;
+  background: rgba(17, 17, 17, 0.18);
+  border-radius: 999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #a8a8a8;
+  background: rgba(17, 17, 17, 0.28);
 }
 
-/* ========================================
-   Animations
-   ======================================== */
-@keyframes fadeIn {
-  from {
-    opacity: 0;
-    transform: translateY(10px);
-  }
-
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.fade-in {
-  animation: fadeIn 0.3s ease-out;
-}
-
-/* ========================================
-   Responsive Utilities
-   ======================================== */
-@media (max-width: 768px) {
-  .el-card__header {
-    padding: var(--spacing-md) var(--spacing-lg);
-  }
-
-  .el-card__body {
-    padding: var(--spacing-lg);
-  }
-}

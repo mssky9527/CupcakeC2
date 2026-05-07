@@ -3,6 +3,7 @@ package controllers
 import (
 	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/hub"
+	"cupcake-server/pkg/utils"
 	"cupcake-server/services"
 	"encoding/base64"
 	"fmt"
@@ -143,11 +144,12 @@ func HandleGenerate(c *gin.Context) {
 			return
 		}
 
-		filename := fmt.Sprintf("agent_%s_%s", req.Arch, uuid.New().String()[:8])
+		randSuffix, _ := utils.RandomAlphaString(8)
+		filename := fmt.Sprintf("agent_%s_%s", req.Arch, randSuffix)
 		if req.OS == "windows" {
 			filename += ".exe"
 		}
-		
+
 		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 		c.Data(http.StatusOK, "application/octet-stream", patched)
 		return
