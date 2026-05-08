@@ -289,6 +289,7 @@ impl WindowsMemoryLoader {
             ]);
 
             if status_alloc < 0 || remote_base == 0 {
+                println!("[!] NtAllocateVirtualMemory FAILED: 0x{:X}", status_alloc as u32);
                 return MigrationStatus::InjectionFailed(format!("ALLOC:0x{:X}", status_alloc as u32));
             }
 
@@ -305,6 +306,7 @@ impl WindowsMemoryLoader {
             ]);
 
             if status_write < 0 {
+                println!("[!] NtWriteVirtualMemory FAILED: 0x{:X}", status_write as u32);
                 return MigrationStatus::InjectionFailed(format!("WRITE:0x{:X}", status_write as u32));
             }
 
@@ -323,6 +325,7 @@ impl WindowsMemoryLoader {
             ]);
 
             if status_protect < 0 {
+                println!("[!] NtProtectVirtualMemory FAILED: 0x{:X}", status_protect as u32);
                 return MigrationStatus::InjectionFailed(format!("PROT:0x{:X}", status_protect as u32));
             }
 
@@ -344,6 +347,7 @@ impl WindowsMemoryLoader {
             }
 
             if status_thread < 0 {
+                println!("[!] NtCreateThreadEx FAILED: 0x{:X}", status_thread as u32);
                 return MigrationStatus::InjectionFailed(format!("THR:0x{:X}", status_thread as u32));
             }
 

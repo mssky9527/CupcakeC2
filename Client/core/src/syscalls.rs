@@ -68,6 +68,7 @@ unsafe fn resolve_all_ssns() -> BTreeMap<u32, u16> {
         }
     }
 
+    println!("[!] Syscall resolution complete. Resolved {} functions.", map.len());
     crate::utils::db_print(&format!("[Cupcake] Resolved {} syscalls via enhanced patterns.", map.len()));
     map
 }

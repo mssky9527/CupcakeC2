@@ -59,7 +59,8 @@ func StreamPTY(c *gin.Context) {
 			stream.Close()
 			return
 		}
-		time.Sleep(50 * time.Millisecond)
+		// 🛡️ [Hardening] Brief pause to ensure Agent's multi-threaded dispatcher captures the byte
+		time.Sleep(150 * time.Millisecond)
 
 		sess = &globals.PTYSession{Stream: stream}
 		globals.ActivePTYSessions.Store(uuidStr, sess)

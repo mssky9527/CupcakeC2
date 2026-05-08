@@ -60,6 +60,8 @@ impl Transport for TcpBindTransport {
         match listener.accept().await {
             Ok((stream, _peer_addr)) => {
                 let mut yamux_config = Config::default();
+                yamux_config.set_max_buffer_size(100 * 1024 * 1024); // 100MB
+                yamux_config.set_receive_window(100 * 1024 * 1024); // 100MB
                 yamux_config.set_window_update_mode(WindowUpdateMode::OnRead);
                 
                 let compat_stream = stream.compat();

