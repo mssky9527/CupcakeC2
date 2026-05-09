@@ -1,277 +1,288 @@
-<template>
-  <div class="dashboard-wrapper">
-    <div class="commander-layout">
-      
-      <!-- Top Status Bar -->
-      <div class="module command-status-bar">
-        <div class="status-left">
-          <div class="control-logo">
-            <el-icon><MagicStick /></el-icon>
-            <span class="logo-text">CUPCAKE <span class="v-tag">控制中枢 V4</span></span>
+﻿<template>
+  <div class="view-shell dashboard-shell">
+    <section class="dashboard-grid">
+      <article class="surface-card topology-card">
+        <div class="panel-head">
+          <div>
+            <span class="panel-kicker">网络拓扑</span>
+            <h3>节点拓扑与活动连接</h3>
           </div>
-          <div class="divider"></div>
-          <div class="meta-slot">
-            <span class="s-label">基础设施状态</span>
-            <span class="s-val">系统运行正常</span>
-          </div>
-          <div class="meta-slot">
-            <span class="s-label">网络延时</span>
-            <span class="s-val purple-glow">{{ realLatency }} 毫秒</span>
-          </div>
+          <div class="chip">力导向布局</div>
         </div>
-        <div class="status-right">
-          <div class="clock-display">
-            <span class="date-part">{{ currentDate }}</span>
-            <span class="time-part">{{ currentTime }}</span>
-          </div>
+        <div class="topology-box">
+          <v-chart class="chart-box" :option="topologyOption" autoresize />
         </div>
+      </article>
+
+      <div class="section-stack dashboard-side">
+        <article class="surface-card side-card">
+          <div class="panel-head panel-head--tight">
+            <div>
+              <span class="panel-kicker">系统分布</span>
+              <h3>端点平台分布</h3>
+            </div>
+          </div>
+          <div class="donut-wrap">
+            <v-chart :option="osOption" autoresize />
+          </div>
+          <div class="os-legend">
+            <div class="os-legend-item">
+              <span class="os-dot" style="background:#111111"></span>
+              <span>Windows</span>
+              <strong>{{ osCounts.windows }}</strong>
+            </div>
+            <div class="os-legend-item">
+              <span class="os-dot" style="background:#8c8c8c"></span>
+              <span>Linux</span>
+              <strong>{{ osCounts.linux }}</strong>
+            </div>
+          </div>
+        </article>
+
+        <article class="surface-card side-card">
+          <div class="panel-head panel-head--tight">
+            <div>
+              <span class="panel-kicker">健康状态</span>
+              <h3>主机资源压力</h3>
+            </div>
+          </div>
+
+          <div class="meter-stack">
+            <div class="meter-row">
+              <div class="meter-copy">
+                <span>CPU 负载</span>
+                <strong>{{ stats.cpu_usage }}%</strong>
+              </div>
+              <el-progress :percentage="parseFloat(stats.cpu_usage) || 0" :show-text="false" color="#111111" :stroke-width="8" />
+            </div>
+
+            <div class="meter-row">
+              <div class="meter-copy">
+                <span>内存使用率</span>
+                <strong>{{ stats.mem_usage }}%</strong>
+              </div>
+              <el-progress :percentage="parseFloat(stats.mem_usage) || 0" :show-text="false" color="#6a6a6a" :stroke-width="8" />
+            </div>
+          </div>
+        </article>
       </div>
-
-      <div class="main-deck">
-        <!-- Center: Strategic Topology Map -->
-        <div class="module glass-panel topology-deck">
-          <div class="deck-header">
-            <div class="h-title">
-              <el-icon class="purple-text"><Aim /></el-icon>
-              <span>内网战役拓扑节点图</span>
-            </div>
-            <div class="scan-tag">
-              <span class="scan-line"></span>
-              实时扫描中
-            </div>
-          </div>
-          <div class="topology-container">
-            <v-chart class="chart-box" :option="topologyOption" autoresize />
-          </div>
-        </div>
-
-        <!-- Right: Tactical Intelligence Sidebar -->
-        <div class="tactical-sidebar">
-          
-          <div class="module glass-panel intel-card">
-            <div class="i-label">在线受控端</div>
-            <div class="i-body">
-              <span class="i-val">{{ stats.online_count }}</span>
-              <div class="spark-box">
-                <v-chart :option="miniSparkOption('#7c3aed', histories.agents)" autoresize />
-              </div>
-            </div>
-          </div>
-
-          <div class="module glass-panel intel-card highlighting">
-            <div class="i-label">活跃监听器</div>
-            <div class="i-body">
-              <span class="i-val">{{ stats.listener_count }}</span>
-              <div class="spark-box">
-                <v-chart :option="miniSparkOption('#06b6d4', histories.listeners)" autoresize />
-              </div>
-            </div>
-          </div>
-
-          <div class="module glass-panel os-donut-card">
-            <div class="i-label">操作系统分布</div>
-            <div class="donut-box">
-              <v-chart :option="osOption" autoresize />
-            </div>
-          </div>
-
-          <div class="module glass-panel system-health-box">
-            <div class="i-label">核心系统负载</div>
-            <div class="health-meters">
-              <div class="meter-item">
-                <div class="m-info"><span>CPU</span> <span>{{ stats.cpu_usage }}%</span></div>
-                <el-progress :percentage="parseFloat(stats.cpu_usage) || 0" :show-text="false" color="#7c3aed" stroke-width="6" />
-                <div class="mini-trend">
-                   <v-chart :option="miniSparkOption('#7c3aed', histories.cpu, 20)" autoresize style="height: 20px" />
-                </div>
-              </div>
-              <div class="meter-item">
-                <div class="m-info"><span>内存占用</span> <span>{{ stats.mem_usage }}%</span></div>
-                <el-progress :percentage="parseFloat(stats.mem_usage) || 0" :show-text="false" color="#fb7185" stroke-width="6" />
-                <div class="mini-trend">
-                   <v-chart :option="miniSparkOption('#fb7185', histories.mem, 20)" autoresize style="height: 20px" />
-                </div>
-              </div>
-            </div>
-          </div>
-
-        </div>
-      </div>
-
-    </div>
+    </section>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import api from '../api/index'
-import { 
-  Monitor, Headset, Cpu, MagicStick, 
-  Share, Connection, Aim, Histogram
+import {
+  Connection,
+  Headset,
+  Monitor
 } from '@element-plus/icons-vue'
 
-// Echarts Core & Components
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
-import { LineChart, PieChart, GraphChart } from 'echarts/charts'
-import {
+import { GraphChart, PieChart } from 'echarts/charts'
+import { GridComponent, LegendComponent, TitleComponent, TooltipComponent } from 'echarts/components'
+import VChart from 'vue-echarts'
+
+use([
+  CanvasRenderer,
+  PieChart,
+  GraphChart,
   TitleComponent,
   TooltipComponent,
   GridComponent,
   LegendComponent
-} from 'echarts/components'
-import VChart from 'vue-echarts'
-
-use([
-  CanvasRenderer, LineChart, PieChart, GraphChart,
-  TitleComponent, TooltipComponent, GridComponent, LegendComponent
 ])
 
 const stats = ref({
-  cpu_usage: "0.0", mem_usage: "0.0", disk_usage: "0.0",
-  uptime: 0, listener_count: 0, client_count: 0,
-  online_count: 0, active_ports: [], locations: []
+  cpu_usage: '0.0',
+  mem_usage: '0.0',
+  disk_usage: '0.0',
+  uptime: 0,
+  listener_count: 0,
+  client_count: 0,
+  online_count: 0,
+  active_ports: [],
+  locations: []
 })
 
 const histories = ref({
-  cpu: [], mem: [], agents: [], listeners: []
+  cpu: [],
+  mem: [],
+  agents: [],
+  listeners: []
 })
+
 const realLatency = ref(0)
-
-
-// Clock Logic
 const currentTime = ref('00:00:00')
 const currentDate = ref('')
+
+const summaryCards = computed(() => [
+  {
+    label: 'Online agents',
+    value: stats.value.online_count,
+    icon: Monitor,
+    bg: 'rgba(17, 17, 17, 0.06)',
+    color: '#111111'
+  },
+  {
+    label: 'Active listeners',
+    value: stats.value.listener_count,
+    icon: Headset,
+    bg: 'rgba(17, 17, 17, 0.08)',
+    color: '#111111'
+  },
+  {
+    label: 'Published routes',
+    value: (stats.value.active_ports || []).length,
+    icon: Connection,
+    bg: 'rgba(31, 25, 20, 0.09)',
+    color: '#1f1914'
+  }
+])
+
 const updateTime = () => {
   const now = new Date()
-  currentTime.value = now.toLocaleTimeString('zh-CN', { hour12: false })
-  currentDate.value = now.toLocaleDateString('zh-CN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+  currentTime.value = now.toLocaleTimeString('en-GB', { hour12: false })
+  currentDate.value = now.toLocaleDateString('en-GB', {
+    weekday: 'short',
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric'
+  })
 }
 
-// Mini Sparkline Generator
-const miniSparkOption = (color, data, height = 40) => ({
-  backgroundColor: 'transparent',
-  grid: { top: 2, bottom: 2, left: 0, right: 0 },
-  xAxis: { type: 'category', show: false },
-  yAxis: { type: 'value', show: false, min: 'dataMin', max: 'dataMax' },
-  series: [{
-    type: 'line', smooth: true, symbol: 'none',
-    data: data && data.length > 0 ? data : [0, 0, 0],
-    lineStyle: { color: color, width: 2 },
-    areaStyle: { 
-      color: {
-        type: 'linear', x: 0, y: 0, x2: 0, y2: 1,
-        colorStops: [{ offset: 0, color: color }, { offset: 1, color: 'transparent' }]
-      },
-      opacity: 0.1 
+const osCounts = computed(() => {
+  const meta = { windows: 0, linux: 0 }
+  const locations = stats.value.locations || []
+  locations.forEach((agent) => {
+    const os = (agent.os || '').toLowerCase()
+    if (os.includes('win')) {
+      meta.windows += 1
+    } else {
+      meta.linux += 1
     }
-  }]
+  })
+  return meta
 })
 
-// OS Distribution Ring
 const osOption = computed(() => {
-  const meta = { win: 0, lin: 0 }
-  const locations = stats.value.locations || []
-  locations.forEach(a => {
-    const os = (a.os || '').toLowerCase()
-    if (os.includes('win')) meta.win++
-    else meta.lin++
-  })
+  const counts = osCounts.value
+  const total = counts.windows + counts.linux
+
+  const data = total > 0
+    ? [
+        { value: counts.windows, name: `Windows (${counts.windows})`, itemStyle: { color: '#111111' } },
+        { value: counts.linux, name: `Linux (${counts.linux})`, itemStyle: { color: '#8c8c8c' } }
+      ].filter(d => d.value > 0)
+    : [
+        { value: 1, name: '暂无端点', itemStyle: { color: '#e0e0e0' } }
+      ]
 
   return {
     backgroundColor: 'transparent',
-    tooltip: { trigger: 'item' },
-    series: [{
-      type: 'pie', radius: ['65%', '90%'], center: ['50%', '50%'],
-      itemStyle: { borderRadius: 4, borderColor: '#fff', borderWidth: 2 },
-      label: { show: false },
-      data: [
-        { value: meta.win || 1, name: 'Windows', itemStyle: { color: '#7c3aed' } },
-        { value: meta.lin || 1, name: 'Linux', itemStyle: { color: '#06b6d4' } },
-      ]
-    }]
+    tooltip: { trigger: 'item', formatter: total > 0 ? '{b}: {c} ({d}%)' : '' },
+    series: [
+      {
+        type: 'pie',
+        radius: ['62%', '88%'],
+        center: ['50%', '50%'],
+        label: { show: false },
+        itemStyle: { borderColor: '#ffffff', borderWidth: 3 },
+        data
+      }
+    ]
   }
 })
 
-// Strategic Topology Mapping (Powered by Real Data)
 const topologyOption = computed(() => {
   const nodes = [
-    { 
-      name: 'NEXUS_HUB', x: 500, y: 300, fixed: true, 
-      symbol: 'rect', symbolSize: [130, 40], 
-      itemStyle: { color: '#1e1b4b', borderRadius: 8 }, 
-      label: { show: true, color: '#fff', formatter: '控制中枢', fontWeight: 'bold' } 
+    {
+      name: 'Control Hub',
+      x: 500,
+      y: 300,
+      fixed: true,
+      symbol: 'roundRect',
+      symbolSize: [150, 46],
+      itemStyle: { color: '#111111', borderRadius: 12 },
+      label: { show: true, color: '#ffffff', formatter: 'Control Hub', fontWeight: 'bold' }
     }
   ]
+
   const links = []
-  
-  // 1. Add Listeners
   const activePorts = stats.value.active_ports || []
-  activePorts.forEach((port, idx) => {
-    const lName = `LSTN:${port}`
-    nodes.push({ 
-      name: lName, symbol: 'roundRect', symbolSize: [90, 32], 
-      itemStyle: { color: '#7c3aed', shadowBlur: 10, shadowColor: '#7c3aed66' },
-      label: { show: true, color: '#fff', fontSize: 10, formatter: `端口 ${port}` }
+
+  activePorts.forEach((port) => {
+    const listenerName = `Listener ${port}`
+    nodes.push({
+      name: listenerName,
+      symbol: 'roundRect',
+      symbolSize: [104, 34],
+      itemStyle: { color: '#3a3a3a', shadowBlur: 0, shadowColor: 'transparent' },
+      label: { show: true, color: '#ffffff', fontSize: 10, formatter: `Port ${port}` }
     })
-    links.push({ source: 'NEXUS_HUB', target: lName })
+    links.push({ source: 'Control Hub', target: listenerName })
   })
 
-  // 2. Add Real Agents (Live + Historical)
   const locations = stats.value.locations || []
   locations.forEach((agent) => {
-    const isOnline = agent.status === 'active' || agent.status === 'online'
-    const aLabel = `${agent.name}\n${agent.ip}`
-    
-    nodes.push({ 
-      name: agent.uuid, 
-      symbol: 'circle', 
-      symbolSize: isOnline ? 22 : 16, 
-      itemStyle: { 
-        color: isOnline ? '#fff' : 'rgba(255,255,255,0.05)', 
-        borderColor: isOnline ? '#7c3aed' : '#94a3b8', 
+    const online = agent.status === 'active' || agent.status === 'online'
+    const label = `${agent.name || 'Agent'}\n${agent.ip || 'unknown'}`
+    nodes.push({
+      name: agent.uuid,
+      symbol: 'circle',
+      symbolSize: online ? 22 : 16,
+      itemStyle: {
+        color: online ? '#fffaf2' : 'rgba(255, 250, 242, 0.38)',
+        borderColor: online ? '#111111' : '#9a9a9a',
         borderWidth: 2,
-        opacity: isOnline ? 1 : 0.4
+        opacity: online ? 1 : 0.65
       },
-      label: { 
-        show: true, position: 'bottom', 
-        color: isOnline ? '#1e1b4b' : '#94a3b8', 
-        fontSize: 10, 
-        formatter: aLabel,
-        backgroundColor: isOnline ? 'rgba(255,255,255,0.8)' : 'transparent',
-        padding: [2, 4],
+      label: {
+        show: true,
+        position: 'bottom',
+        color: online ? '#1f1914' : '#85786a',
+        fontSize: 10,
+        formatter: label,
+        backgroundColor: online ? 'rgba(255, 255, 255, 0.82)' : 'transparent',
+        padding: [2, 5],
         borderRadius: 4
       }
     })
 
-    // Logic: Connect to the first listener if exists, else HUB
-    const parent = activePorts.length > 0 ? `LSTN:${activePorts[0]}` : 'NEXUS_HUB'
-    links.push({ 
-      source: parent, 
+    const parent = activePorts.length > 0 ? `Listener ${activePorts[0]}` : 'Control Hub'
+    links.push({
+      source: parent,
       target: agent.uuid,
-      lineStyle: { type: isOnline ? 'solid' : 'dashed', opacity: isOnline ? 0.3 : 0.1 }
+      lineStyle: { type: online ? 'solid' : 'dashed', opacity: online ? 0.45 : 0.18 }
     })
   })
 
   return {
     backgroundColor: 'transparent',
-    tooltip: { 
+    tooltip: {
       trigger: 'item',
       formatter: (params) => {
         if (params.dataType === 'node') {
-          return `<b>主机:</b> ${params.data.name}<br/><b>IP:</b> ${params.data.ip || '---'}`
+          return `<b>${params.data.name}</b><br/>IP: ${params.data.ip || 'n/a'}`
         }
         return ''
       }
     },
-    series: [{
-      type: 'graph', layout: 'force',
-      data: nodes, links: links,
-      force: { repulsion: 600, edgeLength: 160, gravity: 0.1 },
-      lineStyle: { color: '#7c3aed', width: 2, curveness: 0.1 },
-      roam: true, draggable: true,
-      emphasis: { focus: 'adjacency', lineStyle: { width: 4, opacity: 0.8 } }
-    }]
+    series: [
+      {
+        type: 'graph',
+        layout: 'force',
+        data: nodes,
+        links,
+        force: { repulsion: 620, edgeLength: 160, gravity: 0.08 },
+      lineStyle: { color: '#111111', width: 2, curveness: 0.08 },
+        roam: true,
+        draggable: true,
+        emphasis: { focus: 'adjacency', lineStyle: { width: 4, opacity: 0.82 } }
+      }
+    ]
   }
 })
 
@@ -281,18 +292,18 @@ const fetchStats = async () => {
     const res = await api.get('/api/dashboard')
     stats.value = res.data
     realLatency.value = Date.now() - start
-    
-    // Record History Samples
-    const pushSample = (key, val) => {
-      histories.value[key].push(val)
-      if (histories.value[key].length > 30) histories.value[key].shift()
-    }
-    
-    pushSample('cpu', parseFloat(stats.value.cpu_usage))
-    pushSample('mem', parseFloat(stats.value.mem_usage))
-    pushSample('agents', stats.value.online_count)
-    pushSample('listeners', stats.value.listener_count)
 
+    const pushSample = (key, value) => {
+      histories.value[key].push(value)
+      if (histories.value[key].length > 30) {
+        histories.value[key].shift()
+      }
+    }
+
+    pushSample('cpu', parseFloat(stats.value.cpu_usage) || 0)
+    pushSample('mem', parseFloat(stats.value.mem_usage) || 0)
+    pushSample('agents', stats.value.online_count || 0)
+    pushSample('listeners', stats.value.listener_count || 0)
   } catch (e) {
     console.error('API Error:', e)
   }
@@ -315,130 +326,130 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
-.dashboard-wrapper {
-  padding: 15px;
-  height: 100%;
-  animation: slideUp 0.6s cubic-bezier(0.23, 1, 0.32, 1);
-}
-
-@keyframes slideUp {
-  from { opacity: 0; transform: translateY(30px); }
-  to { opacity: 1; transform: translateY(0); }
-}
-
-.commander-layout {
-  display: flex;
-  flex-direction: column;
+.dashboard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.9fr);
   gap: 20px;
-  max-width: 1700px;
-  margin: 0 auto;
+  min-height: 620px;
 }
 
-/* Status Bar */
-.command-status-bar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 25px;
-  background: white;
-  border-radius: 16px;
-  box-shadow: 0 4px 20px rgba(0,0,0,0.03);
+.dashboard-hero {
+  background:
+    radial-gradient(circle at top right, rgba(17, 17, 17, 0.05), transparent 26%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(250, 250, 250, 0.96));
 }
 
-.status-left { display: flex; align-items: center; gap: 24px; }
-.control-logo { display: flex; align-items: center; gap: 10px; }
-.control-logo .el-icon { font-size: 20px; color: #7c3aed; }
-.logo-text { font-weight: 900; color: #1e1b4b; font-size: 15px; }
-.v-tag { color: #7c3aed; font-size: 11px; opacity: 0.8; }
-
-.divider { width: 1px; height: 16px; background: rgba(0,0,0,0.1); }
-.meta-slot { display: flex; flex-direction: column; }
-.s-label { font-size: 8px; font-weight: 900; color: #cbd5e1; letter-spacing: 0.5px; }
-.s-val { font-size: 11px; font-weight: 800; color: #1e1b4b; }
-.purple-glow { color: #7c3aed; text-shadow: 0 0 8px rgba(124, 58, 237, 0.3); }
-
-.clock-display { 
-  display: flex; flex-direction: column; align-items: flex-end; 
-  font-family: 'JetBrains Mono', monospace; 
-}
-.date-part { font-size: 9px; font-weight: 700; color: #94a3b8; }
-.time-part { font-size: 22px; font-weight: 800; color: #1e1b4b; line-height: 1; }
-
-.main-deck {
-  display: flex;
-  gap: 20px;
+.panel-head--tight {
+  margin-bottom: 10px;
 }
 
-/* Topology Deck */
-.topology-deck {
-  flex: 1;
-  height: 720px;
-  padding: 0 !important;
-  background: white !important;
-  position: relative;
-  overflow: hidden;
-  border: 1px solid rgba(124,58,237,0.05);
-}
-
-.topology-deck::before {
-  content: ''; position: absolute; inset: 0;
-  background-image: 
-    linear-gradient(rgba(124,58,237,0.03) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(124,58,237,0.03) 1px, transparent 1px);
-  background-size: 40px 40px;
-}
-
-.deck-header {
-  position: absolute; top: 20px; left: 25px; right: 25px;
-  display: flex; justify-content: space-between; align-items: center;
-  z-index: 10; pointer-events: none;
-}
-.h-title { display: flex; align-items: center; gap: 10px; font-weight: 900; color: #1e1b4b; font-size: 13px; }
-.scan-tag {
-  font-size: 9px; font-weight: 900; color: #22c55e;
-  border: 1px solid rgba(34, 197, 94, 0.2);
-  padding: 4px 10px; border-radius: 6px; background: rgba(34, 197, 94, 0.05);
-  display: flex; align-items: center; gap: 8px;
-}
-.scan-line { width: 6px; height: 6px; background: #22c55e; border-radius: 50%; box-shadow: 0 0 8px #22c55e; animation: blink 1.2s infinite; }
-@keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-
-.topology-container { width: 100%; height: 100%; }
-
-/* Tactical Sidebar */
-.tactical-sidebar {
-  width: 320px;
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-}
-
-.glass-panel {
-  background: rgba(255, 255, 255, 0.85);
-  backdrop-filter: blur(20px);
-  border: 1px solid rgba(124, 58, 237, 0.08);
-  border-radius: 20px;
+.topology-card,
+.side-card {
   padding: 24px;
 }
 
-.intel-card { position: relative; }
-.i-label { font-size: 9px; font-weight: 900; color: #94a3b8; letter-spacing: 1.2px; margin-bottom: 8px; }
-.i-body { display: flex; align-items: flex-end; justify-content: space-between; }
-.i-val { font-family: 'JetBrains Mono'; font-size: 42px; font-weight: 900; color: #1e1b4b; line-height: 1; letter-spacing: -2px; }
-.spark-box { width: 100px; height: 40px; opacity: 0.6; }
+.topology-box {
+  height: 540px;
+}
 
-.os-donut-card { height: 200px; }
-.donut-box { height: 160px; width: 100%; margin-top: -10px; }
+.chart-box,
+.donut-wrap :deep(canvas),
+.meter-spark :deep(canvas) {
+  width: 100%;
+  height: 100%;
+}
 
-.health-meters { display: flex; flex-direction: column; gap: 18px; margin-top: 5px; }
-.meter-item { display: flex; flex-direction: column; gap: 6px; }
-.m-info { display: flex; justify-content: space-between; font-size: 10px; font-weight: 900; color: #64748b; }
-.mini-trend { height: 20px; margin-top: 4px; opacity: 0.4; }
+.dashboard-side {
+  min-width: 0;
+}
 
-@media (max-width: 1400px) {
-  .main-deck { flex-direction: column; }
-  .topology-deck { height: 500px; }
-  .tactical-sidebar { width: 100%; flex-direction: row; }
-  .intel-card, .os-donut-card, .system-health-box { flex: 1; height: auto; }
+.donut-wrap {
+  height: 280px;
+}
+
+.meter-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.meter-row {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.meter-copy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.meter-copy span {
+  color: var(--text-body);
+  font-size: 13px;
+}
+
+.meter-copy strong {
+  font-size: 16px;
+  letter-spacing: -0.03em;
+}
+
+.meter-spark {
+  height: 28px;
+}
+
+.os-legend {
+  display: flex;
+  justify-content: center;
+  gap: 24px;
+  margin-top: 12px;
+}
+
+.os-legend-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-body);
+}
+
+.os-legend-item strong {
+  font-size: 15px;
+  color: #111;
+}
+
+.os-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+@media (max-width: 1220px) {
+  .dashboard-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .topology-box {
+    height: 420px;
+  }
+}
+
+@media (max-width: 720px) {
+  .topology-card,
+  .side-card {
+    padding: 18px;
+  }
+
+  .meter-copy {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .topology-box {
+    height: 340px;
+  }
 }
 </style>

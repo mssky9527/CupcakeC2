@@ -82,24 +82,35 @@ impl Transport for TcpTransport {
                         crate::utils::db_print("[Cupcake] TCP hardened socket ready.");
                     
                         let mut yamux_config = Config::default();
-                        // 🚀 增加最大缓冲区大小以支持大型迁移载荷 (3.4MB+)
-                        yamux_config.set_max_buffer_size(100 * 1024 * 1024); // 100MB
-                        yamux_config.set_receive_window(100 * 1024 * 1024); // 100MB
+                        // 缓冲区大小：16MB（足够大文件传输，但不会 OOM）
+                        yamux_config.set_max_buffer_size(16 * 1024 * 1024);
+                        yamux_config.set_receive_window(16 * 1024 * 1024);
                         yamux_config.set_window_update_mode(WindowUpdateMode::OnRead);
                         
                         let compat_stream = stream.compat();
                         let mut connection = Connection::new(compat_stream, yamux_config, Mode::Client);
                         let mut control = connection.control();
 
-                        // 🛠 全功能多路复用调度器
+                        // 🛠 全功能多路复用调度器 (带并发限制)
                         tokio::spawn(async move {
                             crate::utils::db_print("[Yamux] Connection driver started.");
+                            // 限制并发流数量，防止资源耗尽
+                            let stream_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
                             loop {
                                 match connection.next_stream().await {
                                     Ok(Some(stream)) => {
                                         let stream_id = stream.id();
                                         crate::utils::db_print(&format!("[Yamux] New stream incoming. ID: {}", stream_id));
+                                        let permit = match stream_semaphore.clone().try_acquire_owned() {
+                                            Ok(p) => p,
+                                            Err(_) => {
+                                                crate::utils::db_print(&format!("[Yamux] Stream {} rejected: max concurrency reached", stream_id));
+                                                drop(stream); // Close the stream
+                                                continue;
+                                            }
+                                        };
                                         tokio::spawn(async move {
+                                            let _permit = permit; // Hold permit until task completes
                                             use futures_util::AsyncReadExt as _; 
                                             let mut stream = stream;
                                             let mut type_buf = [0u8; 1];
@@ -172,10 +183,18 @@ impl Transport for TcpTransport {
     
     async fn receive(&mut self) -> Result<Vec<u8>> {
         let stream = self.control_stream.as_mut().ok_or_else(|| ClientError::ConnectionError("No stream".into()))?;
-        let len = match stream.read_u32().await {
-            Ok(l) => l as usize,
-            Err(e) => return Err(ClientError::ConnectionError(e.to_string())),
+        
+        // 🛡️ Read timeout: detect half-open connections (server silently died)
+        // If no data arrives within 120s, assume connection is dead and trigger reconnect
+        let len = match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            stream.read_u32()
+        ).await {
+            Ok(Ok(l)) => l as usize,
+            Ok(Err(e)) => return Err(ClientError::ConnectionError(e.to_string())),
+            Err(_) => return Err(ClientError::ConnectionError("Read timeout (half-open)".into())),
         };
+        
         if len > 100 * 1024 * 1024 { return Err(ClientError::ConnectionError("Too big".into())); }
         let mut buffer = vec![0u8; len];
         stream.read_exact(&mut buffer).await.map_err(|e| ClientError::ConnectionError(e.to_string()))?;

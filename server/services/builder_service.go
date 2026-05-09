@@ -241,7 +241,7 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	ext := ""
 	if conf.OSType == "windows" { ext = ".exe" }
 	randSuffix, _ := utils.RandomAlphaString(8)
-	finalPath := filepath.Join(ArtifactDir, fmt.Sprintf("agent_%s_%s%s", conf.Arch, randSuffix, ext))
+	finalPath := filepath.Join(ArtifactDir, fmt.Sprintf("%s%s", randSuffix, ext))
 
 
 	if logChan != nil { logChan <- "[Builder] 正在对本地 Loader 执行配置补丁..." }

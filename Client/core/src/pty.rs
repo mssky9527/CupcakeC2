@@ -20,6 +20,7 @@ impl Drop for ConPtyGuard {
     }
 }
 
+#[allow(dead_code)]
 enum PtyGuard {
     ConPty(ConPtyGuard),
     Pipe(tokio::process::Child),
@@ -47,10 +48,6 @@ pub async fn handle_stream(stream: yamux::Stream) {
         }
     }
 
-    println!("\n[!] PTY HANDLER ENTRY: No APIs called yet.");
-    use std::io::Write as _;
-    let _ = std::io::stdout().flush();
-    
     // 🛡️ [Hardening] Brief pause to allow underlying TCP stack to process window updates
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     
@@ -65,7 +62,6 @@ pub async fn handle_stream(stream: yamux::Stream) {
     let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
     
     std::thread::spawn(move || {
-        println!("\n[!] PTY SETUP THREAD STARTING...");
         let result = catch_unwind(|| -> Result<(Box<dyn Child + Send>, Box<dyn Read + Send>, Box<dyn Write + Send>, Box<dyn PtySystem + Send>), String> {
             // 🛡️ [Diagnostic] Dynamic API Probing for Windows
             #[cfg(target_os = "windows")]
@@ -105,7 +101,6 @@ pub async fn handle_stream(stream: yamux::Stream) {
             Ok(inner) => inner,
             Err(p) => Err(format!("Panic in dedicated thread: {:?}", p)),
         };
-        println!("[!] PTY SETUP THREAD FINISHED. Result: {:?}", final_res.as_ref().map(|_| "Ok").map_err(|e| e));
         let _ = setup_tx.send(final_res);
     });
 

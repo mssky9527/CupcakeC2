@@ -16,9 +16,16 @@ use std::collections::HashMap;
 use lazy_static::lazy_static;
 
 lazy_static! {
-    /// In-memory cache for synced plugins to avoid redundant network transfers
+    /// In-memory cache for synced plugins (max 20 entries, ~50MB cap)
     static ref PLUGIN_CACHE: SyncMutex<HashMap<String, Vec<u8>>> = SyncMutex::new(HashMap::new());
+    /// LRU order tracking for cache eviction
+    static ref PLUGIN_CACHE_ORDER: SyncMutex<VecDeque<String>> = SyncMutex::new(VecDeque::new());
 }
+
+/// Maximum number of cached plugins
+const MAX_PLUGIN_CACHE_ENTRIES: usize = 20;
+/// Maximum total cache size in bytes (~50MB)
+const MAX_PLUGIN_CACHE_BYTES: usize = 50 * 1024 * 1024;
 
 /// Plugin execution task definition
 #[derive(Debug, Clone)]
@@ -335,21 +342,60 @@ impl BatchExecutionManager {
 pub struct PluginRouter;
 
 impl PluginRouter {
-    /// Cache a plugin binary for future use
+    /// Cache a plugin binary for future use (with LRU eviction)
     pub fn cache_plugin(id: String, data: Vec<u8>) {
         if let Ok(mut cache) = PLUGIN_CACHE.lock() {
-            debug!("Caching plugin: {} ({} bytes)", id, data.len());
+            let data_size = data.len();
+            
+            // Reject single plugins larger than half the cache limit
+            if data_size > MAX_PLUGIN_CACHE_BYTES / 2 {
+                warn!("Plugin {} too large ({} bytes), not caching", id, data_size);
+                return;
+            }
+            
+            // Evict until we have space
+            if let Ok(mut order) = PLUGIN_CACHE_ORDER.lock() {
+                // Remove existing entry from order if re-caching
+                order.retain(|x| x != &id);
+                
+                // Evict oldest entries if over count limit
+                while order.len() >= MAX_PLUGIN_CACHE_ENTRIES {
+                    if let Some(oldest) = order.pop_front() {
+                        cache.remove(&oldest);
+                    }
+                }
+                
+                // Evict until total size is under limit
+                let mut total_size: usize = cache.values().map(|v| v.len()).sum();
+                while total_size + data_size > MAX_PLUGIN_CACHE_BYTES && !order.is_empty() {
+                    if let Some(oldest) = order.pop_front() {
+                        if let Some(removed) = cache.remove(&oldest) {
+                            total_size -= removed.len();
+                        }
+                    }
+                }
+                
+                order.push_back(id.clone());
+            }
+            
+            debug!("Caching plugin: {} ({} bytes)", id, data_size);
             cache.insert(id, data);
         }
     }
 
-    /// Retrieve a plugin from cache
+    /// Retrieve a plugin from cache (updates LRU order)
     pub fn get_cached_plugin(id: &str) -> Option<Vec<u8>> {
         if let Ok(cache) = PLUGIN_CACHE.lock() {
-            cache.get(id).cloned()
-        } else {
-            None
+            if let Some(data) = cache.get(id).cloned() {
+                // Update LRU order (move to back = most recently used)
+                if let Ok(mut order) = PLUGIN_CACHE_ORDER.lock() {
+                    order.retain(|x| x != id);
+                    order.push_back(id.to_string());
+                }
+                return Some(data);
+            }
         }
+        None
     }
 
     /// Execute plugin (legacy method for backward compatibility)
@@ -413,6 +459,7 @@ impl PluginRouter {
     }
     
     /// Handle memfd execution
+    #[allow(dead_code)]
     async fn handle_memfd_exec(task: PluginTask) -> CommandResult {
         #[cfg(target_os = "linux")]
         {
@@ -476,6 +523,7 @@ impl PluginRouter {
 
     
     /// Return error for unsupported platform
+    #[allow(dead_code)]
     fn unsupported_on_platform(execution_type: &str, required_platform: &str) -> CommandResult {
         let current_os = std::env::consts::OS;
         CommandResult {

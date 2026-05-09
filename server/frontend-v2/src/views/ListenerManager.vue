@@ -1,251 +1,238 @@
 <template>
-  <div class="listener-manager-container">
-    <!-- Page Header (Bento Box style) -->
-    <div class="page-header glass-panel mb-24">
-      <div class="header-content">
-        <div class="title-section">
-          <h2 class="main-title">通信链路 <span class="purple-text">监听管理</span></h2>
-          <p class="sub-title">多协议指挥通道</p>
-        </div>
-        <div class="action-section">
-          <el-button class="premium-btn create-btn" type="primary" :icon="Plus" @click="openCreateDialog">
-            启动新监听链路
-          </el-button>
-          <el-button class="premium-btn refresh-btn" :loading="loading" plain @click="fetchListeners">
-            <el-icon><Refresh /></el-icon>
-          </el-button>
-        </div>
-      </div>
-    </div>
+  <div class="view-shell listener-shell">
+    <section class="view-actions listener-actions">
+      <el-button @click="fetchListeners">
+        <el-icon><Refresh /></el-icon>
+        刷新
+      </el-button>
+      <el-button type="primary" @click="openCreateDialog">
+        <el-icon><Plus /></el-icon>
+        新建监听器
+      </el-button>
+    </section>
 
-    <!-- Stats Matrix (Quick Info) -->
-    <div class="stats-row mb-24">
-      <div class="stat-module glass-panel">
-        <div class="stat-icon-box purple">
+    <section class="stat-grid">
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
           <el-icon><Headset /></el-icon>
         </div>
-        <div class="stat-info">
-          <div class="stat-label">活跃链路</div>
-          <div class="stat-value">{{ listeners.filter(l => l.status === 'Running').length }}</div>
+        <div>
+          <span class="stat-card__label">运行中</span>
+          <div class="stat-card__value">{{ runningCount }}</div>
         </div>
-      </div>
-      <div class="stat-module glass-panel">
-        <div class="stat-icon-box green">
+      </article>
+
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
           <el-icon><Connection /></el-icon>
         </div>
-        <div class="stat-info">
-          <div class="stat-label">通信承载</div>
-          <div class="stat-value">{{ listeners.length }}</div>
+        <div>
+          <span class="stat-card__label">监听总数</span>
+          <div class="stat-card__value">{{ listeners.length }}</div>
         </div>
-      </div>
-      <div class="stat-module glass-panel">
-        <div class="stat-icon-box blue">
+      </article>
+
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
           <el-icon><Monitor /></el-icon>
         </div>
-        <div class="stat-info">
-          <div class="stat-label">总吞吐量</div>
-          <div class="stat-value">--</div>
+        <div>
+          <span class="stat-card__label">协议类型</span>
+          <div class="stat-card__value">{{ protocolKinds }}</div>
         </div>
-      </div>
-    </div>
+      </article>
+    </section>
 
-    <!-- Table Section -->
-    <div class="table-module glass-panel">
+    <section class="surface-card table-shell listener-table-card">
+      <div class="panel-head">
+        <div>
+          <span class="panel-kicker">Inventory</span>
+          <h3>监听器清单</h3>
+        </div>
+        <div class="chip">实时状态</div>
+      </div>
+
       <el-table :data="listeners" class="premium-table" v-loading="loading">
-        <el-table-column width="60" align="center">
-           <template #default="scope">
-             <div class="protocol-icon" :class="scope.row.protocol.toLowerCase()">
-                <el-icon v-if="scope.row.protocol === 'TCP'"><Share /></el-icon>
-                <el-icon v-else-if="scope.row.protocol === 'WebSocket'"><Connection /></el-icon>
-                <el-icon v-else><Monitor /></el-icon>
-             </div>
-           </template>
+        <el-table-column width="64" align="center">
+          <template #default="{ row }">
+            <div class="protocol-icon" :class="protocolClass(row.protocol)">
+              <el-icon v-if="row.protocol === 'TCP'"><Share /></el-icon>
+              <el-icon v-else-if="row.protocol === 'WebSocket'"><Connection /></el-icon>
+              <el-icon v-else-if="row.protocol === 'DNS'"><Monitor /></el-icon>
+              <el-icon v-else><Promotion /></el-icon>
+            </div>
+          </template>
         </el-table-column>
 
-        <el-table-column prop="protocol" label="协议模板" width="130">
-          <template #default="scope">
-            <el-tag :type="getProtocolType(scope.row.protocol)" class="premium-tag" effect="plain" round>
-              {{ scope.row.protocol }}
+        <el-table-column prop="protocol" label="协议" width="140">
+          <template #default="{ row }">
+            <el-tag :type="getProtocolType(row.protocol)" effect="plain" round>
+              {{ row.protocol }}
             </el-tag>
           </template>
         </el-table-column>
 
-        <el-table-column label="侦听地址" min-width="180">
-          <template #default="scope">
-            <code class="addr-code">{{ scope.row.bind_ip || '0.0.0.0' }}:{{ scope.row.port }}</code>
+        <el-table-column label="监听地址" min-width="190">
+          <template #default="{ row }">
+            <code class="mono addr-code">{{ row.bind_ip || '0.0.0.0' }}:{{ row.port }}</code>
           </template>
         </el-table-column>
 
-        <el-table-column prop="note" label="备注说明" min-width="150" show-overflow-tooltip>
-          <template #default="scope">
-            <span class="note-text">{{ scope.row.note || '---' }}</span>
+        <el-table-column label="公开投递 Host" min-width="170">
+          <template #default="{ row }">
+            <span class="muted">{{ row.public_host || '--' }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="链路状态" width="120" align="center">
-          <template #default="scope">
-            <div class="status-indicator" :class="scope.row.status.toLowerCase()">
+        <el-table-column prop="note" label="备注" min-width="160" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span class="muted">{{ row.note || '--' }}</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="状态" width="120" align="center">
+          <template #default="{ row }">
+            <div class="status-indicator" :class="row.status?.toLowerCase()">
               <span class="dot"></span>
-              {{ scope.row.status === 'Running' ? '工作中' : '已停止' }}
+              {{ row.status === 'Running' ? '运行中' : '已停止' }}
             </div>
           </template>
         </el-table-column>
 
-        <el-table-column label="管理维护" width="300" align="center" fixed="right">
-          <template #default="scope">
-            <el-button 
-              type="primary" 
-              link 
-              class="action-btn purple"
-              @click="openStagerDialog(scope.row)"
-            >
-              一键上线
-            </el-button>
-            <el-divider direction="vertical" />
-            <el-button 
-              v-if="scope.row.status === 'Stopped' || scope.row.status === 'Failed'"
-              link
-              class="action-btn green"
-              @click="handleStart(scope.row.id)"
-            >
-              激活
-            </el-button>
-            <el-button 
-              v-else
-              link
-              class="action-btn orange"
-              @click="handleStop(scope.row.id)"
-            >
-              熔断
-            </el-button>
-            <el-button 
-              link
-              class="action-btn red"
-              @click="handleDelete(scope.row.id)"
-            >
-              销毁
-            </el-button>
+        <el-table-column label="操作" width="320" align="center" fixed="right">
+          <template #default="{ row }">
+            <div class="table-actions">
+              <el-button link class="action-link" @click="openStagerDialog(row)">Stager</el-button>
+              <el-button
+                v-if="row.status === 'Stopped' || row.status === 'Failed'"
+                link
+                class="action-link"
+                @click="handleStart(row.id)"
+              >
+                启动
+              </el-button>
+              <el-button
+                v-else
+                link
+                class="action-link"
+                @click="handleStop(row.id)"
+              >
+                停止
+              </el-button>
+              <el-button link class="action-link action-link--danger" @click="handleDelete(row.id)">删除</el-button>
+            </div>
           </template>
         </el-table-column>
       </el-table>
-    </div>
+    </section>
 
-    <!-- One-click On-boarding Dialog -->
-    <el-dialog v-model="stagerVisible" title="指令注入 - 一键上线" width="620px" class="premium-dialog" center>
-      <div class="dialog-inner">
-        <div class="platform-tabs mb-20">
-          <el-radio-group v-model="stagerPlatform" size="large" @change="fetchStager">
-            <el-radio-button label="windows">WINDOWS (PS)</el-radio-button>
-            <el-radio-button label="linux">LINUX (BASH)</el-radio-button>
-          </el-radio-group>
-        </div>
-        <div v-loading="stagerLoading">
-          <p class="dialog-hint">在目标机器执行以下指令完成资产同步：</p>
+    <el-dialog v-model="stagerVisible" title="快速上线命令" width="680px" class="premium-dialog">
+      <div class="dialog-stack">
+        <el-radio-group v-model="stagerPlatform" @change="fetchStager">
+          <el-radio-button label="windows">Windows</el-radio-button>
+          <el-radio-button label="linux">Linux</el-radio-button>
+        </el-radio-group>
+
+        <div class="stager-section" v-loading="stagerLoading">
+          <h4 class="stager-title">{{ stagerPlatform === 'windows' ? 'Windows 上线命令' : 'Linux 上线命令' }}</h4>
+          <p class="dialog-hint" v-if="stagerPlatform === 'windows'">目标执行后自动判断 x64/x86 架构，下载对应版本 Agent。</p>
+          <p class="dialog-hint" v-else>在目标 Linux 主机执行，自动下载并运行 Agent。</p>
           <div class="terminal-box">
-            <div class="term-header">
-               <span class="dot red"></span>
-               <span class="dot yellow"></span>
-               <span class="dot green"></span>
+            <div class="terminal-box__dots">
+              <span></span>
+              <span></span>
+              <span></span>
             </div>
-            <pre><code>{{ stagerCommand }}</code></pre>
-            <el-button class="copy-btn-mini" @click="copyCommand">
-              <el-icon><CopyDocument /></el-icon> 复制
-            </el-button>
+            <pre><code>{{ stagerCommand || '暂无可用命令' }}</code></pre>
           </div>
         </div>
       </div>
+
       <template #footer>
-        <el-button @click="stagerVisible = false" class="plain-btn">关闭</el-button>
+        <el-button @click="stagerVisible = false">关闭</el-button>
+        <el-button type="primary" :disabled="!stagerCommand" @click="copyText(stagerCommand)">
+          <el-icon><CopyDocument /></el-icon>
+          复制命令
+        </el-button>
       </template>
     </el-dialog>
 
-    <!-- Professional configuration -->
-    <el-dialog 
-      v-model="dialogVisible" 
-      title="配置核心通信模板" 
-      width="700px" 
+    <el-dialog
+      v-model="dialogVisible"
+      title="新建监听器"
+      width="760px"
       class="premium-dialog"
       destroy-on-close
     >
-      <el-form :model="form" label-position="top">
-        <div class="form-grid">
-           <div class="form-aside">
-              <div class="protocol-selector-v2">
-                 <div 
-                   v-for="p in ['TCP', 'WebSocket', '正向TCP', 'DNS']" 
-                   :key="p"
-                   class="p-item"
-                   :class="{ active: form.protocol === p }"
-                   @click="form.protocol = p; handleProtocolChange(p)"
-                 >
-                   {{ p }}
-                 </div>
-              </div>
-           </div>
-           <div class="form-main">
-              <el-row :gutter="20">
-                <el-col :span="14">
-                   <el-form-item :label="form.protocol === '正向TCP' ? '监听端口' : '侦听地址 (IP:Port)'">
-                      <el-input v-model="listenAddr" :placeholder="form.protocol === '正向TCP' ? '4444' : '0.0.0.0:8081'" />
-                   </el-form-item>
-                </el-col>
-                <el-col :span="10">
-                   <el-form-item label="名称/别名">
-                      <el-input v-model="form.note" placeholder="链路描述" />
-                   </el-form-item>
-                </el-col>
-              </el-row>
+      <el-form :model="form" label-position="top" class="listener-form">
+        <div class="listener-form__layout">
+          <div class="protocol-list">
+            <button
+              v-for="protocol in ['TCP', 'WebSocket', '正向TCP', 'DNS']"
+              :key="protocol"
+              type="button"
+              class="protocol-list__item"
+              :class="{ 'protocol-list__item--active': form.protocol === protocol }"
+              @click="form.protocol = protocol; handleProtocolChange(protocol)"
+            >
+              {{ protocol }}
+            </button>
+          </div>
 
-              <el-form-item label="公开投递Host (Public C2 Host)" v-if="form.protocol !== '正向TCP'">
-                <el-input v-model="form.public_host" placeholder="c2.example.com" />
+          <div class="listener-form__main">
+            <div class="listener-form__grid">
+              <el-form-item :label="form.protocol === '正向TCP' ? '监听端口' : '监听地址 (IP:Port)'">
+                <el-input v-model="listenAddr" :placeholder="form.protocol === '正向TCP' ? '4444' : '0.0.0.0:8081'" />
               </el-form-item>
 
-              <el-row :gutter="20" v-if="form.protocol === 'DNS'">
-                <el-col :span="24">
-                  <el-form-item label="NS Domain delegation" required>
-                    <el-input v-model="form.ns_domain" placeholder="ns1.corp.com" />
-                  </el-form-item>
-                </el-col>
-              </el-row>
+              <el-form-item label="备注">
+                <el-input v-model="form.note" placeholder="例如：办公网 WebSocket 出口" />
+              </el-form-item>
+            </div>
 
-              <div class="advanced-section glass-panel">
-                 <label class="section-label">安全与混淆安全 (Security Settings)</label>
-                 <el-row :gutter="20">
-                    <el-col :span="24">
-                       <el-form-item label="Vkey (通讯秘钥)">
-                          <el-input v-model="form.encrypt_key" :type="showKey ? 'text' : 'password'" class="vkey-input">
-                             <template #append>
-                               <el-button @click="generateKey" class="random-btn">随机生成</el-button>
-                             </template>
-                          </el-input>
-                       </el-form-item>
-                    </el-col>
-                    <el-col :span="12">
-                       <el-form-item label="加密盐值 (Salt)">
-                          <el-input v-model="form.encryption_salt" />
-                       </el-form-item>
-                    </el-col>
-                    <el-col :span="12">
-                       <el-form-item label="报文编码方式">
-                          <el-select v-model="form.obfuscate_mode" style="width: 100%">
-                            <el-option label="None (Plain)" value="None" />
-                            <el-option label="Base64" value="Base64" />
-                            <el-option label="XOR Stream" value="XOR" />
-                          </el-select>
-                       </el-form-item>
-                    </el-col>
-                 </el-row>
+            <el-form-item v-if="form.protocol !== '正向TCP'" label="公开投递 Host">
+              <el-input v-model="form.public_host" placeholder="c2.example.com" />
+            </el-form-item>
+
+            <el-form-item v-if="form.protocol === 'DNS'" label="NS 域名委派" required>
+              <el-input v-model="form.ns_domain" placeholder="ns1.corp.example" />
+            </el-form-item>
+
+            <div class="security-box">
+              <span class="security-box__label">安全参数</span>
+
+              <el-form-item label="通信密钥">
+                <el-input v-model="form.encrypt_key" :type="showKey ? 'text' : 'password'" class="vkey-input">
+                  <template #append>
+                    <el-button @click="generateKey">随机生成</el-button>
+                  </template>
+                </el-input>
+              </el-form-item>
+
+              <div class="listener-form__grid">
+                <el-form-item label="加密盐值">
+                  <el-input v-model="form.encryption_salt" />
+                </el-form-item>
+
+                <el-form-item label="报文编码方式">
+                  <el-select v-model="form.obfuscate_mode">
+                    <el-option label="None" value="None" />
+                    <el-option label="Base64" value="Base64" />
+                    <el-option label="XOR Stream" value="XOR" />
+                  </el-select>
+                </el-form-item>
               </div>
-           </div>
+            </div>
+          </div>
         </div>
       </el-form>
 
       <template #footer>
-        <div class="dialog-footer-v2">
-          <span class="warning-text">* 防火墙需预先放行相应流量端口</span>
-          <div class="btns">
-            <el-button @click="dialogVisible = false" class="plain-btn">取消</el-button>
-            <el-button type="primary" class="purple-btn" :loading="submitting" @click="createListener">下发部署指令</el-button>
+        <div class="dialog-footer">
+          <span class="muted">请确保目标端口已放行，并与投递方式保持一致。</span>
+          <div class="dialog-footer__actions">
+            <el-button @click="dialogVisible = false">取消</el-button>
+            <el-button type="primary" :loading="submitting" @click="createListener">创建监听器</el-button>
           </div>
         </div>
       </template>
@@ -254,12 +241,18 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import api from '../api/index'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { 
-  Plus, Connection, Monitor, Lock, Setting, Promotion, 
-  View, Hide, Refresh, CopyDocument, Share, Headset
+import {
+  Connection,
+  CopyDocument,
+  Headset,
+  Monitor,
+  Plus,
+  Promotion,
+  Refresh,
+  Share
 } from '@element-plus/icons-vue'
 
 const listeners = ref([])
@@ -269,7 +262,6 @@ const submitting = ref(false)
 const showKey = ref(false)
 const listenAddr = ref('0.0.0.0:8081')
 
-// Stager State
 const stagerVisible = ref(false)
 const stagerLoading = ref(false)
 const stagerCommand = ref('')
@@ -293,13 +285,19 @@ const form = reactive({
   max_retry: 30
 })
 
+const runningCount = computed(() => listeners.value.filter((listener) => listener.status === 'Running').length)
+const protocolKinds = computed(() => new Set(listeners.value.map((listener) => listener.protocol)).size || 0)
+
 const fetchListeners = async () => {
   loading.value = true
   try {
     const res = await api.get('/api/listeners')
     listeners.value = res.data || []
-  } catch (e) { ElMessage.error('无法同步链路') }
-  finally { loading.value = false }
+  } catch {
+    ElMessage.error('无法同步监听器列表')
+  } finally {
+    loading.value = false
+  }
 }
 
 const openCreateDialog = () => {
@@ -319,7 +317,9 @@ const handleProtocolChange = (val) => {
 const generateKey = () => {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
   let key = ''
-  for (let i = 0; i < 32; i++) key += chars.charAt(Math.floor(Math.random() * chars.length))
+  for (let i = 0; i < 32; i += 1) {
+    key += chars.charAt(Math.floor(Math.random() * chars.length))
+  }
   form.encrypt_key = key
   showKey.value = true
 }
@@ -327,53 +327,68 @@ const generateKey = () => {
 const generateRandomSalt = () => {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
   let result = ''
-  for (let i = 0; i < 6; i++) result += chars.charAt(Math.floor(Math.random() * chars.length))
+  for (let i = 0; i < 6; i += 1) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length))
+  }
   form.encryption_salt = result
 }
 
-const getProtocolType = (p) => {
-  const map = { 'WebSocket': 'success', 'TCP': 'primary', '正向TCP': 'warning', 'DNS': 'warning' }
-  return map[p] || 'info'
+const protocolClass = (protocol) => {
+  const value = String(protocol || '').toLowerCase()
+  if (value === 'tcp') return 'protocol-icon--tcp'
+  if (value === 'websocket') return 'protocol-icon--websocket'
+  if (value === 'dns') return 'protocol-icon--dns'
+  return 'protocol-icon--bind'
+}
+
+const getProtocolType = (protocol) => {
+  const map = { WebSocket: 'success', TCP: 'primary', 正向TCP: 'warning', DNS: 'warning' }
+  return map[protocol] || 'info'
 }
 
 const createListener = async () => {
   const parts = listenAddr.value.split(':')
   if (parts.length === 2) {
     form.bind_ip = parts[0] || '0.0.0.0'
-    form.port = parseInt(parts[1])
-  } else if (!isNaN(listenAddr.value)) {
+    form.port = parseInt(parts[1], 10)
+  } else if (!Number.isNaN(Number(listenAddr.value))) {
     form.bind_ip = '0.0.0.0'
-    form.port = parseInt(listenAddr.value)
+    form.port = parseInt(listenAddr.value, 10)
   }
 
   submitting.value = true
   try {
     await api.post('/api/listeners', { ...form })
-    ElMessage.success('链路部署成功')
+    ElMessage.success('监听器创建成功')
     dialogVisible.value = false
     fetchListeners()
-  } catch (e) { ElMessage.error('部署失败') }
-  finally { submitting.value = false }
+  } catch {
+    ElMessage.error('监听器创建失败')
+  } finally {
+    submitting.value = false
+  }
 }
 
 const handleStop = async (id) => {
   await api.post(`/api/listeners/${id}/stop`)
-  ElMessage.warning('链路已熔断')
+  ElMessage.warning('监听器已停止')
   fetchListeners()
 }
 
 const handleStart = async (id) => {
   await api.post(`/api/listeners/${id}/start`)
-  ElMessage.success('链路已重连')
+  ElMessage.success('监听器已启动')
   fetchListeners()
 }
 
 const handleDelete = (id) => {
-  ElMessageBox.confirm('确定销毁该链路吗？', '销毁确认', { type: 'error' }).then(async () => {
-    await api.delete(`/api/listeners/${id}`)
-    ElMessage.success('已销毁')
-    fetchListeners()
-  })
+  ElMessageBox.confirm('确认删除这个监听器吗？', '删除监听器', { type: 'warning' })
+    .then(async () => {
+      await api.delete(`/api/listeners/${id}`)
+      ElMessage.success('监听器已删除')
+      fetchListeners()
+    })
+    .catch(() => {})
 }
 
 const openStagerDialog = (row) => {
@@ -383,170 +398,289 @@ const openStagerDialog = (row) => {
 }
 
 const fetchStager = async () => {
+  if (!currentListener.value) return
   stagerLoading.value = true
+  const host = currentListener.value.public_host || window.location.hostname
   try {
     const res = await api.get('/api/stager', {
       params: {
         listener_id: currentListener.value.id,
         os: stagerPlatform.value,
         arch: 'x64',
-        host: currentListener.value.public_host || window.location.hostname
+        host
       }
     })
     stagerCommand.value = res.data.command
-  } catch (e) { ElMessage.error('生成失败') }
-  finally { stagerLoading.value = false }
+  } catch {
+    ElMessage.error('stager 生成失败')
+  } finally {
+    stagerLoading.value = false
+  }
 }
 
-const copyCommand = () => {
-  navigator.clipboard.writeText(stagerCommand.value)
-  ElMessage.success('指令已复制')
+const copyText = async (text) => {
+  if (!text) return
+  await navigator.clipboard.writeText(text)
+  ElMessage.success('命令已复制')
 }
 
 onMounted(fetchListeners)
 </script>
 
 <style scoped>
-.listener-manager-container { padding: 0; animation: fadeIn 0.5s ease-out; }
-@keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
-
-.mb-24 { margin-bottom: 24px; }
-.mb-20 { margin-bottom: 20px; }
-
-/* Bento Panes */
-.glass-panel {
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(124, 58, 237, 0.08); border-radius: 24px;
-  box-shadow: 0 10px 30px rgba(124, 58, 237, 0.05);
+.listener-shell {
+  gap: 20px;
 }
 
-.page-header { padding: 24px 32px; }
-.header-content { display: flex; justify-content: space-between; align-items: center; }
-.main-title { font-size: 26px; font-weight: 900; color: #1e1b4b; margin: 0; }
-.purple-text { color: #7c3aed; }
-.sub-title { font-size: 13px; color: #94a3b8; font-weight: 600; margin-top: 4px; }
-
-.premium-btn { border-radius: 12px; font-weight: 700; height: 42px; transition: all 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275); }
-.create-btn { background: #7c3aed !important; border: none !important; box-shadow: 0 4px 15px rgba(124, 58, 237, 0.3); }
-.create-btn:hover { transform: translateY(-2px); box-shadow: 0 8px 25px rgba(124, 58, 237, 0.4); }
-
-/* Stats Matrix */
-.stats-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
-.stat-module { padding: 20px; display: flex; align-items: center; gap: 16px; }
-.stat-icon-box { width: 48px; height: 48px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 22px; }
-.stat-icon-box.purple { background: rgba(124, 58, 237, 0.1); color: #7c3aed; }
-.stat-icon-box.green { background: rgba(16, 185, 129, 0.1); color: #10b981; }
-.stat-icon-box.blue { background: rgba(14, 165, 233, 0.1); color: #0ea5e9; }
-.stat-label { font-size: 11px; font-weight: 800; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; }
-.stat-value { font-family: 'JetBrains Mono'; font-size: 26px; font-weight: 800; color: #1e1b4b; }
-
-/* Table */
-.table-module { padding: 12px; }
-.premium-table { background: transparent !important; }
-
-.protocol-icon { width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 16px; }
-.protocol-icon.tcp { background: #eff6ff; color: #3b82f6; }
-.protocol-icon.websocket { background: #f0fdf4; color: #22c55e; }
-.protocol-icon.dns { background: #fffbeb; color: #d97706; }
-
-.addr-code { font-family: 'JetBrains Mono'; font-weight: 700; color: #7c3aed; background: rgba(124, 58, 237, 0.05); padding: 4px 10px; border-radius: 8px; font-size: 13px; }
-.note-text { color: #64748b; font-size: 13px; font-weight: 600; }
-
-.status-indicator { display: inline-flex; align-items: center; gap: 8px; padding: 4px 12px; border-radius: 20px; font-size: 11px; font-weight: 800; }
-.status-indicator.working, .status-indicator.running { background: rgba(16, 185, 129, 0.1); color: #059669; }
-.status-indicator.stopped { background: #f1f5f9; color: #94a3b8; }
-.status-indicator.working .dot, .status-indicator.running .dot { width: 6px; height: 6px; background: #10b981; border-radius: 50%; box-shadow: 0 0 8px #10b981; }
-
-.action-btn { font-size: 13px; font-weight: 800; }
-.action-btn.purple { color: #7c3aed !important; }
-.action-btn.green { color: #10b981 !important; }
-.action-btn.orange { color: #f59e0b !important; }
-.action-btn.red { color: #ef4444 !important; }
-
-/* Terminal Stager */
-.terminal-box { background: #0f172a; padding: 20px; border-radius: 16px; position: relative; border: 1px solid rgba(124, 58, 237, 0.2); }
-.term-header { display: flex; gap: 6px; margin-bottom: 12px; }
-.term-header .dot { width: 8px; height: 8px; border-radius: 50%; }
-.dot.red { background: #fb7185; } .dot.yellow { background: #fbbf24; } .dot.green { background: #34d399; }
-.terminal-box pre { margin: 0; white-space: pre-wrap; word-break: break-all; }
-.terminal-box code { font-family: 'JetBrains Mono'; color: #38bdf8; font-size: 13px; line-height: 1.6; }
-.copy-btn-mini { position: absolute; bottom: 15px; right: 15px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: white; font-size: 11px; font-weight: 800; border-radius: 8px; }
-.copy-btn-mini:hover { background: #7c3aed; border-color: #7c3aed; }
-
-/* Configuration Modal */
-.form-grid { display: flex; gap: 30px; }
-.form-aside { width: 140px; }
-.form-main { flex: 1; }
-
-.dialog-inner { padding: 10px 5px; }
-
-/* 深度优化输入框 visibility */
-:deep(.el-input__wrapper) {
-  background-color: #f8fafc !important;
-  border: 1px solid #e2e8f0 !important;
-  box-shadow: none !important;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+.listener-actions {
+  justify-content: flex-end;
 }
 
-:deep(.el-input__wrapper.is-focus) {
-  border-color: #7c3aed !important;
-  background-color: #ffffff !important;
-  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.1) !important;
+.listener-table-card {
+  padding-top: 20px;
 }
 
-:deep(.el-input__inner) {
-  font-family: 'JetBrains Mono', monospace;
-  font-weight: 600;
-  color: #1e1b4b;
+.listener-table-card :deep(.el-table__header-wrapper th.el-table__cell),
+.listener-table-card :deep(.el-table__body-wrapper td.el-table__cell) {
+  white-space: nowrap;
 }
 
-.protocol-selector-v2 { display: flex; flex-direction: column; gap: 10px; padding-right: 15px; border-right: 1px solid #f1f5f9; }
-.p-item { padding: 12px 16px; border-radius: 12px; background: #f8fafc; color: #64748b; font-weight: 800; font-size: 12px; cursor: pointer; transition: all 0.2s; border: 1px solid transparent; text-align: center; }
-.p-item:hover { background: rgba(124, 58, 237, 0.05); color: #7c3aed; }
-.p-item.active { background: #7c3aed; color: white; box-shadow: 0 4px 12px rgba(124, 58, 237, 0.2); }
-
-.advanced-section { 
-  padding: 24px; 
-  margin-top: 20px; 
-  background: rgba(124, 58, 237, 0.03);
-  border: 1px solid rgba(124, 58, 237, 0.1); 
-  border-radius: 20px;
+.protocol-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--surface-subtle);
+  color: var(--text-strong);
 }
-.section-label { display: block; font-size: 11px; font-weight: 900; color: #7c3aed; text-transform: uppercase; margin-bottom: 20px; letter-spacing: 0.8px; }
 
-.random-btn {
-  background: #7c3aed !important;
-  color: white !important;
-  border: none !important;
-  font-weight: 800;
+.protocol-icon--tcp {
+  background: #eff6ff;
+  color: #2563eb;
+}
+
+.protocol-icon--websocket {
+  background: #f0fdf4;
+  color: #059669;
+}
+
+.protocol-icon--dns {
+  background: #fff7ed;
+  color: #d97706;
+}
+
+.protocol-icon--bind {
+  background: #f5f3ff;
+  color: #7c3aed;
+}
+
+.addr-code {
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+}
+
+.status-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: var(--surface-muted);
+  color: var(--text-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.status-indicator .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--text-strong);
+}
+
+.status-indicator.running {
+  background: rgba(16, 185, 129, 0.12);
+  color: #047857;
+}
+
+.status-indicator.running .dot {
+  background: #10b981;
+}
+
+.table-actions {
+  display: inline-flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.action-link {
+  font-weight: 700;
+}
+
+.action-link--danger {
+  color: #b42318 !important;
+}
+
+.dialog-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.dialog-hint {
+  margin: 0 0 12px;
+  color: var(--text-body);
+  line-height: 1.6;
   font-size: 13px;
-  height: 42px; /* Fixed height to match input */
-  padding: 0 24px !important;
-  margin: 0 !important;
-  border-radius: 0 12px 12px 0 !important;
+}
+
+.terminal-box {
+  padding: 18px;
+  border-radius: 20px;
+  background: #0f0f10;
+}
+
+.terminal-box__dots {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.terminal-box__dots span {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.terminal-box pre {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.terminal-box code {
+  color: #d9f99d;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.stager-section {
+  margin-bottom: 20px;
+}
+
+.stager-title {
+  font-size: 15px;
+  font-weight: 700;
+  margin-bottom: 10px;
+  color: var(--text-strong);
+}
+
+.copy-btn {
+  margin-top: 8px;
+}
+
+.listener-form__layout {
+  display: grid;
+  grid-template-columns: 160px minmax(0, 1fr);
+  gap: 24px;
+}
+
+.protocol-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.protocol-list__item {
+  padding: 12px 14px;
+  border: 1px solid var(--line-soft);
+  border-radius: 16px;
+  background: var(--surface-soft);
+  color: var(--text-body);
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+
+.protocol-list__item--active {
+  background: #ffffff;
+  color: var(--text-strong);
+  border-color: var(--text-strong);
+}
+
+.listener-form__main {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.listener-form__grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.security-box {
+  padding: 18px;
+  border-radius: 20px;
+  background: var(--surface-soft);
+  border: 1px solid var(--line-soft);
+}
+
+.security-box__label {
+  display: inline-block;
+  margin-bottom: 14px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-muted);
+}
+
+.dialog-footer {
   display: flex;
   align-items: center;
-  justify-content: center;
-  min-width: 100px; /* Ensure it's wide enough */
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
 }
 
-/* 解决 append 容器与按钮的完美贴合 */
-:deep(.vkey-input .el-input-group__append) {
-  background-color: #7c3aed !important;
-  border: none !important;
-  padding: 0 !important;
-  overflow: hidden;
-  border-radius: 0 12px 12px 0;
-  box-shadow: none !important;
+.dialog-footer__actions {
+  display: flex;
+  gap: 10px;
 }
 
-:deep(.vkey-input .el-input__wrapper) {
-  border-radius: 12px 0 0 12px !important;
-  height: 42px;
-}
+@media (max-width: 900px) {
+  .listener-actions {
+    justify-content: flex-start;
+  }
 
-.dialog-footer-v2 { display: flex; justify-content: space-between; align-items: center; width: 100%; border-top: 1px solid #f1f5f9; padding-top: 20px; }
-.warning-text { font-size: 12px; color: #94a3b8; font-weight: 600; }
-.purple-btn { background: #7c3aed !important; border: none !important; color: white !important; font-weight: 800; border-radius: 10px; padding: 0 25px; height: 42px; }
+  .table-actions {
+    gap: 10px;
+    justify-content: flex-start;
+  }
+
+  .action-link {
+    padding: 0;
+    font-size: 12px;
+  }
+
+  .listener-form__layout,
+  .listener-form__grid {
+    grid-template-columns: 1fr;
+  }
+
+  .dialog-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .dialog-footer__actions {
+    width: 100%;
+  }
+}
 </style>

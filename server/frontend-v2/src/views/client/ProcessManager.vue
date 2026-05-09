@@ -5,7 +5,7 @@
       <div class="left-tools">
         <el-input 
           v-model="searchQuery" 
-          placeholder="搜索 PID / 进程名称 / 用户..." 
+          placeholder="搜索 PID / 进程名称 / 用户..."
           clearable
           class="proc-search"
         >
@@ -16,7 +16,7 @@
         
         <div class="noise-filter">
           <span class="filter-label">隐藏系统进程:</span>
-          <el-switch v-model="hideSystem" active-color="#13ce66" />
+          <el-switch v-model="hideSystem" active-color="var(--text-strong)" />
         </div>
       </div>
 
@@ -43,7 +43,7 @@
       >
         <el-table-column prop="pid" label="PID" width="90" sortable fixed />
         
-        <el-table-column prop="name" label="映像名称" min-width="250" sortable>
+        <el-table-column prop="name" label="鏄犲儚名称" min-width="250" sortable>
           <template #default="scope">
             <div class="name-cell">
               <img :src="getProcessIcon(scope.row.name)" class="proc-mini-icon" />
@@ -52,7 +52,7 @@
           </template>
         </el-table-column>
 
-        <el-table-column prop="ppid" label="父进程 ID (PPID)" width="130" sortable />
+        <el-table-column prop="ppid" label="鐖惰繘绋ID (PPID)" width="130" sortable />
 
         <el-table-column label="分类" width="130" align="center">
           <template #default="scope">
@@ -100,7 +100,7 @@
         <el-table-column label="操作" width="100" align="center" fixed="right">
           <template #default="scope">
             <el-popconfirm 
-              :title="`确定强制结束进程 ${scope.row.name} (PID: ${scope.row.pid}) 吗?`"
+              :title="`确定强制结束进程 ${scope.row.name} (PID: ${scope.row.pid}) 吗？`"
               @confirm="handleKill(scope.row)"
               confirm-button-text="强制结束"
               confirm-button-type="danger"
@@ -201,7 +201,7 @@ const fetchProcesses = async () => {
     const res = await listProcesses(props.clientId)
     if (res.data && res.data.data) {
       rawProcesses.value = res.data.data
-      ElMessage.success({ message: `获取成功: ${res.data.data.length} 个进程`, duration: 1000 })
+      ElMessage.success({ message: '获取成功: ' + res.data.data.length + ' 个进程', duration: 1000 })
     }
   } catch (e) {
     ElMessage.error('无法获取进程列表: ' + (e.response?.data?.error || e.message))
@@ -230,7 +230,7 @@ const displayProcesses = computed(() => {
 const handleKill = async (row) => {
   try {
     await killProcess({ uuid: props.clientId, pid: row.pid })
-    ElMessage.success(`已发送结束指令: ${row.name}`)
+    ElMessage.success('已发送结束指令 ' + row.name)
     // Refresh after a short delay to allow process to terminate
     setTimeout(fetchProcesses, 1500)
   } catch (error) {
@@ -252,7 +252,7 @@ const getProcessIcon = (name) => {
 }
 
 const copyInfo = (row) => {
-  const info = `Name: ${row.name}\nPID: ${row.pid}\nPPID: ${row.ppid}\nUser: ${row.user}\nArch: ${row.arch}`
+  const info = 'Name: ' + row.name + '\nPID: ' + row.pid + '\nPPID: ' + row.ppid + '\nUser: ' + row.user + '\nArch: ' + row.arch
   navigator.clipboard.writeText(info)
   ElMessage.success('已复制详细信息')
 }
@@ -284,34 +284,42 @@ onMounted(() => {
 </script>
 
 <style scoped>
-.process-explorer { height: 100%; display: flex; flex-direction: column; background: #ffffff; }
+.process-explorer { height: 100%; display: flex; flex-direction: column; background: var(--bg-panel-strong); }
 .proc-toolbar { padding: 10px 15px; background: #f8f9fa; border-bottom: 1px solid #ebeef5; display: flex; justify-content: space-between; align-items: center; }
 .left-tools { display: flex; align-items: center; gap: 20px; }
 .proc-search { width: 300px; }
 .noise-filter { display: flex; align-items: center; gap: 10px; }
-.filter-label { font-size: 13px; color: #606266; font-weight: 500; }
+.filter-label { font-size: 13px; color: var(--text-body); font-weight: 500; }
 .explorer-body { flex: 1; overflow: hidden; }
 .name-cell { display: flex; align-items: center; gap: 12px; }
 .proc-mini-icon { width: 20px; height: 20px; }
-.p-name { font-family: 'Segoe UI', sans-serif; font-weight: 600; color: #2c3e50; }
-.system-user { color: #909399; font-style: italic; font-size: 12px; }
-.type-tag { font-family: 'Inter', sans-serif; font-size: 10px; font-weight: 800; border-radius: 4px; }
-:deep(.security-row-highlight) { background-color: #fff1f0 !important; }
-:deep(.security-row-highlight:hover > td) { background-color: #ffccc7 !important; }
-:deep(.security-row-highlight) .p-name { color: #cf1322 !important; }
-:deep(.system-row-dim) { opacity: 0.85; }
-:deep(.system-row-dim) td { color: #909399; }
-.custom-context-menu { position: fixed; z-index: 3000; background: white; border: 1px solid #e4e7ed; box-shadow: 0 4px 12px rgba(0,0,0,0.1); padding: 4px 0; border-radius: 8px; min-width: 200px; }
-.menu-header { padding: 8px 16px; font-size: 11px; color: #909399; border-bottom: 1px solid #f2f6fc; margin-bottom: 4px; font-weight: bold; }
-.menu-item { padding: 10px 16px; font-size: 13px; color: #606266; cursor: pointer; display: flex; align-items: center; gap: 10px; }
-.menu-item:hover { background: #f5f7fa; color: #409eff; }
-.menu-item.danger:hover { background: #fff1f0; color: #f56c6c; }
 
-.status-bar {
-  padding: 5px 15px;
-  font-size: 12px;
-  color: #909399;
-  border-top: 1px solid #ebeef5;
-  background: #fafafa;
+:deep(.security-row-highlight) {
+  background-color: var(--surface-muted) !important;
+}
+
+:deep(.security-row-highlight:hover > td) {
+  background-color: #ededed !important;
+}
+
+:deep(.security-row-highlight) .p-name {
+  color: var(--text-strong) !important;
+}
+
+@media (max-width: 820px) {
+  .proc-toolbar,
+  .left-tools {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .proc-search {
+    width: 100%;
+  }
+
+  .noise-filter,
+  .right-tools {
+    justify-content: space-between;
+  }
 }
 </style>

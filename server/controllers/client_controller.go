@@ -104,7 +104,7 @@ func startPtyBackgroundLoop(uuidStr string, sess *globals.PTYSession) {
 		}
 		sess.Mutex.Unlock()
 		globals.ActivePTYSessions.Delete(uuidStr)
-		log.Printf("[PTY] Session background loop ended for %s", uuidStr)
+		// PTY session ended silently
 	}()
 
 	for {

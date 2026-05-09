@@ -1,6 +1,5 @@
 <template>
   <div class="client-detail">
-    <!-- Top Header -->
     <div class="top-header">
       <div class="header-left">
         <h1>{{ getPageTitle() }}</h1>
@@ -11,11 +10,8 @@
       </div>
     </div>
 
-    <!-- Main Layout -->
     <div class="main-layout">
-      <!-- Left Sidebar with Menu + Client Info -->
       <div class="left-sidebar">
-        <!-- Menu -->
         <el-menu
           :default-active="activeMenu"
           @select="handleMenuSelect"
@@ -44,13 +40,12 @@
         </el-menu>
       </div>
 
-      <!-- Right Content Area -->
       <div class="right-content">
         <router-view v-slot="{ Component }">
           <transition name="fade" mode="out-in">
-            <component 
-              :is="Component" 
-              :client-id="clientId" 
+            <component
+              :is="Component"
+              :client-id="clientId"
               :client-info="clientInfo"
               :socket="socket"
               ref="childRef"
@@ -65,7 +60,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Monitor, Folder, Connection, Back, Close, Fold, Tools, Collection, Search } from '@element-plus/icons-vue'
+import { Monitor, Folder, Connection, Fold, Tools } from '@element-plus/icons-vue'
 import api from '../api/index'
 import { ElMessage } from 'element-plus'
 
@@ -75,7 +70,6 @@ const router = useRouter()
 const clientId = computed(() => route.params.id)
 const clientInfo = ref(null)
 
-// Determine active menu based on current route
 const activeMenu = computed(() => {
   const name = route.name
   if (name === 'ClientTerminals') return 'terminals'
@@ -99,11 +93,11 @@ const handleMenuSelect = (index) => {
 
 const getPageTitle = () => {
   const titleMap = {
-    'ClientTerminals': '终端',
-    'ClientFiles': '文件管理',
-    'ClientTunnels': '隧道管理',
-    'ClientProcesses': '进程管理',
-    'ClientPlugins': '插件与后渗透'
+    ClientTerminals: '终端',
+    ClientFiles: '文件管理',
+    ClientTunnels: '隧道管理',
+    ClientProcesses: '进程管理',
+    ClientPlugins: '插件与工具'
   }
   return titleMap[route.name] || '终端'
 }
@@ -115,11 +109,11 @@ const fetchClientInfo = async () => {
     if (client) {
       clientInfo.value = client
     } else {
-      ElMessage.error('客户端不存在')
+      ElMessage.error('Client not found')
       router.push('/clients')
     }
   } catch (e) {
-    ElMessage.error('无法获取客户端信息')
+    ElMessage.error('Failed to load client information')
   }
 }
 
@@ -127,44 +121,30 @@ const socket = ref(null)
 const childRef = ref(null)
 let pingInterval = null
 
-// Handle return to list - clear terminal history
 const handleReturnToList = () => {
-  // Navigate back to clients list
   router.push('/clients')
 }
 
 const initSocket = () => {
-  // Use the Admin Shell endpoint for this specific client
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-  // Determine the correct host (prefer current hostname to avoid localhost issues in prod)
-  const host = window.location.host // includes port
+  const host = window.location.host
   const token = localStorage.getItem('cupcake_token')
   const wsUrl = `${protocol}//${host}/api/shell/${clientId.value}?token=${encodeURIComponent(token)}`
 
   socket.value = new WebSocket(wsUrl)
 
   socket.value.onopen = () => {
-    // Keep alive if needed
     pingInterval = setInterval(() => {
-        if (socket.value?.readyState === WebSocket.OPEN) {
-            socket.value.send(JSON.stringify({ type: 'ping' })) 
-        }
+      if (socket.value?.readyState === WebSocket.OPEN) {
+        socket.value.send(JSON.stringify({ type: 'ping' }))
+      }
     }, 30000)
   }
 
   socket.value.onmessage = (event) => {
-    // Forward to the active child component (TerminalTabs, FileManager, etc.)
     if (childRef.value?.handleSocketMessage) {
-        childRef.value.handleSocketMessage(event)
+      childRef.value.handleSocketMessage(event)
     }
-  }
-
-  socket.value.onclose = () => {
-    // Reconnect logic could be added here
-  }
-
-  socket.value.onerror = () => {
-    // WebSocket error: silently handled, no console leak
   }
 }
 
@@ -178,7 +158,6 @@ onUnmounted(() => {
   if (socket.value) socket.value.close()
 })
 
-// Refresh client info when ID changes
 watch(clientId, () => {
   fetchClientInfo()
 })
@@ -189,17 +168,16 @@ watch(clientId, () => {
   height: 100%;
   display: flex;
   flex-direction: column;
-  background-color: #f5f7fa;
+  background-color: var(--bg-panel-strong);
 }
 
-/* Top Header */
 .top-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   padding: 16px 24px;
-  background-color: #ffffff;
-  border-bottom: 1px solid rgba(124, 58, 237, 0.08); /* White-purple theme sync */
+  background-color: var(--bg-panel-strong);
+  border-bottom: 1px solid var(--line-muted);
   flex-shrink: 0;
 }
 
@@ -213,7 +191,7 @@ watch(clientId, () => {
 
 .header-left .subtitle {
   font-size: 13px;
-  color: #909399;
+  color: var(--text-muted);
   font-family: 'JetBrains Mono', monospace;
   margin-left: 16px;
 }
@@ -223,7 +201,6 @@ watch(clientId, () => {
   gap: 10px;
 }
 
-/* Main Layout */
 .main-layout {
   flex: 1;
   display: flex;
@@ -231,13 +208,12 @@ watch(clientId, () => {
   min-height: 0;
 }
 
-/* Left Sidebar */
 .left-sidebar {
   width: 220px;
-  background-color: #ffffff; /* White-purple theme sync */
+  background-color: var(--bg-panel-strong);
   display: flex;
   flex-direction: column;
-  border-right: 1px solid rgba(124, 58, 237, 0.08);
+  border-right: 1px solid var(--line-muted);
   flex-shrink: 0;
 }
 
@@ -255,60 +231,21 @@ watch(clientId, () => {
   border-radius: 12px;
   font-size: 13px;
   font-weight: 700;
-  color: #64748b;
+  color: var(--text-muted);
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
 :deep(.el-menu-item:hover) {
-  background-color: rgba(124, 58, 237, 0.04) !important;
-  color: #7c3aed !important;
+  background-color: var(--surface-muted) !important;
+  color: var(--text-strong) !important;
 }
 
 :deep(.el-menu-item.is-active) {
-  background-color: rgba(124, 58, 237, 0.08) !important;
-  color: #7c3aed !important;
-  box-shadow: 0 4px 12px rgba(124, 58, 237, 0.05);
+  background-color: var(--surface-muted) !important;
+  color: var(--text-strong) !important;
+  box-shadow: none;
 }
 
-/* Client Info Card */
-.client-info-card {
-  margin: 20px;
-  padding: 16px;
-  background-color: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 8px;
-  flex-shrink: 0;
-}
-
-.card-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 16px;
-  font-weight: 600;
-  color: #ffffff;
-  margin-bottom: 16px;
-  padding-bottom: 12px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-}
-
-.card-item {
-  display: flex;
-  justify-content: space-between;
-  margin-bottom: 10px;
-  font-size: 13px;
-}
-
-.card-item .label {
-  color: rgba(255, 255, 255, 0.5);
-}
-
-.card-item .value {
-  color: rgba(255, 255, 255, 0.85);
-  font-family: 'JetBrains Mono', monospace;
-}
-
-/* Right Content */
 .right-content {
   flex: 1;
   padding: 16px;
@@ -316,7 +253,7 @@ watch(clientId, () => {
   display: flex;
   flex-direction: column;
   min-height: 0;
-  background-color: #f8fafc; /* Keep layout consistent */
+  background-color: var(--surface-soft);
 }
 
 :deep(.right-content > div) {
@@ -336,4 +273,3 @@ watch(clientId, () => {
   opacity: 0;
 }
 </style>
-

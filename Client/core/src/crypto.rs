@@ -149,10 +149,27 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
     };
     
     // 生成 Nonce（12 字节）
-    // ⚡ OPSEC: We use our custom PRNG instead of OsRng to avoid BCrypt initialization crashes
+    // 使用混合策略：4字节时间戳 + 4字节计数器 + 4字节PRNG
+    // 这确保即使 PRNG 质量低，nonce 也不会重复
     let mut nonce_bytes = [0u8; NONCE_LENGTH];
-    for i in 0..NONCE_LENGTH {
-        nonce_bytes[i] = (crate::utils::next_u32() % 256) as u8;
+    {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NONCE_COUNTER: AtomicU32 = AtomicU32::new(0);
+        
+        // 前4字节：单调递增计数器（保证唯一性）
+        let counter = NONCE_COUNTER.fetch_add(1, Ordering::SeqCst);
+        nonce_bytes[0..4].copy_from_slice(&counter.to_le_bytes());
+        
+        // 中4字节：时间戳低32位（增加熵）
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u32)
+            .unwrap_or(0);
+        nonce_bytes[4..8].copy_from_slice(&ts.to_le_bytes());
+        
+        // 后4字节：PRNG（额外随机性）
+        let r1 = crate::utils::next_u32();
+        nonce_bytes[8..12].copy_from_slice(&r1.to_le_bytes());
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
     

@@ -26,8 +26,11 @@ const IMAGE_REL_AMD64_ADDR32NB: u16 = 3; // 32位相对于镜像基址
 const IMAGE_REL_AMD64_REL32: u16 = 4;    // 32位相对地址
 
 // x86 重定位类型
+#[allow(dead_code)]
 const IMAGE_REL_I386_DIR32: u16 = 6;     // 32位绝对地址
+#[allow(dead_code)]
 const IMAGE_REL_I386_DIR32NB: u16 = 7;   // 32位相对于镜像基址
+#[allow(dead_code)]
 const IMAGE_REL_I386_REL32: u16 = 20;    // 32位相对地址
 
 // --- COFF 结构体定义 ---
@@ -627,6 +630,7 @@ impl BofLoader {
     }
 
     /// 核心符号修复逻辑 (Symbol Patching) - x86 版本
+    #[allow(dead_code)]
     unsafe fn patch_symbols_x86(
         section_base: *mut u8,
         relocs: &[CoffRelocation],

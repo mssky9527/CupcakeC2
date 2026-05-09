@@ -7,8 +7,6 @@ import (
 
 func SaveAgent(agent *model.Agent) error {
 	// Use GORM's Save which handles both Create and Update (Upsert)
-	// We want to ensure it's "online" when saved during registration
-	agent.Status = "online"
 	agent.LastSeen = time.Now()
 	if agent.CreatedAt.IsZero() {
 		agent.CreatedAt = time.Now()
@@ -16,6 +14,15 @@ func SaveAgent(agent *model.Agent) error {
 	agent.UpdatedAt = time.Now()
 
 	return DB.Save(agent).Error
+}
+
+func GetAgent(uuid string) (*model.Agent, error) {
+	var agent model.Agent
+	err := DB.Where("uuid = ?", uuid).First(&agent).Error
+	if err != nil {
+		return nil, err
+	}
+	return &agent, nil
 }
 
 func GetAllAgents() ([]model.Agent, error) {

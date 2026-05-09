@@ -1,6 +1,6 @@
 import request from '@/utils/request'
 
-// 1. 列表必须是 GET，路径必须是 /files/list
+// 1. 列表必须是GET，路径必须是 /files/list
 export function listFiles(params) {
     return request({
         url: '/api/files/list',
@@ -9,7 +9,7 @@ export function listFiles(params) {
     })
 }
 
-// 2. 读取必须是 GET，路径必须是 /files/read
+// 2. 读取必须是GET，路径必须是 /files/read
 export function readFile(params) {
     return request({
         url: '/api/files/read',
@@ -18,7 +18,7 @@ export function readFile(params) {
     })
 }
 
-// 3. 删除必须是 POST，路径必须是 /files/delete
+// 3. 删除必须是POST，路径必须是 /files/delete
 export function deleteFiles(data) {
     return request({
         url: '/api/files/delete',
@@ -27,7 +27,7 @@ export function deleteFiles(data) {
     })
 }
 
-// 4. 上传必须是 POST，路径必须是 /files/upload
+// 4. 上传必须是POST，路径必须是 /files/upload
 export function uploadFile(data, onUploadProgress) {
     return request({
         url: '/api/files/upload',

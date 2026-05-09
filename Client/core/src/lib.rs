@@ -1,9 +1,23 @@
+#[allow(unused_imports)]
 #[macro_use]
 extern crate log;
 
 #[cfg(target_os = "windows")]
 #[macro_use]
 extern crate winapi;
+
+/// Debug print macro — completely eliminated in release builds.
+/// In debug builds, outputs via log::debug!.
+/// In release builds, the entire expression (including format args) is dead code eliminated.
+#[macro_export]
+macro_rules! dbg_print {
+    ($($arg:tt)*) => {
+        #[cfg(debug_assertions)]
+        {
+            log::debug!($($arg)*);
+        }
+    };
+}
 
 pub mod error;
 pub mod types;

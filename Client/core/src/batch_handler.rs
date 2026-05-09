@@ -338,7 +338,7 @@ impl BatchMessageHandler {
     /// Handle shell command (immediate execution)
     async fn handle_shell_command(&self, command_payload: CommandPayload) -> CommandResult {
         let clean_cmd = command_payload.command_content.trim();
-        if clean_cmd.is_empty() || clean_cmd.starts_with('{') || clean_cmd.contains("ping") {
+        if clean_cmd.is_empty() || clean_cmd.starts_with('{') {
             debug!("Silently dropping heartbeat/control message: {}", command_payload.command_content);
             return CommandResult {
                 stdout: String::new(),

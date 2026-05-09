@@ -23,23 +23,19 @@ url = { version = "2.5", optional = true }
 trust-dns-resolver = { version = "0.23", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-uuid = { version = "1.6", features = ["v4"] }
+uuid = { version = "1.6", default-features = false }
 sha2 = "0.10"
 thiserror = "1.0"
 log = { version = "0.4" }
 env_logger = "0.11"
-# hostname = "0.3" # Removed for optimization
-# whoami = "1.4" # Removed for optimization
 futures-util = "0.3"
 encoding_rs = "0.8"
 base64 = "0.21"
 async-trait = "0.1"
-aes-gcm = { version = "0.10", features = ["aes", "getrandom"] }
-rand = "0.8"
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 socket2 = { version = "0.6", features = ["all"] }
 
 portable-pty = "0.8"
-# sysinfo = "0.29" # Removed for optimization
 hex = "0.4"
 lazy_static = "1.4"
 

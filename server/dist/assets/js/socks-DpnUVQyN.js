@@ -1,0 +1,1 @@
+import{o as e}from"./index-BMLl5ym4.js";function t(){return e.get(`/api/socks`)}function n(t){return e.post(`/api/socks/start`,t)}function r(t){return e.post(`/api/socks/stop`,t)}function i(t){return e.post(`/api/tunnel/delete`,t)}export{r as i,t as n,n as r,i as t};

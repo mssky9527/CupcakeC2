@@ -268,6 +268,7 @@
       v-model="terminalDialogVisible"
       width="1040px"
       class="build-dialog premium-dialog"
+      :show-close="false"
       destroy-on-close
       @opened="onTerminalOpened"
       @closed="onTerminalClosed"

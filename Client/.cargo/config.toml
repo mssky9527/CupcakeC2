@@ -1,0 +1,19 @@
+[build]
+rustflags = [
+    "--remap-path-prefix", "E:\\学习\\C2\\Client=/src",
+    "--remap-path-prefix", "C:\\Users\\47993=/u",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "--remap-path-prefix", "E:\\学习\\C2\\Client=/src",
+    "--remap-path-prefix", "C:\\Users\\47993=/u",
+    "-Clink-arg=/DEBUG:NONE",
+]
+
+[target.i686-pc-windows-msvc]
+rustflags = [
+    "--remap-path-prefix", "E:\\学习\\C2\\Client=/src",
+    "--remap-path-prefix", "C:\\Users\\47993=/u",
+    "-Clink-arg=/DEBUG:NONE",
+]

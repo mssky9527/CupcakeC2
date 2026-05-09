@@ -201,12 +201,11 @@ const fetchPlugins = async () => {
 const fetchLogs = async () => {
     loadingLogs.value = true
     try {
-        const res = await api.get(`/api/resp?uuid=${props.clientId}`)
-        // Fetch full history from DB via settings if available? 
-        // For now, let's use a simpler way or dedicated history endpoint if it existed
-        // But store already saves it. Let's try to get last 10
         const histRes = await api.get(`/api/clients/history/${props.clientId}`)
-        history.value = histRes.data.slice(0, 10)
+        // 只显示插件执行记录，过滤掉系统命令（migrate、shell、heartbeat等）
+        const systemCommands = ['migrate', 'shell', 'shell_interactive', 'shell_exit', 'heartbeat', 'file_upload', 'file_download', 'file_upload_chunk', 'file_download_chunk', 'file_delete', 'file_list']
+        const pluginOnly = (histRes.data || []).filter(log => !systemCommands.includes(log.type))
+        history.value = pluginOnly.slice(0, 10)
     } catch (e) {
         console.error('Logs fetch failed', e)
     } finally {

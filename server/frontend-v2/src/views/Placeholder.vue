@@ -21,6 +21,7 @@ import { DataBoard } from '@element-plus/icons-vue'
   height: 50vh;
   margin-top: 50px;
 }
+
 :deep(.el-empty__description p) {
   color: var(--text-secondary);
   font-size: 16px;

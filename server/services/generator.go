@@ -50,7 +50,7 @@ func PatchPayload(raw []byte, c2url string, aesKey string, heartbeat int, jitter
 	data := make([]byte, len(raw))
 	copy(data, raw)
 
-	log.Printf("Starting payload patching. URL: %s, Heartbeat: %d, Jitter: %d, AutoDestruct: %v, SleepTime: %d", c2url, heartbeat, jitter, autoDestruct, sleepTime)
+	// Patching payload silently (no log spam)
 
 	// 1. Patch Server URL
 	urlMarkers := []string{
