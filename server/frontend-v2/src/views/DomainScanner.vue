@@ -1,6 +1,6 @@
 <template>
   <div class="plugin-management-container">
-    <section class="view-actions">
+    <section class="view-actions view-actions--between">
       <div class="view-actions__copy">
         <span class="panel-kicker">Plugin Center</span>
         <h3>插件管理</h3>

@@ -16,7 +16,7 @@ dns = ["dep:trust-dns-resolver"]  # DNS 隧道协议实现
 
 [dependencies]
 tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time", "sync", "process"] }
-tokio-tungstenite = { version = "0.21", features = ["native-tls"], optional = true }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"], optional = true }
 tokio-util = { version = "0.7", features = ["codec", "compat"] }
 yamux = "0.10"
 url = { version = "2.5", optional = true }

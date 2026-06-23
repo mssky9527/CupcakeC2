@@ -1,16 +1,11 @@
 <template>
   <div class="tunnel-manager-container">
-    <div class="page-header glass-panel mb-24">
-      <div class="header-content">
-        <div class="title-section">
-          <h2 class="main-title">全局 <span class="purple-text">隧道路由</span></h2>
-          <p class="sub-title">内网穿透数据转发管理 (Network Routing Control Center)</p>
-        </div>
-        <el-button class="premium-btn refresh-btn" :loading="loading" @click="fetchData">
-          <el-icon><Refresh /></el-icon> 刷新状态
-        </el-button>
-      </div>
-    </div>
+    <section class="view-actions">
+      <el-button @click="fetchData" :loading="loading">
+        <el-icon><Refresh /></el-icon>
+        刷新
+      </el-button>
+    </section>
 
     <div class="stats-row mb-24">
       <div class="stat-module glass-panel">
