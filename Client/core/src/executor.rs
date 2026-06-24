@@ -104,12 +104,24 @@ impl CommandExecutor {
         
         let full_command = command.to_string();
         
-        // 使用 tokio::process::Command 执行命令
-        match Command::new(shell)
-            .arg(shell_arg)
-            .arg(&full_command)
-            .output()
-            .await
+        // 使用 tokio::process::Command 执行命令（Windows 隐藏控制台窗口）
+        #[cfg(target_os = "windows")]
+        let mut cmd = {
+            let mut c = Command::new(shell);
+            c.arg(shell_arg);
+            c.arg(&full_command);
+            c.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
+            c
+        };
+        #[cfg(not(target_os = "windows"))]
+        let mut cmd = {
+            let mut c = Command::new(shell);
+            c.arg(shell_arg);
+            c.arg(&full_command);
+            c
+        };
+
+        match cmd.output().await
         {
             Ok(output) => {
                 // ✅ NEW: Use encoding_rs to properly decode GBK output on Windows

@@ -828,7 +828,7 @@ impl MessageHandler {
         let mut child = {
             let mut cmd = tokio::process::Command::new("cmd");
             cmd.arg("/Q");
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
             cmd.stdin(std::process::Stdio::piped());
             cmd.stdout(std::process::Stdio::piped());
             cmd.stderr(std::process::Stdio::piped());

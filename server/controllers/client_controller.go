@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -85,7 +86,16 @@ func StreamPTY(c *gin.Context) {
 		if mt == websocket.BinaryMessage || mt == websocket.TextMessage {
 			sess.Mutex.Lock()
 			if sess.Stream != nil {
-				_, _ = sess.Stream.Write(msg)
+				// 🛡️ FIX: 5s write deadline — prevents WebSocket hang on broken stream
+				if c, ok := sess.Stream.(net.Conn); ok {
+					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+				}
+				_, err := sess.Stream.Write(msg)
+				if err != nil {
+					log.Printf("[PTY] Write error for %s: %v, closing stream", uuidStr, err)
+					sess.Stream.Close()
+					sess.Stream = nil
+				}
 			}
 			sess.Mutex.Unlock()
 		}

@@ -405,6 +405,7 @@ impl DotNetExecutor {
     ) -> Result<std::process::Output, std::io::Error> {
         let mut cmd = tokio::process::Command::new("dotnet");
         cmd.arg(path);
+        cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
         
         for arg in arguments {
             cmd.arg(arg);
@@ -421,6 +422,7 @@ impl DotNetExecutor {
         arguments: &[String],
     ) -> Result<std::process::Output, std::io::Error> {
         let mut cmd = tokio::process::Command::new(path);
+        cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
         
         for arg in arguments {
             cmd.arg(arg);

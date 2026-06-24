@@ -46,7 +46,10 @@ pub async fn handle_stream(stream: Stream) {
     info!("[PROCESS] Starting process management session");
     
     let (mut reader, mut writer) = tokio::io::split(stream.compat());
-    
+
+    // 🛡️ FIX: Max request buffer (1MB) to prevent OOM from malicious data
+    const MAX_BUF: usize = 1024 * 1024;
+
     // 1. 读取请求（处理分段）
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -67,6 +70,12 @@ pub async fn handle_stream(stream: Stream) {
         };
 
         buf.extend_from_slice(&chunk[..n]);
+
+        // 🛡️ FIX: Prevent unbounded memory growth — reject requests over 1MB
+        if buf.len() > MAX_BUF {
+            error!("[PROCESS] Request too large (>{})", MAX_BUF);
+            break None;
+        }
         match serde_json::from_slice::<ProcRequest>(&buf) {
             Ok(r) => break Some(r),
             Err(e) if e.is_eof() => continue,

@@ -12,8 +12,7 @@
 // - 异步 I/O
 // - 可修补的服务器配置
 
-// Windows: Enabled for debugging
-// #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
  
   #[allow(unused_imports)]
   use cupcake_core::{Result, stealth};

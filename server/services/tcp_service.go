@@ -47,13 +47,22 @@ func StartTCPListener(ln *globals.Listener) {
 		}
 
 		go func() {
+			// 🛡️ FIX: 30s timeout for control stream — prevents goroutine leak
+			timer := time.AfterFunc(30*time.Second, func() {
+				log.Printf("[TCP] Timeout waiting for control stream, closing session")
+				session.Close()
+				conn.Close()
+			})
+
 			stream, err := session.Accept()
+			timer.Stop()
+
 			if err != nil {
 				log.Printf("[TCP Error] Session accept failed: %v", err)
-				session.Close()
+				conn.Close()
 				return
 			}
-			
+
 			ProcessTCPConnection(stream, stream.RemoteAddr().String(), ln, session)
 		}()
 	}

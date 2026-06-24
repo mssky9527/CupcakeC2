@@ -12,6 +12,7 @@ import (
     "strconv"
     "strings"
     "sync"
+    "time"
     "cupcake-server/pkg/globals"
     "cupcake-server/pkg/model"
     "cupcake-server/pkg/store"
@@ -217,102 +218,187 @@ func GetActiveTunnels() []TunnelDTO {
 }
 
 func handleSocksConnection(conn net.Conn, agentID, user, pass string) {
-    defer conn.Close()
+	defer conn.Close()
+	// 🛡️ SOCKS5 握手总超时：防止客户端不发请求导致 goroutine 永久阻塞
+	conn.SetDeadline(time.Now().Add(60 * time.Second))
+	defer conn.SetDeadline(time.Time{})
 
-    // 1. SOCKS5 Handshake
-    buf := make([]byte, 258)
-    if _, err := io.ReadAtLeast(conn, buf, 2); err != nil { return }
-    if buf[0] != 0x05 { return }
-    
-    // Choose Auth Method
-    if user != "" && pass != "" {
-        conn.Write([]byte{0x05, 0x02}) // Username/Password Auth (0x02)
+	// 🛡️ FIX: Global panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[SOCKS] ⚠️ PANIC recovered: %v", r)
+		}
+	}()
 
-        // Auth Negotiation
-        header := make([]byte, 2)
-        if _, err := io.ReadAtLeast(conn, header, 2); err != nil { return }
-        if header[0] != 0x01 { return } // Sub-negotiation version 1
+	remoteAddr := conn.RemoteAddr().String()
+	log.Printf("[SOCKS] 🔌 New connection from %s (agent=%s)", remoteAddr, agentID)
 
-        uLen := int(header[1])
-        uBuf := make([]byte, uLen)
-        if _, err := io.ReadAtLeast(conn, uBuf, uLen); err != nil { return }
-        
-        pLenBuf := make([]byte, 1)
-        if _, err := io.ReadAtLeast(conn, pLenBuf, 1); err != nil { return }
-        pLen := int(pLenBuf[0])
-        pBuf := make([]byte, pLen)
-        if _, err := io.ReadAtLeast(conn, pBuf, pLen); err != nil { return }
-
-        if string(uBuf) != user || string(pBuf) != pass {
-            conn.Write([]byte{0x01, 0x01}) // Auth Failed
-            return
-        }
-        conn.Write([]byte{0x01, 0x00}) // Auth Success
-    } else {
-        conn.Write([]byte{0x05, 0x00}) // No Auth
-    }
-
-    // 2. Request Details
-    if _, err := io.ReadAtLeast(conn, buf, 4); err != nil { return }
-    if buf[1] != 0x01 { return }
-
-    var targetHost string
-    switch buf[3] {
-    case 0x03: // Domain Name
-        lenBuf := make([]byte, 1)
-        if _, err := io.ReadFull(conn, lenBuf); err != nil { return }
-        domainLen := int(lenBuf[0])
-        domainBytes := make([]byte, domainLen)
-        if _, err := io.ReadFull(conn, domainBytes); err != nil { return }
-        targetHost = string(domainBytes)
-    case 0x01: // IPv4
-        ipBuf := make([]byte, 4)
-        if _, err := io.ReadFull(conn, ipBuf); err != nil { return }
-        targetHost = net.IP(ipBuf).String()
-    default:
-        return 
-    }
-    
-    portBuf := make([]byte, 2)
-    if _, err := io.ReadFull(conn, portBuf); err != nil { return }
-    port := binary.BigEndian.Uint16(portBuf)
-
-    // 3. Connect to Agent via Yamux
-    val, ok := globals.Clients.Load(agentID)
-    if !ok { return }
-    client := val.(*globals.Client)
-    session := client.YamuxSession
-    if session == nil { return }
-
-    stream, err := session.Open()
-    if err != nil { return }
-    defer stream.Close()
-
-    // 4. Send Protocol Header (0x02 for SOCKS/HTTP-TCP)
-    stream.Write([]byte{0x02})
-
-	// 5. Send Target Info to Agent
-	sendTargetInfo(stream, targetHost, strconv.Itoa(int(port)))
-
-	// ⚡️ V3.0.1 Fix: Wait for Agent's Ack (1 byte) before piping
-	// This prevents the Agent's internal ack byte (0x01) from leaking into the SOCKS tunnel
-	ack := make([]byte, 1)
-	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x01 {
-		conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) // 0x05 = Connection refused
+	// 1. SOCKS5 Handshake
+	buf := make([]byte, 258)
+	if _, err := io.ReadAtLeast(conn, buf, 2); err != nil {
+		log.Printf("[SOCKS] ⚠️ %s: read handshake failed: %v", remoteAddr, err)
+		return
+	}
+	if buf[0] != 0x05 {
+		log.Printf("[SOCKS] ⚠️ %s: not SOCKS5 (ver=0x%02x)", remoteAddr, buf[0])
 		return
 	}
 
+	// Choose Auth Method
+	if user != "" && pass != "" {
+		log.Printf("[SOCKS] 🔐 %s: auth required, negotiating...", remoteAddr)
+		conn.Write([]byte{0x05, 0x02}) // Username/Password Auth (0x02)
+
+		// Auth Negotiation
+		header := make([]byte, 2)
+		if _, err := io.ReadAtLeast(conn, header, 2); err != nil {
+			return
+		}
+		if header[0] != 0x01 { return }
+
+		uLen := int(header[1])
+		uBuf := make([]byte, uLen)
+		if _, err := io.ReadAtLeast(conn, uBuf, uLen); err != nil { return }
+
+		pLenBuf := make([]byte, 1)
+		if _, err := io.ReadAtLeast(conn, pLenBuf, 1); err != nil { return }
+		pLen := int(pLenBuf[0])
+		pBuf := make([]byte, pLen)
+		if _, err := io.ReadAtLeast(conn, pBuf, pLen); err != nil { return }
+
+		if string(uBuf) != user || string(pBuf) != pass {
+			log.Printf("[SOCKS] ❌ %s: auth FAILED (user=%s)", remoteAddr, string(uBuf))
+			conn.Write([]byte{0x01, 0x01}) // Auth Failed
+			return
+		}
+		log.Printf("[SOCKS] ✅ %s: auth OK", remoteAddr)
+		conn.Write([]byte{0x01, 0x00}) // Auth Success
+	} else {
+		log.Printf("[SOCKS] 🔓 %s: no auth required", remoteAddr)
+		conn.Write([]byte{0x05, 0x00}) // No Auth
+	}
+
+	// 2. Request Details
+	// 🛡️ FIX: Read 4-byte header only (VER, CMD, RSV, ATYP) into buf[0:4]
+	// buf[:4] limits the first TCP read to 4 bytes, leaving remaining data in kernel buffer
+	if _, err := io.ReadAtLeast(conn, buf[:4], 4); err != nil {
+		log.Printf("[SOCKS] ⚠️ %s: read request header failed: %v", remoteAddr, err)
+		return
+	}
+	log.Printf("[SOCKS] 📋 %s: request header: VER=0x%02x CMD=0x%02x RSV=0x%02x ATYP=0x%02x", remoteAddr, buf[0], buf[1], buf[2], buf[3])
+	if buf[1] != 0x01 {
+		log.Printf("[SOCKS] ⚠️ %s: unsupported command 0x%02x (want 0x01 CONNECT)", remoteAddr, buf[1])
+		return
+	}
+
+	var targetHost string
+	var port uint16
+	switch buf[3] {
+	case 0x03: // Domain Name — read len(1) + domain(N) + port(2)
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			log.Printf("[SOCKS] ⚠️ %s: read domain length failed: %v", remoteAddr, err)
+			return
+		}
+		domainLen := int(buf[0])
+		if domainLen == 0 || domainLen > 255 {
+			log.Printf("[SOCKS] ⚠️ %s: invalid domain length %d", remoteAddr, domainLen)
+			return
+		}
+		domainBuf := make([]byte, domainLen)
+		if _, err := io.ReadFull(conn, domainBuf); err != nil {
+			log.Printf("[SOCKS] ⚠️ %s: read domain failed: %v", remoteAddr, err)
+			return
+		}
+		targetHost = string(domainBuf)
+		if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+			log.Printf("[SOCKS] ⚠️ %s: read domain port failed: %v", remoteAddr, err)
+			return
+		}
+		port = binary.BigEndian.Uint16(buf[:2])
+	case 0x01: // IPv4 — read IP(4) + port(2)
+		if _, err := io.ReadFull(conn, buf[:6]); err != nil {
+			log.Printf("[SOCKS] ⚠️ %s: read addr+port failed: %v", remoteAddr, err)
+			return
+		}
+		targetHost = net.IP(buf[:4]).String()
+		port = binary.BigEndian.Uint16(buf[4:6])
+	default:
+		log.Printf("[SOCKS] ⚠️ %s: unsupported address type 0x%02x", remoteAddr, buf[3])
+		return
+	}
+	log.Printf("[SOCKS] 🎯 %s: CONNECT %s:%d", remoteAddr, targetHost, port)
+
+	// 3. Connect to Agent via Yamux
+	val, ok := globals.Clients.Load(agentID)
+	if !ok {
+		log.Printf("[SOCKS] ❌ %s: agent %s not found", remoteAddr, agentID)
+		return
+	}
+	client := val.(*globals.Client)
+	session := client.YamuxSession
+	if session == nil {
+		log.Printf("[SOCKS] ❌ %s: agent %s has nil YamuxSession", remoteAddr, agentID)
+		return
+	}
+	log.Printf("[SOCKS] 🔗 %s: agent Yamux session OK", remoteAddr)
+
+	stream, err := session.Open()
+	if err != nil {
+		log.Printf("[SOCKS] ❌ %s: session.Open() failed: %v", remoteAddr, err)
+		return
+	}
+	defer stream.Close()
+	log.Printf("[SOCKS] ✅ %s: Yamux stream opened", remoteAddr)
+
+	// 4. Send Protocol Header (0x02)
+	if _, err := stream.Write([]byte{0x02}); err != nil {
+		log.Printf("[SOCKS] ❌ %s: write type byte 0x02 failed: %v", remoteAddr, err)
+		return
+	}
+	log.Printf("[SOCKS] 📤 %s: sent type byte 0x02 to agent", remoteAddr)
+
+	// 5. Send Target Info to Agent
+	sendTargetInfo(stream, targetHost, strconv.Itoa(int(port)))
+	log.Printf("[SOCKS] 📤 %s: sent target info (%s:%d)", remoteAddr, targetHost, port)
+
+	// ⚡️ FIX: Wait for Agent ACK with 30s timeout
+	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x01 {
+		if err != nil {
+			log.Printf("[SOCKS] ❌ %s: ACK read error: %v", remoteAddr, err)
+		} else {
+			log.Printf("[SOCKS] ❌ %s: bad ACK byte 0x%02x", remoteAddr, ack[0])
+		}
+		conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	stream.SetReadDeadline(time.Time{})
+	log.Printf("[SOCKS] ✅ %s: ACK received, agent connected to target", remoteAddr)
+
 	// 6. Respond to SOCKS Client "Success"
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	log.Printf("[SOCKS] ✅ %s: SOCKS5 success sent, starting data pipe", remoteAddr)
 
-    // 7. Pipe Data
-    go io.Copy(stream, conn)
-    io.Copy(conn, stream)
+	// 7. Pipe Data with proper cleanup
+	go io.Copy(stream, conn)
+	io.Copy(conn, stream)
+	log.Printf("[SOCKS] 🔚 %s: data pipe finished", remoteAddr)
+
+	conn.Close()
+	log.Printf("[SOCKS] 🔚 %s: connection closed", remoteAddr)
 }
 
 func handleHTTPConnection(conn net.Conn, agentID, user, pass string) {
-    defer conn.Close()
-    
+	defer conn.Close()
+
+	// 🛡️ FIX: Global panic recovery
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[HTTP] ⚠️ PANIC recovered: %v", r)
+		}
+	}()
+
     br := bufio.NewReader(conn)
     req, err := http.ReadRequest(br)
     if err != nil { return }
@@ -372,12 +458,13 @@ func handleHTTPConnection(conn net.Conn, agentID, user, pass string) {
     defer stream.Close()
 
     // 2. Send Protocol Header (0x02)
-    stream.Write([]byte{0x02})
+    if _, err := stream.Write([]byte{0x02}); err != nil { return }
 
 	// 3. Send Target Info
 	sendTargetInfo(stream, targetHost, targetPort)
 
-	// ⚡️ V3.0.1 Fix: Wait for Agent's Ack (1 byte)
+	// ⚡️ V3.0.1 Fix + Timeout: Wait for Agent's Ack (1 byte) before piping
+	stream.SetReadDeadline(time.Now().Add(30 * time.Second))
 	ack := make([]byte, 1)
 	if _, err := io.ReadFull(stream, ack); err != nil || ack[0] != 0x01 {
 		resp := http.Response{
@@ -388,6 +475,7 @@ func handleHTTPConnection(conn net.Conn, agentID, user, pass string) {
 		resp.Write(conn)
 		return
 	}
+	stream.SetReadDeadline(time.Time{}) // 🚨 Clear deadline for data forwarding
 
     // 4. Handle Protocol Specifics
     if req.Method == "CONNECT" {
@@ -399,6 +487,9 @@ func handleHTTPConnection(conn net.Conn, agentID, user, pass string) {
         go io.Copy(stream, br)
         io.Copy(conn, stream)
     }
+
+    // 🛡️ FIX: Close conn first to unblock goroutine before stream cleanup
+    conn.Close()
 }
 
 func sendTargetInfo(w io.Writer, host string, portStr string) {

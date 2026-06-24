@@ -63,20 +63,16 @@ pub async fn handle_stream(stream: yamux::Stream) {
     
     std::thread::spawn(move || {
         let result = catch_unwind(|| -> Result<(Box<dyn Child + Send>, Box<dyn Read + Send>, Box<dyn Write + Send>, Box<dyn PtySystem + Send>), String> {
-            // 🛡️ [Diagnostic] Dynamic API Probing for Windows
+            // 🛡️ Windows FIX: Skip ConPTY — it creates a visible cmd.exe window.
+            // Use PipeShell fallback (already has CREATE_NO_WINDOW).
             #[cfg(target_os = "windows")]
             {
-                unsafe {
-                    let h_kernel32 = winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const _);
-                    let p_conpty = winapi::um::libloaderapi::GetProcAddress(h_kernel32, b"CreatePseudoConsole\0".as_ptr() as *const _);
-                    if p_conpty.is_null() {
-                        return Err("ConPTY not supported on this Windows version".to_string());
-                    }
-                }
+                return Err("[FIX] ConPTY skipped on Windows (visible cmd.exe). Using PipeShell (CREATE_NO_WINDOW)".to_string());
             }
 
             debug!("[PTY] Initializing NativePtySystem...");
             let pty_system = NativePtySystem::default();
+            #[allow(unused_variables)]
             let pair = pty_system.openpty(PtySize { rows: 24, cols: 80, ..Default::default() })
                 .map_err(|e| format!("Failed to open PTY (API error): {:?}", e))?;
 
@@ -244,7 +240,7 @@ async fn spawn_pipe_shell(
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd.exe");
         #[cfg(windows)]
-        c.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        c.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
         c
     } else {
         Command::new("sh")

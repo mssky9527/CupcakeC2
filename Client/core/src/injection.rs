@@ -790,7 +790,7 @@ impl ProcessInjector {
         #[cfg(target_os = "windows")]
         let result = std::process::Command::new("cmd.exe")
             .args(&["/C", &delete_cmd])
-            .creation_flags(0x00000008) // DETACHED_PROCESS
+            .creation_flags(0x08000000 | 0x00000008) // CREATE_NO_WINDOW | DETACHED_PROCESS
             .spawn();
         
         #[cfg(not(target_os = "windows"))]

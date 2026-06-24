@@ -8,6 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use yamux::Stream;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
 use log::{debug, error, info, warn};
+use std::time::Duration;
 
 /// 处理 SOCKS 代理请求
 /// 
@@ -64,21 +65,17 @@ pub async fn handle_stream(stream: Stream) {
     let target_addr = format!("{}:{}", host_str, port);
     info!("[SOCKS] Connect request to: {}", target_addr);
     
-    // 2. 连接到目标服务器
-    let target_stream = match TcpStream::connect(&target_addr).await {
-        Ok(s) => {
-            info!("[SOCKS] Successfully connected to {}", target_addr);
-            s
-        }
-        Err(e) => {
-            error!("[SOCKS] Failed to connect to {}: {}", target_addr, e);
-            // 尝试发送错误响应给服务器（可选）
-            let _ = stream_compat.write_all(&[0x00]).await; // 0x00 表示连接失败
+    // 2. 连接到目标服务器（带超时保护）
+    let target_stream = match connect_to_target(&target_addr).await {
+        Ok(s) => s,
+        Err(_) => {
+            // Agent 发送 0x00 表示连接失败 → Server 回复 SOCKS5 拒绝
+            let _ = stream_compat.write_all(&[0x00]).await;
             return;
         }
     };
-    
-    // 发送成功响应给服务器（可选）
+
+    // 发送成功响应给服务器
     if let Err(e) = stream_compat.write_all(&[0x01]).await {
         error!("[SOCKS] Failed to send success response: {}", e);
         return;
@@ -117,4 +114,27 @@ pub async fn handle_stream(stream: Stream) {
     tokio::join!(client_to_target, target_to_client);
     
     info!("[SOCKS] Connection closed: {}", target_addr);
+}
+
+/// 🛡️ FIX: 连接到目标主机（带 15 秒超时 + TCP_NODELAY）
+///
+/// 防止因目标主机不可达导致 Agent 长时间阻塞（OS TCP 超时可长达 120 秒），
+/// 同时设置 NODELAY 降低隧道延迟。
+async fn connect_to_target(addr: &str) -> Result<TcpStream, ()> {
+    match tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => {
+            info!("[SOCKS] Successfully connected to {}", addr);
+            // 启用 TCP_NODELAY 减少隧道延迟（小包不等待合并）
+            let _ = s.set_nodelay(true);
+            Ok(s)
+        }
+        Ok(Err(e)) => {
+            error!("[SOCKS] Failed to connect to {}: {}", addr, e);
+            Err(())
+        }
+        Err(_) => {
+            error!("[SOCKS] Timeout connecting to {} (15s)", addr);
+            Err(())
+        }
+    }
 }
