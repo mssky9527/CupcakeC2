@@ -652,6 +652,10 @@ func WriteEncryptedMessage(client *globals.Client, msg interface{}) error {
 		}
 		return client.WebSocketConn.WriteMessage(msgType, payload)
 	} else if client.Transport == "tcp" {
+		// 🐛 互斥锁防止与 startWriteLoop 并发写导致消息错位
+		client.TCPWriteMu.Lock()
+		defer client.TCPWriteMu.Unlock()
+
 		// Use framing for TCP
 		header := make([]byte, 4)
 		binary.BigEndian.PutUint32(header, uint32(len(payload)))

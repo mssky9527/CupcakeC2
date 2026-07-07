@@ -44,6 +44,7 @@ pub mod batch_handler;
 pub mod stealth;
 pub mod loader;
 pub mod syscalls;
+pub mod fallback; // 🛡️ Phase 3: Fallback Channel
 
 // 重新导出常用类型
 pub use error::{ClientError, Result};

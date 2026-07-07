@@ -9,24 +9,33 @@ use crate::config;
 /// Nonce 长度（12 字节，AES-GCM 标准）
 const NONCE_LENGTH: usize = 12;
 
+/// Phase 2: Traffic Camouflage Constants
+const HTTP_HEADER_TEMPLATE: &[u8] = b"POST /api/v1/sync HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ";
+const HTTP_HEADER_END: &[u8] = b"\r\n\r\n";
+const HTTP_RESPONSE_TEMPLATE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+const HTTP_RESPONSE_END: &[u8] = b"\r\n\r\n";
+
 /// 使用 Salt 和 Vkey 派生实际的 AES 密钥
 /// Key = SHA256(Vkey + Salt)
 pub fn derive_key(base_key: &[u8], salt: &[u8]) -> Vec<u8> {
     if salt.is_empty() {
         return base_key.to_vec();
     }
-    
+
     let mut hasher = Sha256::new();
     hasher.update(base_key);
     hasher.update(salt);
     hasher.finalize().to_vec()
 }
 
+/// 🛡️ Phase 2: Enhanced Traffic Camouflage
+///
 /// 报文混淆：对加密后的报文进行二次混淆 (防止 DPI 特征识别)
+/// 新增 HTTP 伪装模式，使 WebSocket 流量看起来像正常 HTTP API 调用
 pub fn obfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
     let mode = config::get_packet_obfuscation_mode();
     if mode == "none" || mode.is_empty() {
-        return data;
+        return apply_default_padding(data);
     }
 
     match mode.as_str() {
@@ -51,27 +60,156 @@ pub fn obfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
             // Junk Data Padding 模式：填充随机长度的垃圾数据
             // 格式: [Encrypted Data] + [Junk Bytes] + [Original Len (4 bytes)]
             let original_len = data.len() as u32;
-            let mut junk_len = (crate::utils::next_u32() % 64) as usize; 
+            let mut junk_len = (crate::utils::next_u32() % 64) as usize;
             if junk_len == 0 { junk_len = 8; }
-            
+
             let mut junk = vec![0u8; junk_len];
             for i in 0..junk_len {
                 junk[i] = (crate::utils::next_u32() % 256) as u8;
             }
-            
+
             data.extend_from_slice(&junk);
             data.extend_from_slice(&original_len.to_be_bytes());
             data
         }
-        _ => data
+        "http" => {
+            // 🚀 Phase 2: HTTP 伪装模式
+            // 将 WebSocket 帧伪装成 HTTP POST 请求
+            // 格式: HTTP Header + Base64(Encrypted Data) + Padding
+            wrap_as_http_request(data)
+        }
+        "padding" => {
+            // 🚀 Phase 2: Tailored Padding 模式
+            // 每个包填充随机长度数据 (50-2048 字节)，使 DPI 包长度分析失效
+            apply_tailored_padding(data)
+        }
+        _ => apply_default_padding(data)
     }
+}
+
+/// 🛡️ Phase 2: Default padding to avoid fixed packet sizes
+fn apply_default_padding(data: Vec<u8>) -> Vec<u8> {
+    // Add small random padding (1-16 bytes) to every packet
+    // This prevents pattern recognition based on fixed packet sizes
+    let padding_len = (crate::utils::next_u32() % 16 + 1) as usize;
+    let mut padded = data;
+
+    // Random padding bytes
+    for _ in 0..padding_len {
+        padded.push((crate::utils::next_u32() % 256) as u8);
+    }
+
+    // Append padding length marker (last 2 bytes)
+    padded.extend_from_slice(&(padding_len as u16).to_be_bytes());
+
+    padded
+}
+
+/// 🛡️ Phase 2: HTTP Request Wrapper
+fn wrap_as_http_request(data: Vec<u8>) -> Vec<u8> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    // Base64 encode the encrypted data
+    let b64_data = STANDARD.encode(&data);
+
+    // Add padding to vary content length
+    let padding_len = (crate::utils::next_u32() % 100 + 50) as usize;
+    let padding = generate_http_padding(padding_len);
+
+    // Build HTTP POST request
+    let content_len = b64_data.len() + padding.len();
+
+    let mut http_packet = Vec::new();
+
+    // HTTP Header
+    http_packet.extend_from_slice(HTTP_HEADER_TEMPLATE);
+    http_packet.extend_from_slice(content_len.to_string().as_bytes());
+    http_packet.extend_from_slice(HTTP_HEADER_END);
+
+    // Content: Base64(Data) + Padding JSON
+    http_packet.extend_from_slice(b64_data.as_bytes());
+    http_packet.extend_from_slice(&padding);
+
+    http_packet
+}
+
+/// Generate JSON-style padding for HTTP camouflage
+fn generate_http_padding(len: usize) -> Vec<u8> {
+    // Generate random JSON-like padding
+    let mut padding = Vec::new();
+    padding.push(b'{');
+
+    let num_fields = (crate::utils::next_u32() % 5 + 2) as usize;
+    for i in 0..num_fields {
+        if i > 0 {
+            padding.push(b',');
+        }
+
+        // Random field name
+        let field_names = ["status", "timestamp", "version", "token", "session", "request_id", "nonce"];
+        let field_idx = (crate::utils::next_u32() % field_names.len() as u32) as usize;
+        let field = field_names[field_idx];
+
+        padding.push(b'"');
+        padding.extend_from_slice(field.as_bytes());
+        padding.extend_from_slice(b"\":");
+
+        // Random value (string or number)
+        if crate::utils::random_bool(0.5) {
+            padding.push(b'"');
+            let val_len = (crate::utils::next_u32() % 10 + 5) as usize;
+            for _ in 0..val_len {
+                padding.push((crate::utils::next_u32() % 26 + 97) as u8); // lowercase letters
+            }
+            padding.push(b'"');
+        } else {
+            padding.extend_from_slice((crate::utils::next_u32() % 10000).to_string().as_bytes());
+        }
+    }
+
+    padding.push(b'}');
+
+    // Pad to target length with whitespace
+    while padding.len() < len {
+        padding.push(b' ');
+    }
+
+    padding
+}
+
+/// 🛡️ Phase 2: Tailored Padding (50-2048 bytes random)
+fn apply_tailored_padding(data: Vec<u8>) -> Vec<u8> {
+    // Random padding between 50-2048 bytes
+    let padding_len = (crate::utils::next_u32() % 1998 + 50) as usize;
+
+    let mut padded = data;
+
+    // Generate random padding bytes
+    for _ in 0..padding_len {
+        // Use varied byte distribution to mimic normal traffic
+        let byte = if crate::utils::random_bool(0.7) {
+            // Mostly printable ASCII (mimics text content)
+            (crate::utils::next_u32() % 95 + 32) as u8
+        } else {
+            // Some binary content
+            (crate::utils::next_u32() % 256) as u8
+        };
+        padded.push(byte);
+    }
+
+    // Store original length for deobfuscation (4 bytes at end)
+    let original_len = data.len() as u32;
+    padded.extend_from_slice(&original_len.to_be_bytes());
+
+    padded
 }
 
 /// 报文解混淆
 pub fn deobfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
     let mode = config::get_packet_obfuscation_mode();
     if mode == "none" || mode.is_empty() {
-        return data;
+        return remove_default_padding(data);
     }
 
     match mode.as_str() {
@@ -95,18 +233,108 @@ pub fn deobfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
         "junk" => {
             // 识别并移除 Junk Padding (最后 4 字节固定是原始长度)
             if data.len() < 4 { return data; }
-            
+
             let mut len_bytes = [0u8; 4];
             len_bytes.copy_from_slice(&data[data.len()-4..]);
             let original_len = u32::from_be_bytes(len_bytes) as usize;
-            
+
             if original_len <= data.len() - 4 {
                 data.truncate(original_len);
             }
             data
         }
-        _ => data
+        "http" => {
+            // 🚀 Phase 2: Extract from HTTP wrapper
+            extract_from_http_wrapper(data)
+        }
+        "padding" => {
+            // 🚀 Phase 2: Remove tailored padding
+            remove_tailored_padding(data)
+        }
+        _ => remove_default_padding(data)
     }
+}
+
+/// Remove default padding
+fn remove_default_padding(data: Vec<u8>) -> Vec<u8> {
+    if data.len() < 2 { return data; }
+
+    // Read padding length marker (last 2 bytes)
+    let marker_len = u16::from_be_bytes([data[data.len()-2], data[data.len()-1]]) as usize;
+
+    if data.len() >= 2 + marker_len {
+        let original_len = data.len() - 2 - marker_len;
+        data.truncate(original_len);
+    }
+
+    data
+}
+
+/// Extract data from HTTP wrapper
+fn extract_from_http_wrapper(data: Vec<u8>) -> Vec<u8> {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+
+    // Find HTTP body start (after "\r\n\r\n")
+    let header_end_marker = b"\r\n\r\n";
+    if let Some(pos) = find_sequence(&data, header_end_marker) {
+        let body_start = pos + header_end_marker.len();
+
+        if body_start >= data.len() { return data; }
+
+        // Extract body (Base64 encoded)
+        let body = &data[body_start..];
+
+        // Find and strip padding (JSON object after base64 data)
+        // Base64 data ends at '{' or first non-base64 character
+        let b64_end = body.iter().position(|&b| b == b'{' || !is_base64_char(b))
+            .unwrap_or(body.len());
+
+        let b64_data = &body[..b64_end];
+
+        // Decode base64
+        if let Ok(decoded) = STANDARD.decode(b64_data) {
+            return decoded;
+        }
+    }
+
+    data
+}
+
+/// Find byte sequence in data
+fn find_sequence(data: &[u8], sequence: &[u8]) -> Option<usize> {
+    if sequence.len() > data.len() { return None; }
+
+    for i in 0..=data.len() - sequence.len() {
+        if data[i..i+sequence.len()] == *sequence {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Check if byte is valid base64 character
+fn is_base64_char(b: u8) -> bool {
+    (b >= b'A' && b <= b'Z') ||
+    (b >= b'a' && b <= b'z') ||
+    (b >= b'0' && b <= b'9') ||
+    b == b'+' || b == b'/' || b == b'='
+}
+
+/// Remove tailored padding
+fn remove_tailored_padding(data: Vec<u8>) -> Vec<u8> {
+    if data.len() < 4 { return data; }
+
+    // Original length is stored in last 4 bytes
+    let mut len_bytes = [0u8; 4];
+    len_bytes.copy_from_slice(&data[data.len()-4..]);
+    let original_len = u32::from_be_bytes(len_bytes) as usize;
+
+    if original_len <= data.len() - 4 && original_len > 0 {
+        data.truncate(original_len);
+    }
+
+    data
 }
 
 /// 加密数据

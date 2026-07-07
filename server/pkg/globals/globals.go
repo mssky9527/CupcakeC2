@@ -39,6 +39,7 @@ type Client struct {
 	TCPConn       net.Conn        `json:"-"`
 	YamuxSession  *yamux.Session  `json:"-"`
 	Transport     string          `json:"transport"` // "websocket", "tcp"
+	TCPWriteMu    sync.Mutex      `json:"-"`         // 🐛 修复: 防止并发写 TCPConn 导致消息错位
 	UUID           string          `json:"uuid"`
 	Hostname       string          `json:"hostname"`
 	OS             string          `json:"os"`
@@ -84,21 +85,27 @@ type Listener struct {
 	HeartbeatInterval int          `json:"heartbeat_interval"` // in seconds
 	HeartbeatJitter   int          `json:"heartbeat_jitter"`   // 0-100 percentage
 	MaxRetry          int          `json:"max_retry"`
+	// 🔒 TLS Configuration (Phase 1 - Secure WebSocket)
+	EnableTLS         bool         `json:"enable_tls"`
+	TLSCertPath       string       `json:"tls_cert_path"`
+	TLSKeyPath        string       `json:"tls_key_path"`
+	TLSCertPEM        string       `json:"tls_cert_pem"`
+	TLSKeyPEM         string       `json:"tls_key_pem"`
 	// Status and server instances
 	Status            string       `json:"status"`
 	HTTPServer        *http.Server `json:"-"`
-	DNSServer         interface{}  `json:"-"` // Using interface to avoid circular dep with miekg/dns if needed
+	DNSServer         interface{}  `json:"-"`
 	TCPServer         net.Listener `json:"-"`
 }
 
 var (
-	Clients          sync.Map
-	PTYState         sync.Map
+	Clients           sync.Map
+	PTYState          sync.Map
 	ActivePTYSessions sync.Map // UUID -> *PTYSession (用于保持后端 PTY 历史和分发)
-	LogsMap          sync.Map
-	PendingResponses sync.Map
-	Listeners        sync.Map
-	Upgrader         = websocket.Upgrader{
+	LogsMap           sync.Map
+	PendingResponses  sync.Map
+	Listeners         sync.Map
+	Upgrader          = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool { return true },
 	}
 	// 修复6: 使用 atomic 替代 Mutex，性能更高（无锁原子操作）

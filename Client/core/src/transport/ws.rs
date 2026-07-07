@@ -1,8 +1,13 @@
-// WebSocket 传输实现
+// WebSocket 传输实现 (TLS Enhanced)
 //
 // 实现 Transport trait，封装 tokio-tungstenite 的 WebSocket 逻辑。
 // 包含指数退避重连策略和连接管理。
 // 支持 AES-256-GCM 加密通信。
+// 支持 TLS (wss://) 加密连接。
+//
+// TLS Features:
+// - ws-native-tls: Windows 原生 TLS (SChannel)
+// - ws-rustls: Rust TLS 实现 (推荐跨平台)
 
 use crate::backoff::ExponentialBackoff;
 use crate::config::get_aes_key;
@@ -14,8 +19,9 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::Connector;
 
 /// WebSocket 流类型别名
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -80,11 +86,12 @@ impl WebSocketTransport {
 impl Transport for WebSocketTransport {
     async fn connect(&mut self) -> Result<()> {
         use tokio_tungstenite::tungstenite::http::Request;
-        
+
         loop {
             debug!("Connecting to {}...", self.url);
-            
+
             // 🛡️ TRAFFIC CAMOUFLAGE: Set custom headers to mimic browser traffic
+            // Enhanced headers for wss:// to match browser WebSocket fingerprint
             let mut request = Request::builder()
                 .uri(&self.url)
                 .header("User-Agent", crate::config::get_ua())
@@ -93,35 +100,78 @@ impl Transport for WebSocketTransport {
                 .header("Pragma", "no-cache")
                 .header("Cache-Control", "no-cache");
 
+            // Add browser-specific WebSocket headers for wss:// connections
+            if self.url.starts_with("wss://") {
+                request = request
+                    .header("Sec-Fetch-Dest", "empty")          // Browser WebSocket fingerprint
+                    .header("Sec-Fetch-Mode", "cors")           // CORS mode header
+                    .header("Sec-Fetch-Site", "cross-site");    // Site type header
+
+                // Add Origin header if host is configured
+                if let Some(host) = crate::config::get_host_header() {
+                    let origin = if host.contains(":") {
+                        format!("https://{}", host.split(':').next().unwrap_or(&host))
+                    } else {
+                        format!("https://{}", host)
+                    };
+                    request = request.header("Origin", origin);
+                }
+            }
+
             if let Some(host) = crate::config::get_host_header() {
                 request = request.header("Host", host);
             }
 
             let req = request.body(()).map_err(|e| ClientError::ConnectionError(e.to_string()))?;
 
-            match connect_async(req).await {
+            // 🔒 TLS Connection Handling
+            let is_tls = self.url.starts_with("wss://");
+
+            let connect_result = if is_tls {
+                debug!("TLS connection requested for {}", self.url);
+
+                // Use TLS-enabled connect with connector
+                // The connector is automatically provided by tokio-tungstenite when TLS feature is enabled
+                #[cfg(any(feature = "ws-native-tls", feature = "ws-rustls", feature = "ws"))]
+                {
+                    // Default TLS connector (rustls with native roots or native-tls)
+                    connect_async(req).await
+                }
+                #[cfg(not(any(feature = "ws-native-tls", feature = "ws-rustls", feature = "ws")))]
+                {
+                    // Fallback: try connect_async anyway (may fail without TLS)
+                    connect_async(req).await
+                }
+            } else {
+                // Plain WebSocket connection
+                connect_async(req).await
+            };
+
+            match connect_result {
                 Ok((ws_stream, response)) => {
                     info!("Connected to server successfully!");
                     info!("Response status: {}", response.status());
-                    
+                    if is_tls {
+                        info!("TLS handshake completed successfully");
+                    }
+
                     // 连接成功，保存流并重置退避计时器
                     self.stream = Some(ws_stream);
                     self.backoff.reset();
-                    
+
                     return Ok(());
                 }
                 Err(e) => {
-                    // ... (rest of logic same)
                     // 连接失败，获取下一次重连延迟
                     let delay = self.backoff.next_delay();
-                    
+
                     debug!(
                         "Failed to connect to {}: {}. Retrying in {} seconds...",
                         self.url,
                         e,
                         delay.as_secs()
                     );
-                    
+
                     // 等待指定时间后重试
                     sleep(delay).await;
                 }

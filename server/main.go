@@ -69,6 +69,7 @@ func main() {
 	adminRouter.Use(middleware.AuthMiddleware())
 
 	// 🚀 Public routes (no auth required) - Stager payload delivery
+	adminRouter.GET("/api/s/bin/:id", controllers.HandleServeRawPayload)
 	adminRouter.GET("/api/s/:id", controllers.HandleServePayload)
 
 	api := adminRouter.Group("/api")

@@ -3,11 +3,13 @@ module cupcake-server
 go 1.25.4
 
 require (
+	github.com/Binject/go-donut v0.0.0-20220908180326-fcdcc35d591c
 	github.com/gin-contrib/cors v1.7.6
 	github.com/gin-gonic/gin v1.11.0
 	github.com/glebarez/sqlite v1.11.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
+	github.com/hashicorp/yamux v0.1.2
 	github.com/miekg/dns v1.1.72
 	github.com/shirou/gopsutil/v3 v3.24.5
 	golang.org/x/crypto v0.46.0
@@ -16,8 +18,6 @@ require (
 
 require (
 	github.com/Binject/debug v0.0.0-20210312092933-6277045c2fdf // indirect
-	github.com/Binject/go-donut v0.0.0-20220908180326-fcdcc35d591c // indirect
-	github.com/akamensky/argparse v1.3.0 // indirect
 	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
@@ -31,7 +31,6 @@ require (
 	github.com/go-playground/validator/v10 v10.27.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/goccy/go-yaml v1.18.0 // indirect
-	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/jinzhu/inflection v1.0.0 // indirect
 	github.com/jinzhu/now v1.1.5 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect

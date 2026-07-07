@@ -10,6 +10,8 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["ws"]  # Default to WebSocket if not specified
 ws = ["dep:tokio-tungstenite", "dep:url"]
+ws-native-tls = ["ws", "dep:tokio-tungstenite", "tokio-tungstenite/native-tls"]
+ws-rustls = ["ws", "dep:tokio-tungstenite", "tokio-tungstenite/rustls-tls-native-roots"]
 tcp = []  # TCP protocol (uses tokio's built-in TcpStream)
 tcp_bind = [] # TCP Bind protocol (Agent listens for connection)
 dns = ["dep:trust-dns-resolver"]  # DNS 隧道协议实现

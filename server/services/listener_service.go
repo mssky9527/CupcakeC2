@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"crypto/tls"
 	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/store"
 	"fmt"
@@ -39,6 +40,11 @@ func RestoreListeners() {
 			HeartbeatJitter:   l.HeartbeatJitter,
 			MaxRetry:          l.MaxRetry,
 			Status:            l.Status,
+			EnableTLS:         l.EnableTLS,
+			TLSCertPath:       l.TLSCertPath,
+			TLSKeyPath:        l.TLSKeyPath,
+			TLSCertPEM:        l.TLSCertPEM,
+			TLSKeyPEM:         l.TLSKeyPEM,
 		}
 
 		if newLn.Status == "Running" {
@@ -68,6 +74,15 @@ func StartListenerInstance(ln *globals.Listener) error {
 			Addr:    fmt.Sprintf("%s:%d", ln.BindIP, ln.Port),
 			Handler: mux,
 		}
+
+		// 🔒 TLS Configuration for Secure WebSocket (wss://)
+		if ln.EnableTLS {
+			if err := configureTLS(ln); err != nil {
+				log.Printf("[TLS] Failed to configure TLS for listener %s: %v", ln.ID, err)
+				return err
+			}
+			log.Printf("[TLS] Secure WebSocket (wss://) enabled on port %d", ln.Port)
+		}
 	} else if ln.Protocol == "DNS" {
 		ln.DNSServer = &dns.Server{
 			Addr:    fmt.Sprintf("%s:%d", ln.BindIP, ln.Port),
@@ -79,7 +94,13 @@ func StartListenerInstance(ln *globals.Listener) error {
 	go func() {
 		var err error
 		if ln.Protocol == "WebSocket" {
-			err = ln.HTTPServer.ListenAndServe()
+			if ln.EnableTLS && ln.HTTPServer.TLSConfig != nil {
+				// Start TLS-enabled WebSocket server
+				err = ln.HTTPServer.ListenAndServeTLS("", "") // Cert/key already loaded in TLSConfig
+			} else {
+				// Start plain WebSocket server
+				err = ln.HTTPServer.ListenAndServe()
+			}
 		} else if ln.Protocol == "DNS" {
 			err = ln.DNSServer.(*dns.Server).ListenAndServe()
 		} else if ln.Protocol == "TCP" {
@@ -96,6 +117,54 @@ func StartListenerInstance(ln *globals.Listener) error {
 		}
 	}()
 	return nil
+}
+
+// 🔒 Configure TLS for Secure WebSocket
+func configureTLS(ln *globals.Listener) error {
+	// Priority: Inline PEM > File paths
+	var cert tls.Certificate
+	var err error
+
+	if ln.TLSCertPEM != "" && ln.TLSKeyPEM != "" {
+		// Use inline PEM certificates
+		cert, err = tls.X509KeyPair([]byte(ln.TLSCertPEM), []byte(ln.TLSKeyPEM))
+		if err != nil {
+			return fmt.Errorf("failed to parse inline PEM: %v", err)
+		}
+		log.Printf("[TLS] Using inline PEM certificate for listener %s", ln.ID)
+	} else if ln.TLSCertPath != "" && ln.TLSKeyPath != "" {
+		// Load from file paths
+		cert, err = tls.LoadX509KeyPair(ln.TLSCertPath, ln.TLSKeyPath)
+		if err != nil {
+			return fmt.Errorf("failed to load cert/key files: %v", err)
+		}
+		log.Printf("[TLS] Loaded certificate from %s for listener %s", ln.TLSCertPath, ln.ID)
+	} else {
+		// Generate self-signed certificate for testing/internal use
+		cert, err = generateSelfSignedCert()
+		if err != nil {
+			return fmt.Errorf("failed to generate self-signed cert: %v", err)
+		}
+		log.Printf("[TLS] Using auto-generated self-signed certificate for listener %s", ln.ID)
+	}
+
+	ln.HTTPServer.TLSConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12, // Enforce TLS 1.2+ for security
+	}
+
+	return nil
+}
+
+// Generate a self-signed certificate for development/testing
+func generateSelfSignedCert() (tls.Certificate, error) {
+	// This is a simplified self-signed cert generation
+	// In production, use proper certificates from Let's Encrypt or internal CA
+
+	// For now, we'll return an error prompting the user to provide certs
+	// A proper implementation would use crypto/x509 to generate certs
+
+	return tls.Certificate{}, fmt.Errorf("no TLS certificate provided. Please configure TLSCertPath/TLSKeyPath or TLSCertPEM/TLSKeyPEM")
 }
 
 func StopListenerInstance(ln *globals.Listener) {

