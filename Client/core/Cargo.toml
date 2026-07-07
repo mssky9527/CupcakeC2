@@ -10,8 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["ws"]  # Default to WebSocket if not specified
 ws = ["dep:tokio-tungstenite", "dep:url"]
-ws-native-tls = ["ws", "dep:tokio-tungstenite", "tokio-tungstenite/native-tls"]
-ws-rustls = ["ws", "dep:tokio-tungstenite", "tokio-tungstenite/rustls-tls-native-roots"]
+ws-tls = ["ws", "tokio-tungstenite/rustls-tls-native-roots"]  # wss:// TLS support via rustls
 tcp = []  # TCP protocol (uses tokio's built-in TcpStream)
 tcp_bind = [] # TCP Bind protocol (Agent listens for connection)
 dns = ["dep:trust-dns-resolver"]  # DNS 隧道协议实现
@@ -69,9 +68,6 @@ lto = "fat"             # Full link-time optimization
 codegen-units = 1       # Single codegen unit for max optimization
 panic = "abort"         # Remove panic unwind tables
 strip = "symbols"       # Strip debug symbols (saves ~60%)
-# Windows: enable static CRT to avoid VC redist dependency
-[target.'cfg(windows)'.profile.release]
-rustflags = ["-C", "target-feature=+crt-static"]
 
 # 🛡️ Phase 3: Debug build for testing
 [profile.dev]

@@ -137,7 +137,7 @@ impl WindowsMemoryLoader {
         let h_process = unsafe {
             winapi::um::processthreadsapi::OpenProcess(
                 winapi::um::winnt::PROCESS_CREATE_THREAD |
-                winapi::um::winnt::PROCESS_QUERY_OPERATION |
+                winapi::um::winnt::PROCESS_QUERY_INFORMATION |
                 winapi::um::winnt::PROCESS_VM_OPERATION |
                 winapi::um::winnt::PROCESS_VM_WRITE |
                 winapi::um::winnt::PROCESS_VM_READ,

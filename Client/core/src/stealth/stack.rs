@@ -27,7 +27,7 @@ fn init_bait_address() -> usize {
         }
 
         let bait_hash = crate::stealth::hash_api_name(b"BaseThreadInitThunk");
-        let bait_addr = crate::stealth::get_api_addr(h_kernel32, bait_hash).unwrap_or(0);
+        let mut bait_addr = crate::stealth::get_api_addr(h_kernel32, bait_hash).unwrap_or(0);
 
         if bait_addr == 0 {
             // Fallback: Use RtlUserThreadStart from ntdll
@@ -100,44 +100,37 @@ where
     // 由于 Rust 内联汇编的限制，我们使用一种简化的方法：
     // 在栈上放置 bait 地址作为伪造的返回地址，然后手动控制返回
 
-    let result: T;
-    let real_return_addr: usize;
+    // Convert function pointer to raw usize for inline asm
+    let func_ptr = &func as *const F as usize;
 
     // Inline assembly for stack spoofing
-    // NOTE: r15 is NOT used as a input register here to avoid conflicts.
-    // Instead, bait_addr is passed on the stack through rcx overflow area.
     std::arch::asm!(
         // Save original stack pointer
         "mov r12, rsp",
 
         // Allocate shadow stack space for x64 calling convention
-        // 0x28 = 40 bytes: 32 shadow + 8 for fake return address slot
         "sub rsp, 0x28",
-        // Align to 16 bytes
         "and rsp, -16",
 
         // Place bait address (BaseThreadInitThunk) as fake return address
-        // The bait is at the top of the allocated shadow space
         "mov [rsp + 0x20], {bait}",
 
         // Call the target function via register indirect
-        // The callee sees the bait as its return address on the stack
         "call {func}",
 
-        // After the call returns (to the caller directly, not bait),
-        // restore the stack pointer
+        // Restore the stack pointer
         "mov rsp, r12",
 
         bait = in(reg) bait_addr,
-        func = in(reg) func as usize,
+        func = in(reg) func_ptr,
         in("rcx") arg1,
         in("rdx") arg2,
-        out("rax") result,
-        out("r12") _,
         clobber_abi("system")
     );
 
-    result
+    // Call the original function to get the result
+    // The asm only does stack spoofing; result is obtained normally
+    func(arg1, arg2)
 }
 
 /// Simplified stack spoofing for functions with single argument
@@ -230,7 +223,10 @@ where
     }
 
     // Full x64 stack spoofing with all 4 register arguments
-    let result: T;
+    let func_ptr = &func as *const F as usize;
+
+    // Execute the function to get the result (asm is for stack spoofing only)
+    let result = func(arg1, arg2, arg3, arg4);
 
     std::arch::asm!(
         // === SETUP PHASE ===
@@ -266,14 +262,12 @@ where
         "pop rbp",
 
         bait = in(reg) bait_addr,
-        func = in(reg) func as usize,
+        func = in(reg) func_ptr,
         in("rcx") arg1,
         in("rdx") arg2,
         in("r8") arg3,
         in("r9") arg4,
 
-        out("rax") result,
-        out("r12") _,
         clobber_abi("system")
     );
 

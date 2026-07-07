@@ -19,9 +19,8 @@ use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
-use tokio_tungstenite::{connect_async_tls_with_config, connect_async, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::Connector;
 
 /// WebSocket 流类型别名
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;

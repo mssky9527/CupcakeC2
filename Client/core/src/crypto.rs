@@ -179,11 +179,12 @@ fn generate_http_padding(len: usize) -> Vec<u8> {
 }
 
 /// 🛡️ Phase 2: Tailored Padding (50-2048 bytes random)
-fn apply_tailored_padding(data: Vec<u8>) -> Vec<u8> {
+fn apply_tailored_padding(mut data: Vec<u8>) -> Vec<u8> {
+    // Record original length before padding
+    let original_len = data.len() as u32;
+
     // Random padding between 50-2048 bytes
     let padding_len = (crate::utils::next_u32() % 1998 + 50) as usize;
-
-    let mut padded = data;
 
     // Generate random padding bytes
     for _ in 0..padding_len {
@@ -195,14 +196,13 @@ fn apply_tailored_padding(data: Vec<u8>) -> Vec<u8> {
             // Some binary content
             (crate::utils::next_u32() % 256) as u8
         };
-        padded.push(byte);
+        data.push(byte);
     }
 
     // Store original length for deobfuscation (4 bytes at end)
-    let original_len = data.len() as u32;
-    padded.extend_from_slice(&original_len.to_be_bytes());
+    data.extend_from_slice(&original_len.to_be_bytes());
 
-    padded
+    data
 }
 
 /// 报文解混淆
@@ -256,7 +256,7 @@ pub fn deobfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
 }
 
 /// Remove default padding
-fn remove_default_padding(data: Vec<u8>) -> Vec<u8> {
+fn remove_default_padding(mut data: Vec<u8>) -> Vec<u8> {
     if data.len() < 2 { return data; }
 
     // Read padding length marker (last 2 bytes)
@@ -322,7 +322,7 @@ fn is_base64_char(b: u8) -> bool {
 }
 
 /// Remove tailored padding
-fn remove_tailored_padding(data: Vec<u8>) -> Vec<u8> {
+fn remove_tailored_padding(mut data: Vec<u8>) -> Vec<u8> {
     if data.len() < 4 { return data; }
 
     // Original length is stored in last 4 bytes

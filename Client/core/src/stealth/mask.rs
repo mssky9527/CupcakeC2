@@ -100,7 +100,7 @@ unsafe fn shift_jis_const_xor(image_base: *const u8, xor_key: &[u8]) {
         if !should_mask { continue; }
 
         let section_addr = image_base.offset((*section).VirtualAddress as isize) as *mut u8;
-        let section_size = (*section).Misc.VirtualSize() as usize;
+        let section_size = *(*section).Misc.VirtualSize() as usize;
 
         if section_size == 0 { continue; }
 

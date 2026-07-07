@@ -160,8 +160,7 @@ impl MessageHandler {
             // Optional: Sync heartbeat during office hours (9am-6pm local time)
             // This makes traffic look more like legitimate business activity
             if !received_data {
-                let now = chrono_like_now();
-                let hour = now.hour();
+                let hour = chrono_like_now();
 
                 // During office hours (9-18), use shorter intervals
                 if hour >= 9 && hour < 18 && idle_multiplier > 1 {
@@ -171,21 +170,6 @@ impl MessageHandler {
         }
     }
 
-    /// Simple time helper (no chrono dependency)
-    fn chrono_like_now() -> MockTime {
-        // Use system time, no external crate
-        MockTime {
-            hour: ((std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() % 86400 / 3600)
-                .unwrap_or(12) as i32) + 8) % 24, // Approximate local time (UTC+8)
-        }
-    }
-
-    struct MockTime {
-        hour: i32,
-    }
-    
     /// 发送注册消息
     /// 
     /// 收集系统信息并发送注册消息到服务端。
@@ -1109,6 +1093,15 @@ impl MessageHandler {
         }
         }.boxed()
     }
+}
+
+/// Simple time helper (no chrono dependency) — used in MessageHandler loop
+fn chrono_like_now() -> i32 {
+    // Returns local hour (UTC+8 approximated), no external crate
+    ((std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % 86400 / 3600)
+        .unwrap_or(12) as i32) + 8) % 24
 }
 
 #[cfg(test)]

@@ -266,8 +266,8 @@ async fn run_websocket_mode() -> Result<()> {
 
         if let Err(_e) = transport.connect().await {
             // 🛡️ Phase 3: Primary failed - try fallback
-            if fallback.state() == FallbackState::Primary {
-                if let Some(fallback_url) = fallback.switch_to_fallback() {
+            if *fallback.state() == FallbackState::Primary {
+                if let Some(_fallback_url) = fallback.switch_to_fallback() {
                     #[cfg(feature = "dns")]
                     {
                         log::info!("[Cupcake] Switching to DNS backup channel");
@@ -291,7 +291,7 @@ async fn run_websocket_mode() -> Result<()> {
         }
 
         // 🛡️ Phase 3: Mark as recovered if on primary
-        if fallback.state() == FallbackState::Primary {
+        if *fallback.state() == FallbackState::Primary {
             fallback.mark_recovered();
         }
 
