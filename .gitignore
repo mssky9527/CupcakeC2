@@ -4,7 +4,8 @@
 
 # ---- Rust (Client) ----
 /Client/target/
-Cargo.lock           # 本项目作�?binary，Cargo.lock 可以提交；如不需要则取消注释
+/Client/core/Client/   # Rust 编译中间产物
+Cargo.lock             # 本项目作 binary，Cargo.lock 可以提交；如不需要则取消注释
 
 # ---- Go (Server) ----
 /server/dist/        # Go embed 打包用的前端产物

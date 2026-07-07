@@ -62,4 +62,18 @@ proptest = "1.4"
 mockall = "0.12"
 tempfile = "3.8"
 
-# Release profile optimization moved to workspace root
+# 🛡️ Phase 3: Release profile optimized for UPX + minimum binary size
+[profile.release]
+opt-level = "z"         # Optimize for size (best UPX ratio)
+lto = "fat"             # Full link-time optimization
+codegen-units = 1       # Single codegen unit for max optimization
+panic = "abort"         # Remove panic unwind tables
+strip = "symbols"       # Strip debug symbols (saves ~60%)
+# Windows: enable static CRT to avoid VC redist dependency
+[target.'cfg(windows)'.profile.release]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# 🛡️ Phase 3: Debug build for testing
+[profile.dev]
+opt-level = 0
+debug = true

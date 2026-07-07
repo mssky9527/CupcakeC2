@@ -7,14 +7,32 @@ use sha2::{Sha256, Digest};
 use uuid::Builder;
 use log::debug;
 
-/// Simple compile-time XOR obfuscation for strings
+/// 🛡️ Phase 3: Multi-key compile-time XOR obfuscation for strings
+/// Uses a rotating XOR key to make static analysis harder
 #[macro_export]
 macro_rules! obf_str {
     ($s:expr) => {{
         let bytes = $s.as_bytes();
         let mut obf = Vec::with_capacity(bytes.len());
-        for b in bytes {
-            obf.push(b ^ 0x42); // Simple XOR key
+        // Multi-byte rotating XOR key to defeat simple pattern matching
+        let xor_key: &[u8] = &[0x42, 0x7F, 0x3A, 0x6C, 0x9B, 0x1E, 0xD4, 0x55];
+        for (i, b) in bytes.iter().enumerate() {
+            obf.push(b ^ xor_key[i % xor_key.len()]);
+        }
+        obf
+    }};
+}
+
+/// Phase 3: Compile-time no-op string obfuscation marker.
+/// The actual XOR key can be tuned per-build to produce unique binaries.
+#[macro_export]
+macro_rules! obf_str_key {
+    ($s:expr, $k:expr) => {{
+        let bytes = $s.as_bytes();
+        let key: &[u8] = $k;
+        let mut obf = Vec::with_capacity(bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            obf.push(b ^ key[i % key.len()]);
         }
         obf
     }};
@@ -23,14 +41,15 @@ macro_rules! obf_str {
 pub fn decode_obf(bytes: &[u8]) -> String {
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut _junk = 0;
+    let xor_key: &[u8] = &[0x42, 0x7F, 0x3A, 0x6C, 0x9B, 0x1E, 0xD4, 0x55];
     for (i, b) in bytes.iter().enumerate() {
         // Add junk math to break the signature of the loop
         _junk = (i as u32).wrapping_add(0xDEADBEEF).count_ones();
-        decoded.push(b ^ 0x42);
+        decoded.push(b ^ xor_key[i % xor_key.len()]);
     }
     // Prevent optimization of junk
     if _junk > 999 { return String::new(); }
-    
+
     String::from_utf8_lossy(&decoded).to_string()
 }
 

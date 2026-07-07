@@ -67,6 +67,11 @@ build_windows_template() {
     if cargo build -p cupcake-core --release --target "$target" --no-default-features --features "$proto"; then
         local src_path="$CLIENT_DIR/target/$target/release/cupcake-core.exe"
         if [ -f "$src_path" ]; then
+            # 🛡️ Phase 3: 可选 UPX 压缩
+            if command -v upx &> /dev/null; then
+                echo -e "${YELLOW}[*] 正在 UPX 压缩: $output_name...${NC}"
+                upx --ultra-brute "$src_path" 2>/dev/null || upx --best "$src_path" 2>/dev/null || true
+            fi
             cp "$src_path" "$ASSETS_DIR/$output_name"
             echo -e "${GREEN}[+] 成功生成: $output_name${NC}"
         else
