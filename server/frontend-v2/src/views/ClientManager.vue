@@ -125,35 +125,6 @@
     </section>
 
     <el-dialog
-      title="进程迁移"
-      v-model="migrateDialogVisible"
-      width="480px"
-      class="premium-dialog"
-      center
-    >
-      <div class="dialog-stack">
-        <el-alert
-          title="高风险操作"
-          type="warning"
-          :closable="false"
-          show-icon
-          description="Agent 会尝试迁移到指定进程内存空间，成功后更利于隐藏当前载荷。"
-        />
-
-        <el-form label-position="top">
-          <el-form-item label="目标进程">
-            <el-input v-model="migrateProcess" placeholder="例如：explorer.exe" :prefix-icon="Promotion" />
-          </el-form-item>
-        </el-form>
-      </div>
-
-      <template #footer>
-        <el-button @click="migrateDialogVisible = false">取消</el-button>
-        <el-button type="primary" :loading="migrating" @click="handleMigrate">立即迁移</el-button>
-      </template>
-    </el-dialog>
-
-    <el-dialog
       title="正向 TCP 资产接入"
       v-model="connectDialogVisible"
       width="500px"
@@ -194,16 +165,6 @@
       >
         <el-icon><Monitor /></el-icon>
         进入终端
-      </button>
-
-      <button
-        type="button"
-        class="menu-item"
-        :class="{ disabled: !isAgentOnline(contextMenu.row?.status) || contextMenu.row?.status === 'memory_online' }"
-        @click="openMigrateDialog"
-      >
-        <el-icon><Promotion /></el-icon>
-        {{ contextMenu.row?.status === 'memory_online' ? '已迁移' : '进程迁移' }}
       </button>
 
       <button
@@ -270,10 +231,6 @@ const getStatusLabel = (status) => {
 
 const contextMenu = reactive({ visible: false, x: 0, y: 0, row: null })
 const contextMenuStyle = computed(() => ({ top: `${contextMenu.y}px`, left: `${contextMenu.x}px` }))
-
-const migrateDialogVisible = ref(false)
-const migrating = ref(false)
-const migrateProcess = ref('explorer.exe')
 
 const connectDialogVisible = ref(false)
 const connecting = ref(false)
@@ -351,22 +308,6 @@ const handleConnect = async () => {
   }
 }
 
-const handleMigrate = async () => {
-  migrating.value = true
-  try {
-    await api.post('/api/clients/migrate', {
-      uuid: contextMenu.row?.uuid,
-      target_process: migrateProcess.value
-    })
-    ElMessage.success('迁移指令已发送')
-    migrateDialogVisible.value = false
-  } catch {
-    ElMessage.error('迁移失败')
-  } finally {
-    migrating.value = false
-  }
-}
-
 const openContextMenu = (row, column, event) => {
   event.preventDefault()
   contextMenu.x = event.clientX
@@ -382,18 +323,6 @@ const closeMenu = () => {
 const handleManageByContext = () => {
   if (!isAgentOnline(contextMenu.row?.status)) return
   handleManageRow(contextMenu.row)
-  closeMenu()
-}
-
-const openMigrateDialog = () => {
-  if (!isAgentOnline(contextMenu.row?.status)) return
-  if (contextMenu.row?.status === 'memory_online') {
-    ElMessage.warning('该 Agent 已处于内存迁移状态，无需重复迁移')
-    closeMenu()
-    return
-  }
-  migrateDialogVisible.value = true
-  migrateProcess.value = contextMenu.row?.os?.toLowerCase().includes('linux') ? '[kworker/u2:1]' : 'explorer.exe'
   closeMenu()
 }
 

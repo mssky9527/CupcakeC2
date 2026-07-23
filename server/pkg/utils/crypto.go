@@ -134,9 +134,47 @@ func DeobfuscatePacket(data []byte, mode string, key []byte) []byte {
 			return data[:originalLen]
 		}
 		return data
+	case "padding":
+		return RemoveDefaultPadding(data)
 	default:
+		// "none"/empty: pure ciphertext. Do NOT strip padding here.
 		return data
 	}
+}
+
+// RemoveDefaultPadding strips the client-side default padding format used by a
+// previous buggy agent build: [ciphertext][junk N bytes][N as u16 BE].
+// Safe when N is out of range — returns data unchanged.
+func RemoveDefaultPadding(data []byte) []byte {
+	if len(data) < 2 {
+		return data
+	}
+	padLen := int(binary.BigEndian.Uint16(data[len(data)-2:]))
+	if padLen < 1 || padLen > 16 {
+		return data
+	}
+	if len(data) < 2+padLen {
+		return data
+	}
+	return data[:len(data)-2-padLen]
+}
+
+// DecryptAESWithCompat tries DecryptAES; on GCM failure, retries after stripping
+// legacy default padding (broken client "none" mode). Keeps old minimal agents online
+// until they are rebuilt.
+func DecryptAESWithCompat(data []byte, key []byte) ([]byte, error) {
+	plain, err := DecryptAES(data, key)
+	if err == nil {
+		return plain, nil
+	}
+	stripped := RemoveDefaultPadding(data)
+	if len(stripped) == len(data) {
+		return nil, err
+	}
+	if plain2, err2 := DecryptAES(stripped, key); err2 == nil {
+		return plain2, nil
+	}
+	return nil, err
 }
 
 func randInt(min, max int) int {

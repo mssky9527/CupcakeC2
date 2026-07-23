@@ -298,6 +298,7 @@ const initPTY = () => {
 
   ptySocket.onopen = () => {
     term.writeln('\x1b[32m[+] Interactive PTY Connected.\x1b[0m')
+    term.writeln('\x1b[2m[Pipe shell] 本地回显已开启；回车执行命令\x1b[0m')
     term.focus()
   }
 
@@ -344,13 +345,27 @@ const initPTY = () => {
   }
 
   term.onData((data) => {
-    if (ptySocket && ptySocket.readyState === WebSocket.OPEN) {
-      if (ptyMode === 'fallback') {
-        handleFallbackInput(data)
-        return
-      }
-      ptySocket.send(data)
+    if (!ptySocket || ptySocket.readyState !== WebSocket.OPEN) return
+    if (ptyMode === 'fallback') {
+      handleFallbackInput(data)
+      return
     }
+    // Yamux pipe-shell: cmd.exe does not echo keystrokes to stdout.
+    // Local echo so the user can see typing; remote still receives raw input.
+    for (let i = 0; i < data.length; i++) {
+      const ch = data[i]
+      if (ch === '\r') {
+        term.write('\r\n')
+      } else if (ch === '\u007f' || ch === '\b') {
+        term.write('\b \b')
+      } else if (ch === '\x03') {
+        term.write('^C')
+      } else if (ch === '\t' || ch >= ' ') {
+        term.write(ch)
+      }
+      // ignore other control codes for local display
+    }
+    ptySocket.send(data)
   })
 }
 

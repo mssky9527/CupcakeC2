@@ -32,6 +32,7 @@
         "type": "guardrail",
         "enforcement": "block",
         "priority": "critical",
+        "description": "MCP 安全网关 - 拦截破坏性操作，保护系统完整性和业务连续性",
         "promptTriggers": {
             "intentPatterns": [
                 "(删除|清空|drop|delete|truncate|remove).*?(数据库|database|数据表|table)",
@@ -39,9 +40,61 @@
                 "rm\\s+-rf\\s+/",
                 "del\\s+/s\\s+/f\\s+C:\\\\Windows",
                 "drop\\s+database",
-                "truncate\\s+table"
+                "truncate\\s+table",
+                "format\\s+[A-Z]:",
+                "mkfs\\.\\w+\\s+/dev/",
+                "dd\\s+.*of=/dev/",
+                "(shutdown|halt|poweroff|reboot)",
+                "vssadmin\\s+delete\\s+shadows",
+                "self[-_]?destruct"
             ]
         },
-        "blockMessage": "【指挥官警告】：该操作具有破坏性（删库或损毁系统），违反了『业务连续性第一』的核心准则。操作已被拦截。请重新制定非侵入式的渗透方案。"
+        "blockMessage": "【指挥官警告】：该操作具有破坏性（删库、损毁系统或触发不可逆操作），违反了『业务连续性第一』的核心准则。操作已被 MCP 安全网关 (Command Guard) 拦截。请重新制定非侵入式的渗透方案。",
+        "protectedCategories": [
+            "system_destructive",
+            "system_control",
+            "permission_abuse",
+            "network_destructive",
+            "data_destructive",
+            "agent_destructive",
+            "protected_path",
+            "ransomware_behavior",
+            "registry_destructive"
+        ]
+    },
+    "file-protection": {
+        "type": "guardrail",
+        "enforcement": "block",
+        "priority": "critical",
+        "description": "文件路径保护 - 禁止通过 MCP 操作系统关键目录和文件",
+        "protectedPaths": {
+            "windows": [
+                "C:\\Windows",
+                "C:\\Windows\\System32",
+                "C:\\Windows\\SysWOW64",
+                "C:\\Program Files",
+                "C:\\Program Files (x86)",
+                "C:\\Boot",
+                "C:\\$Recycle.Bin"
+            ],
+            "linux": [
+                "/bin",
+                "/sbin",
+                "/usr/bin",
+                "/usr/sbin",
+                "/usr/lib",
+                "/lib",
+                "/lib64",
+                "/boot",
+                "/dev",
+                "/proc",
+                "/sys",
+                "/etc/passwd",
+                "/etc/shadow",
+                "/etc/sudoers",
+                "/etc/fstab"
+            ]
+        },
+        "blockMessage": "【文件保护】：目标路径属于系统保护区域，MCP 安全网关已拦截此文件操作。如需操作受保护路径，请通过 C2 Web 控制台直接执行。"
     }
 }

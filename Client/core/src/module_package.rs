@@ -1,0 +1,155 @@
+// Cupcake module package format (CKMS) — pack / verify / unpack.
+// Used by Stage0 loader and server-side packaging.
+
+use sha2::{Digest, Sha256};
+
+pub const MAGIC: &[u8; 4] = b"CKMS";
+pub const FORMAT_VERSION: u16 = 1;
+/// HMAC key size (derived or configured 32-byte key)
+pub const KEY_LEN: usize = 32;
+
+/// Build a signed module blob: MAGIC | ver | flags | id_len | id | pay_len | payload | hmac32
+pub fn pack_module(id: &str, payload: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
+    if id.is_empty() || id.len() > 64 {
+        return Err("invalid module id length".into());
+    }
+    if key.len() < 16 {
+        return Err("module key too short".into());
+    }
+    let mut body = Vec::with_capacity(4 + 2 + 2 + 2 + id.len() + 4 + payload.len() + 32);
+    body.extend_from_slice(MAGIC);
+    body.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+    body.extend_from_slice(&0u16.to_le_bytes()); // flags
+    let id_bytes = id.as_bytes();
+    body.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
+    body.extend_from_slice(id_bytes);
+    body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    body.extend_from_slice(payload);
+    let mac = hmac_sha256(key, &body);
+    body.extend_from_slice(&mac);
+    Ok(body)
+}
+
+/// Verify HMAC and return (module_id, payload).
+pub fn unpack_and_verify(blob: &[u8], key: &[u8]) -> Result<(String, Vec<u8>), String> {
+    if blob.len() < 4 + 2 + 2 + 2 + 4 + 32 {
+        return Err("blob too short".into());
+    }
+    if &blob[0..4] != MAGIC {
+        return Err("bad magic".into());
+    }
+    let ver = u16::from_le_bytes([blob[4], blob[5]]);
+    if ver != FORMAT_VERSION {
+        return Err(format!("unsupported format version {ver}"));
+    }
+    // flags at 6..8 ignored
+    let id_len = u16::from_le_bytes([blob[8], blob[9]]) as usize;
+    let id_start = 10;
+    let id_end = id_start + id_len;
+    if id_end + 4 + 32 > blob.len() {
+        return Err("truncated id".into());
+    }
+    let id = std::str::from_utf8(&blob[id_start..id_end])
+        .map_err(|_| "id not utf8")?
+        .to_string();
+    let pay_len = u32::from_le_bytes([
+        blob[id_end],
+        blob[id_end + 1],
+        blob[id_end + 2],
+        blob[id_end + 3],
+    ]) as usize;
+    let pay_start = id_end + 4;
+    let pay_end = pay_start + pay_len;
+    if pay_end + 32 != blob.len() {
+        return Err(format!(
+            "length mismatch: pay_end+32={} blob={}",
+            pay_end + 32,
+            blob.len()
+        ));
+    }
+    let payload = blob[pay_start..pay_end].to_vec();
+    let body = &blob[..pay_end];
+    let expect = &blob[pay_end..];
+    let got = hmac_sha256(key, body);
+    if got.as_slice() != expect {
+        return Err("HMAC verify failed".into());
+    }
+    Ok((id, payload))
+}
+
+/// HMAC-SHA256 with key padding (RFC 2104 simplified)
+pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let d = Sha256::digest(key);
+        k[..32].copy_from_slice(&d);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner_hash);
+    let out = outer.finalize();
+    let mut mac = [0u8; 32];
+    mac.copy_from_slice(&out);
+    mac
+}
+
+/// Default module key material for dev/tests (production: derive from agent AES key).
+/// Seed must be exactly 32 bytes.
+pub fn default_module_key() -> [u8; 32] {
+    *b"CUPCAKE_MODULE_KEY_V1_DEFAULT___" // 32 bytes
+}
+
+/// Derive module key from agent AES key bytes.
+pub fn derive_module_key(aes_key: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"cupcake-mod-key-v1");
+    h.update(aes_key);
+    let d = h.finalize();
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&d);
+    k
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_unpack_roundtrip() {
+        let key = default_module_key();
+        let payload = b"hello-module-payload";
+        let blob = pack_module("shell", payload, &key).unwrap();
+        let (id, pay) = unpack_and_verify(&blob, &key).unwrap();
+        assert_eq!(id, "shell");
+        assert_eq!(pay, payload);
+    }
+
+    #[test]
+    fn tamper_fails_hmac() {
+        let key = default_module_key();
+        let mut blob = pack_module("shell", b"x", &key).unwrap();
+        let n = blob.len();
+        blob[n / 2] ^= 0xff;
+        assert!(unpack_and_verify(&blob, &key).is_err());
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let blob = pack_module("shell", b"x", &default_module_key()).unwrap();
+        let mut bad = default_module_key();
+        bad[0] ^= 1;
+        assert!(unpack_and_verify(&blob, &bad).is_err());
+    }
+}

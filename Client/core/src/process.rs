@@ -141,44 +141,35 @@ pub async fn handle_stream(stream: Stream) {
     info!("[PROCESS] Process management session completed");
 }
 
-/// 列出所有进程 (本机版本 - 极致体积优化)
+/// 列出所有进程 (本机版本 - Windows 走 NtQuerySystemInformation)
 fn handle_ps() -> ProcResponse {
     #[cfg(target_os = "windows")]
     {
-        use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
-        use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-        use winapi::shared::minwindef::TRUE;
-
-        let mut list = Vec::new();
-        unsafe {
-            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snapshot != INVALID_HANDLE_VALUE {
-                let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-                if Process32FirstW(snapshot, &mut entry) == TRUE {
-                    loop {
-                        let name = String::from_utf16_lossy(&entry.szExeFile).trim_matches('\0').to_string();
-                        list.push(ProcessEntry {
-                            pid: entry.th32ProcessID,
-                            ppid: entry.th32ParentProcessID,
-                            name,
-                        });
-                        if Process32NextW(snapshot, &mut entry) != TRUE { break; }
-                    }
+        match crate::native::list_processes() {
+            Ok(list) => {
+                info!("[PROCESS] Found {} processes", list.len());
+                let processes = list
+                    .into_iter()
+                    .map(|p| ProcessEntry {
+                        pid: p.pid,
+                        ppid: p.ppid,
+                        name: p.name,
+                    })
+                    .collect();
+                ProcResponse {
+                    status: "ok".to_string(),
+                    error: None,
+                    processes: Some(processes),
                 }
-                CloseHandle(snapshot);
             }
-        }
-        
-        info!("[PROCESS] Found {} processes", list.len());
-        ProcResponse {
-            status: "ok".to_string(),
-            error: None,
-            processes: Some(list),
+            Err(e) => ProcResponse {
+                status: "error".to_string(),
+                error: Some(e),
+                processes: None,
+            },
         }
     }
-    
+
     #[cfg(not(target_os = "windows"))]
     {
         let mut list = Vec::new();
@@ -187,15 +178,14 @@ fn handle_ps() -> ProcResponse {
                 let path = entry.path();
                 if let Some(pid_str) = path.file_name().and_then(|s| s.to_str()) {
                     if pid_str.chars().all(|c| c.is_digit(10)) {
-                        // 1. 获取进程名 (comm)
                         let name = std::fs::read_to_string(path.join("comm"))
                             .unwrap_or_else(|_| "unknown".to_string())
                             .trim()
                             .to_string();
-                        
-                        // 2. 获取父进程 PID (status)
+
                         let ppid = if let Ok(status) = std::fs::read_to_string(path.join("status")) {
-                            status.lines()
+                            status
+                                .lines()
                                 .find(|l| l.starts_with("PPid:"))
                                 .and_then(|l| l.split_whitespace().nth(1))
                                 .and_then(|s| s.parse::<u32>().ok())
@@ -213,7 +203,7 @@ fn handle_ps() -> ProcResponse {
                 }
             }
         }
-        
+
         info!("[PROCESS] [Linux] Found {} processes", list.len());
         ProcResponse {
             status: "ok".to_string(),
@@ -223,37 +213,40 @@ fn handle_ps() -> ProcResponse {
     }
 }
 
-/// 终止指定进程 (本机版本)
+/// 终止指定进程 (Windows: NtOpenProcess + NtTerminateProcess)
 fn handle_kill(pid_u32: u32) -> ProcResponse {
     if pid_u32 == 0 {
-        return ProcResponse { status: "error".to_string(), error: Some("Invalid PID".to_string()), processes: None };
+        return ProcResponse {
+            status: "error".to_string(),
+            error: Some("Invalid PID".to_string()),
+            processes: None,
+        };
     }
-    
+
     #[cfg(target_os = "windows")]
     {
-        use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
-        use winapi::um::winnt::PROCESS_TERMINATE;
-        use winapi::um::handleapi::CloseHandle;
-        use winapi::shared::minwindef::FALSE;
-
-        unsafe {
-            let h = OpenProcess(PROCESS_TERMINATE, FALSE, pid_u32);
-            if !h.is_null() {
-                let res = TerminateProcess(h, 1);
-                CloseHandle(h);
-                if res != FALSE {
-                    info!("[PROCESS] Successfully killed process PID: {}", pid_u32);
-                    ProcResponse { status: "ok".to_string(), error: None, processes: None }
-                } else {
-                    ProcResponse { status: "error".to_string(), error: Some("Failed to kill process".to_string()), processes: None }
+        match crate::native::terminate_process(pid_u32) {
+            Ok(()) => {
+                info!("[PROCESS] Successfully killed process PID: {}", pid_u32);
+                ProcResponse {
+                    status: "ok".to_string(),
+                    error: None,
+                    processes: None,
                 }
-            } else {
-                ProcResponse { status: "error".to_string(), error: Some("Access denied or process not found".to_string()), processes: None }
             }
+            Err(e) => ProcResponse {
+                status: "error".to_string(),
+                error: Some(e),
+                processes: None,
+            },
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
-        ProcResponse { status: "error".to_string(), error: Some("Kill not implemented".to_string()), processes: None }
+        ProcResponse {
+            status: "error".to_string(),
+            error: Some("Kill not implemented".to_string()),
+            processes: None,
+        }
     }
 }

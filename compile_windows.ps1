@@ -81,18 +81,21 @@ function Build-Template {
 Write-Host "[*] Starting Windows Agent template builds..." -ForegroundColor Cyan
 Write-Host ""
 
-# WebSocket
-Build-Template -Arch "x64" -Feature "ws"       -OutputName "client_template_windows.exe"
-Build-Template -Arch "x86" -Feature "ws"       -OutputName "client_template_windows_x86.exe"
+# WebSocket (standard capability profile — product default)
+Build-Template -Arch "x64" -Feature "ws,standard"       -OutputName "client_template_windows.exe"
+Build-Template -Arch "x86" -Feature "ws,standard"       -OutputName "client_template_windows_x86.exe"
 
 # Reverse TCP
-Build-Template -Arch "x64" -Feature "tcp"      -OutputName "client_template_windows_tcp.exe"
+Build-Template -Arch "x64" -Feature "tcp,standard"      -OutputName "client_template_windows_tcp.exe"
 
 # Bind TCP (forward connect)
-Build-Template -Arch "x64" -Feature "tcp_bind" -OutputName "client_template_windows_bind.exe"
+Build-Template -Arch "x64" -Feature "tcp_bind,standard" -OutputName "client_template_windows_bind.exe"
 
 # DNS
-Build-Template -Arch "x64" -Feature "dns"      -OutputName "client_template_windows_dns.exe"
+Build-Template -Arch "x64" -Feature "dns,standard"      -OutputName "client_template_windows_dns.exe"
+
+# Minimal TCP (size-optimized, no post-ex)
+Build-Template -Arch "x64" -Feature "tcp,minimal"       -OutputName "client_template_windows_tcp_minimal.exe"
 
 # Summary
 Write-Host "  =========================================" -ForegroundColor Blue

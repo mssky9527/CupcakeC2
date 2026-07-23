@@ -21,6 +21,27 @@ import (
 // upgrader 使用 globals 包中定义的全局实例
 var upgrader = globals.Upgrader
 
+// openPtyStream opens a Yamux type-0x01 stream for interactive shell.
+func openPtyStream(client *globals.Client, uuidStr string) (*globals.PTYSession, error) {
+	if client.YamuxSession == nil || client.YamuxSession.IsClosed() {
+		return nil, fmt.Errorf("no yamux session")
+	}
+	stream, err := client.YamuxSession.Open()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := stream.Write([]byte{0x01}); err != nil {
+		stream.Close()
+		return nil, err
+	}
+	// Brief pause so agent dispatcher reads the type byte before bulk input
+	time.Sleep(150 * time.Millisecond)
+	sess := &globals.PTYSession{Stream: stream}
+	globals.ActivePTYSessions.Store(uuidStr, sess)
+	go startPtyBackgroundLoop(uuidStr, sess)
+	return sess, nil
+}
+
 func StreamPTY(c *gin.Context) {
 	uuidStr := c.Param("uuid")
 	val, ok := globals.Clients.Load(uuidStr)
@@ -36,37 +57,31 @@ func StreamPTY(c *gin.Context) {
 	}
 	defer ws.Close()
 
-	// 1. 获取或创建常驻 PTY 会话
-	valP, exists := globals.ActivePTYSessions.Load(uuidStr)
+	// 1. 获取或创建 PTY 会话；若缓存流已死则强制重建
 	var sess *globals.PTYSession
-
-	if exists {
+	if valP, exists := globals.ActivePTYSessions.Load(uuidStr); exists {
 		sess = valP.(*globals.PTYSession)
-	} else {
+		sess.Mutex.RLock()
+		dead := sess.Stream == nil
+		sess.Mutex.RUnlock()
+		if dead {
+			log.Printf("[PTY] Agent %s has stale PTY session, recreating", uuidStr)
+			globals.ActivePTYSessions.Delete(uuidStr)
+			sess = nil
+		}
+	}
+	if sess == nil {
 		if client.YamuxSession == nil || client.YamuxSession.IsClosed() {
 			log.Printf("[PTY] Agent %s has no Yamux session, fallback to command mode", uuidStr)
 			StreamPTYFallback(ws, client)
 			return
 		}
-
-		stream, err := client.YamuxSession.Open()
+		sess, err = openPtyStream(client, uuidStr)
 		if err != nil {
 			log.Printf("[PTY] Failed to open stream for %s: %v", uuidStr, err)
-			ws.WriteMessage(websocket.BinaryMessage, []byte("\r\n\x1b[31m[!] PTY Stream Error.\x1b[0m\r\n"))
+			_ = ws.WriteMessage(websocket.BinaryMessage, []byte("\r\n\x1b[31m[!] PTY Stream Error.\x1b[0m\r\n"))
 			return
 		}
-
-		if _, err := stream.Write([]byte{0x01}); err != nil {
-			stream.Close()
-			return
-		}
-		// 🛡️ [Hardening] Brief pause to ensure Agent's multi-threaded dispatcher captures the byte
-		time.Sleep(150 * time.Millisecond)
-
-		sess = &globals.PTYSession{Stream: stream}
-		globals.ActivePTYSessions.Store(uuidStr, sess)
-
-		go startPtyBackgroundLoop(uuidStr, sess)
 	}
 
 	// 2. 刷出历史缓存并订阅
@@ -77,27 +92,64 @@ func StreamPTY(c *gin.Context) {
 	sess.Mutex.RUnlock()
 	sess.Subscribers.Store(ws, true)
 
-	// 3. 读取前端输入 -> 传输给 Agent
+	// 3. 读取前端输入 -> 传输给 Agent（写失败则重建流并重试当前包一次）
 	for {
 		mt, msg, err := ws.ReadMessage()
 		if err != nil {
 			break
 		}
-		if mt == websocket.BinaryMessage || mt == websocket.TextMessage {
+		if mt != websocket.BinaryMessage && mt != websocket.TextMessage {
+			continue
+		}
+
+		writeOK := false
+		for attempt := 0; attempt < 2 && !writeOK; attempt++ {
 			sess.Mutex.Lock()
-			if sess.Stream != nil {
-				// 🛡️ FIX: 5s write deadline — prevents WebSocket hang on broken stream
+			needRebuild := sess.Stream == nil
+			if !needRebuild && attempt == 0 {
 				if c, ok := sess.Stream.(net.Conn); ok {
-					c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
 				}
-				_, err := sess.Stream.Write(msg)
-				if err != nil {
-					log.Printf("[PTY] Write error for %s: %v, closing stream", uuidStr, err)
-					sess.Stream.Close()
-					sess.Stream = nil
+				_, werr := sess.Stream.Write(msg)
+				if werr == nil {
+					writeOK = true
+					sess.Mutex.Unlock()
+					break
 				}
+				log.Printf("[PTY] Write error for %s (attempt %d): %v", uuidStr, attempt+1, werr)
+				_ = sess.Stream.Close()
+				sess.Stream = nil
+				needRebuild = true
 			}
 			sess.Mutex.Unlock()
+
+			if needRebuild {
+				globals.ActivePTYSessions.Delete(uuidStr)
+				newSess, oerr := openPtyStream(client, uuidStr)
+				if oerr != nil {
+					log.Printf("[PTY] Rebuild failed for %s: %v", uuidStr, oerr)
+					_ = ws.WriteMessage(websocket.BinaryMessage, []byte("\r\n\x1b[31m[!] PTY stream dead; reopen terminal.\x1b[0m\r\n"))
+					sess.Subscribers.Delete(ws)
+					return
+				}
+				sess = newSess
+				sess.Subscribers.Store(ws, true)
+				// retry write on rebuilt stream
+				sess.Mutex.Lock()
+				if sess.Stream != nil {
+					if c, ok := sess.Stream.(net.Conn); ok {
+						_ = c.SetWriteDeadline(time.Now().Add(5 * time.Second))
+					}
+					if _, werr := sess.Stream.Write(msg); werr == nil {
+						writeOK = true
+					} else {
+						log.Printf("[PTY] Write after rebuild failed for %s: %v", uuidStr, werr)
+						_ = sess.Stream.Close()
+						sess.Stream = nil
+					}
+				}
+				sess.Mutex.Unlock()
+			}
 		}
 	}
 
@@ -269,26 +321,10 @@ func HandleAdminShell(c *gin.Context) {
 }
 
 func MigrateClient(c *gin.Context) {
-	var req struct {
-		UUID          string `json:"uuid"`
-		Target        string `json:"target"`
-		TargetProcess string `json:"target_process"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": "Invalid input"})
-		return
-	}
-
-	target := req.Target
-	if target == "" {
-		target = req.TargetProcess
-	}
-
-	if err := services.MigrateToMemory(req.UUID, target); err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(200, gin.H{"status": "success"})
+	// Process injection / memory migration permanently removed from the agent.
+	c.JSON(http.StatusGone, gin.H{
+		"error": "process migration/injection has been removed from this product",
+	})
 }
 
 func SendCommand(c *gin.Context) {

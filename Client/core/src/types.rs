@@ -149,8 +149,7 @@ impl SystemInfo {
         
         MessageWrapper {
             msg_type: MessageType::Register,
-            payload: serde_json::to_value(&payload)
-                .expect("RegisterPayload serialization should never fail"),
+            payload: serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
         }
     }
 }
@@ -176,8 +175,7 @@ impl CommandResult {
         
         MessageWrapper {
             msg_type: MessageType::Response,
-            payload: serde_json::to_value(&payload)
-                .expect("ResponsePayload serialization should never fail"),
+            payload: serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
         }
     }
 
@@ -199,6 +197,7 @@ mod tests {
             os: "windows".to_string(),
             arch: "x86_64".to_string(),
             username: "testuser".to_string(),
+            source: "test".to_string(),
         };
 
         // 序列化
@@ -250,6 +249,7 @@ mod tests {
             os: "windows".to_string(),
             arch: "x86_64".to_string(),
             username: "testuser".to_string(),
+            source: "test".to_string(),
         };
 
         let wrapper = MessageWrapper {
@@ -275,12 +275,14 @@ mod tests {
     fn test_invalid_message_does_not_panic() {
         // 测试无效 JSON 不会导致 panic
         let invalid_json = r#"{"msg_type": "invalid", "payload": null}"#;
-        let result: Result<MessageWrapper, _> = serde_json::from_str(invalid_json);
+        let result: std::result::Result<MessageWrapper, serde_json::Error> =
+            serde_json::from_str(invalid_json);
         assert!(result.is_err());
 
         // 测试缺少字段不会导致 panic
         let incomplete_json = r#"{"msg_type": "register"}"#;
-        let result: Result<MessageWrapper, _> = serde_json::from_str(incomplete_json);
+        let result: std::result::Result<MessageWrapper, serde_json::Error> =
+            serde_json::from_str(incomplete_json);
         assert!(result.is_err());
     }
 
@@ -292,6 +294,7 @@ mod tests {
             os: "windows".to_string(),
             arch: "x86_64".to_string(),
             username: "testuser".to_string(),
+            source: "test".to_string(),
         };
 
         let msg = sys_info.to_register_message();

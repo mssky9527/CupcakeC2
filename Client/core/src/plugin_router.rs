@@ -427,13 +427,23 @@ impl PluginRouter {
     async fn route_execution(task: PluginTask) -> CommandResult {
         match task.execution_type.as_str() {
             "execute-assembly" => Self::handle_execute_assembly(task).await,
-            "hollow-shellcode" | "native-pe" => Self::handle_hollow_shellcode(task).await,
             "self-destruct" => Self::handle_self_destruct().await,
+            // Process injection types permanently removed
+            "hollow-shellcode" | "native-pe" | "inject-shellcode" | "memfd-exec"
+            | "shellcode-inject" => CommandResult {
+                stdout: String::new(),
+                stderr: format!(
+                    "execution type '{}' removed: process injection is not supported",
+                    task.execution_type
+                ),
+                path: None,
+                req_id: None,
+            },
             _ => {
-                error!("❌ Unsupported execution type: {}", task.execution_type);
+                error!("Unsupported execution type: {}", task.execution_type);
                 CommandResult {
                     stdout: String::new(),
-                    stderr: format!("Unsupported execution type '{}' for this OS", task.execution_type),
+                    stderr: format!("Unsupported execution type '{}'", task.execution_type),
                     path: None,
                     req_id: None,
                 }
@@ -443,82 +453,32 @@ impl PluginRouter {
     
     /// Handle .NET assembly execution
     async fn handle_execute_assembly(task: PluginTask) -> CommandResult {
-        #[cfg(target_os = "windows")]
+        #[cfg(all(feature = "dotnet", target_os = "windows"))]
         {
-            info!("🚨 Routing to .NET assembly execution (Windows)");
-            let app_domain = task.metadata
+            info!("Routing to .NET assembly execution (Windows)");
+            let app_domain = task
+                .metadata
                 .as_ref()
                 .and_then(|m| m.app_domain_name.as_deref());
             crate::dotnet::DotNetExecutor::execute_assembly(task.data, task.args, app_domain).await
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(all(feature = "dotnet", target_os = "windows")))]
         {
             let _ = task;
-            Self::unsupported_on_platform("execute-assembly", "Windows")
-        }
-    }
-    
-    /// Handle memfd execution
-    #[allow(dead_code)]
-    async fn handle_memfd_exec(task: PluginTask) -> CommandResult {
-        #[cfg(target_os = "linux")]
-        {
-            info!("🚨 Routing to memfd ELF/Script execution (Linux)");
-            let fake_name = task.metadata
-                .as_ref()
-                .and_then(|m| m.fake_process_name.as_deref());
-            let detached = task.metadata
-                .as_ref()
-                .and_then(|m| m.detached)
-                .unwrap_or(false);
-            crate::injection::ProcessInjector::run_memfd_elf(task.data, fake_name, detached).await
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = task;
-            Self::unsupported_on_platform("memfd-exec", "Linux")
-        }
-    }
-
-
-    
-    /// Handle process hollowing shellcode execution
-    async fn handle_hollow_shellcode(task: PluginTask) -> CommandResult {
-        info!("🚨 Routing to shellcode/EXE hollowing (Loader V2)");
-        
-        let key = crate::config::get_aes_key();
-        // JIT Decryption
-        let data = match crate::crypto::decrypt(&task.data, &key) {
-            Ok(decrypted) => decrypted,
-            Err(_) => task.data
-        };
-
-        let target = task.metadata.as_ref().and_then(|m| m.fake_process_name.as_deref());
-        
-        let loader = crate::loader::get_loader();
-        let status = loader.load(data, target, None).await;
-
-        match status {
-            crate::loader::MigrationStatus::Success => CommandResult {
-                stdout: format!("[+] Execution successful into: {:?}", target.unwrap_or("default host")),
-                stderr: String::new(),
-                path: None,
-                req_id: None,
-            },
-            _ => CommandResult {
+            CommandResult {
                 stdout: String::new(),
-                stderr: format!("Execution failed: {:?}", status),
+                stderr: "execute-assembly not compiled into this agent (missing dotnet feature)"
+                    .to_string(),
                 path: None,
                 req_id: None,
-            },
+            }
         }
     }
 
-    
     /// Handle self-destruct
     async fn handle_self_destruct() -> CommandResult {
-        info!("💀 Routing to self-destruct (cross-platform)");
-        crate::injection::ProcessInjector::self_destruct().await
+        info!("Routing to self-destruct (cross-platform)");
+        crate::utils::self_destruct().await
     }
 
     

@@ -1,0 +1,21 @@
+[package]
+name = "cupcake-mod-bof"
+version = "0.1.0"
+edition = "2021"
+description = "L2 BOF module — on-demand COFF execution (stealth-oriented)"
+
+[lib]
+name = "cupcake_mod_bof"
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+# Only BOF surface from core (no transport / full monolith)
+cupcake-core = { path = "../../core", default-features = false, features = ["bof"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+base64 = { version = "0.21", default-features = false, features = ["std"] }
+tokio = { version = "1.35", default-features = false, features = ["rt", "macros", "time"] }
+log = { version = "0.4", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winnt", "memoryapi"] }

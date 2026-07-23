@@ -66,7 +66,8 @@ pub fn get_default_debug_url() -> String {
     crate::utils::decode_obf(&crate::obf_str!("ws://127.0.0.1:8080/ws"))
 }
 
-/// 默认调试 AES 密钥
+/// 默认调试 AES 密钥（仅 debug 构建使用；release 未 patch 时返回空密钥）
+#[cfg(debug_assertions)]
 const DEFAULT_DEBUG_KEY: &[u8; 32] = b"DEBUG_KEY_32_BYTES_FOR_DEV_ONLY!";
 
 /// 默认心跳间隔（秒）
@@ -127,7 +128,11 @@ pub fn get_server_url() -> String {
 /// 
 /// 仅用于 WebSocket 模式下的再次确认，不用于 get_server_url 的初步筛选。
 pub fn validate_server_url(url: &str) -> bool {
-    url.starts_with("ws://") || url.starts_with("wss://") || url.starts_with("tcp://") || url.starts_with("dns://")
+    url.starts_with("ws://")
+        || url.starts_with("wss://")
+        || url.starts_with("tcp://")
+        || url.starts_with("dns://")
+        || url.starts_with("bind://")
 }
 
 /// 获取 AES 加密密钥
@@ -158,10 +163,18 @@ pub fn get_aes_key() -> Vec<u8> {
         }
     }
 
-    // 3. 本地调试默认值 (仅限开发)
+    // 3. 本地调试默认值 (仅 debug 构建)
     if base_key.is_empty() {
-        debug!("[*] Using hardcoded debug AES key");
-        base_key = DEFAULT_DEBUG_KEY.to_vec();
+        #[cfg(debug_assertions)]
+        {
+            debug!("[*] Using hardcoded debug AES key");
+            base_key = DEFAULT_DEBUG_KEY.to_vec();
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // Release without patch: empty key → encrypt/decrypt fail closed
+            return Vec::new();
+        }
     }
     
     // 强制修整到 32 字节（AES-256 要求）

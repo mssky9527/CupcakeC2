@@ -1,5 +1,5 @@
 <template>
-  <div class="tunnel-manager-container">
+  <div class="view-shell tunnel-shell">
     <section class="view-actions">
       <el-button @click="fetchData" :loading="loading">
         <el-icon><Refresh /></el-icon>
@@ -7,31 +7,33 @@
       </el-button>
     </section>
 
-    <div class="stats-row mb-24">
-      <div class="stat-module glass-panel">
-        <div class="stat-icon-box blue"><el-icon><Connection /></el-icon></div>
-        <div class="stat-info">
-          <div class="stat-label">活跃隧道</div>
-          <div class="stat-value">{{ tunnels.filter(t => t.status === 'running').length }}</div>
+    <section class="stat-grid">
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon"><el-icon><Connection /></el-icon></div>
+        <div>
+          <span class="stat-card__label">活跃隧道</span>
+          <div class="stat-card__value">{{ tunnels.filter(t => t.status === 'running').length }}</div>
         </div>
-      </div>
-      <div class="stat-module glass-panel">
-        <div class="stat-icon-box purple"><el-icon><Share /></el-icon></div>
-        <div class="stat-info">
-          <div class="stat-label">注册端口数</div>
-          <div class="stat-value">{{ tunnels.length }}</div>
-        </div>
-      </div>
-      <div class="stat-module glass-panel">
-        <div class="stat-icon-box green"><el-icon><User /></el-icon></div>
-        <div class="stat-info">
-          <div class="stat-label">转发后端</div>
-          <div class="stat-value">{{ Array.from(new Set(tunnels.map(t => t.agent_id))).length }}</div>
-        </div>
-      </div>
-    </div>
+      </article>
 
-    <div class="table-module glass-panel">
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon"><el-icon><Share /></el-icon></div>
+        <div>
+          <span class="stat-card__label">注册端口数</span>
+          <div class="stat-card__value">{{ tunnels.length }}</div>
+        </div>
+      </article>
+
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon"><el-icon><User /></el-icon></div>
+        <div>
+          <span class="stat-card__label">转发后端</span>
+          <div class="stat-card__value">{{ Array.from(new Set(tunnels.map(t => t.agent_id))).length }}</div>
+        </div>
+      </article>
+    </section>
+
+    <section class="surface-card table-shell">
       <el-table :data="tunnels" v-loading="loading" class="premium-table">
         <el-table-column label="本端监听 (Local Listener)" width="200">
           <template #default="scope">
@@ -92,7 +94,7 @@
           </template>
         </el-table-column>
       </el-table>
-    </div>
+    </section>
 
     <el-dialog
       :title="isEdit ? '修正隧道路由' : '建立新转发链路'"

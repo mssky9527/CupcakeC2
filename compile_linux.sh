@@ -85,18 +85,11 @@ build_linux_template() {
     # 🛡️ STEALTH: 移除本地路径前缀
     export RUSTFLAGS="--remap-path-prefix $CLIENT_DIR=/cupcake"
 
-    # 执行编译 (使用 --no-default-features 确保功能解耦)
+    # 执行编译 (使用 --no-default-features + capability profile)
+    # UPX is intentionally NOT applied by default — high AV signature cost.
     if cargo build -p cupcake-core --release --target "$target" --no-default-features --features "$proto"; then
         local src_path="$CLIENT_DIR/target/$target/release/cupcake-core"
         if [ -f "$src_path" ]; then
-            # 🛡️ Phase 3: 可选 UPX 压缩（不阻塞，工具不存在时跳过）
-            if command -v upx &> /dev/null; then
-                echo -e "${YELLOW}[*] 正在 UPX 压缩: $output_name...${NC}"
-                upx --ultra-brute "$src_path" 2>/dev/null || upx --best "$src_path" 2>/dev/null || echo -e "${YELLOW}[!] UPX 压缩失败，跳过${NC}"
-            else
-                echo -e "${YELLOW}[*] UPX 未安装，跳过压缩（建议安装: apt-get install upx）${NC}"
-            fi
-
             cp "$src_path" "$ASSETS_DIR/$output_name"
             chmod +x "$ASSETS_DIR/$output_name"
             echo -e "${GREEN}[+] 成功生成: $output_name${NC}"
@@ -114,15 +107,16 @@ build_linux_template() {
 # 4. 执行批量编译任务
 echo -e "${YELLOW}[*] 开始全量 Linux 模板编译进程...${NC}"
 
-# --- x64 架构 ---
-build_linux_template "x64" "ws"       "client_template_linux"
-build_linux_template "x64" "tcp"      "client_template_linux_tcp"
-build_linux_template "x64" "dns"      "client_template_linux_dns"
-build_linux_template "x64" "tcp_bind" "client_template_linux_bind"
+# --- x64 架构 (standard = product default post-ex) ---
+build_linux_template "x64" "ws,standard"       "client_template_linux"
+build_linux_template "x64" "tcp,standard"      "client_template_linux_tcp"
+build_linux_template "x64" "dns,standard"      "client_template_linux_dns"
+build_linux_template "x64" "tcp_bind,standard" "client_template_linux_bind"
+build_linux_template "x64" "tcp,minimal"       "client_template_linux_tcp_minimal"
 
 # --- ARM64 架构 ---
-build_linux_template "arm64" "ws"       "client_template_linux_arm64"
-build_linux_template "arm64" "tcp_bind" "client_template_linux_bind_arm64"
+build_linux_template "arm64" "ws,standard"       "client_template_linux_arm64"
+build_linux_template "arm64" "tcp_bind,standard" "client_template_linux_bind_arm64"
 
 echo -e "${BLUE}-----------------------------------------${NC}"
 echo -e "${GREEN}[DONE] 所有 Linux 模板已就绪。${NC}"

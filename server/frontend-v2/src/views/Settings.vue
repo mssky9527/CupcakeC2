@@ -1,6 +1,6 @@
 <template>
-  <div class="settings-page-container">
-    <div class="main-body glass-panel">
+  <div class="view-shell settings-shell">
+    <section class="surface-card settings-panel">
       <el-tabs v-model="activeTab" class="premium-tabs">
         <el-tab-pane name="users">
           <template #label>
@@ -248,7 +248,7 @@
           </div>
         </el-tab-pane>
       </el-tabs>
-    </div>
+    </section>
 
     <el-dialog v-model="userDialog.visible" :title="userDialog.isEdit ? '人员鉴权变更' : '人员准入授权'" width="420px" class="premium-dialog" center>
       <div class="dialog-inner">
@@ -470,31 +470,24 @@ onMounted(fetchAll)
 </script>
 
 <style scoped>
-.settings-page-container {
-  padding: 0;
+.settings-shell {
+  width: 100%;
+}
+
+.settings-panel {
+  padding: 24px;
+  border-radius: var(--radius-lg, 24px);
+  background: var(--bg-elevated, #ffffff);
+  border: 1px solid var(--line-soft, rgba(17, 17, 17, 0.08));
+  box-shadow: var(--shadow-panel, 0 14px 32px rgba(17, 17, 17, 0.04));
 }
 
 .mb-20 {
   margin-bottom: 20px;
 }
 
-.glass-panel {
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid var(--accent-soft);
-  border-radius: 24px;
-  box-shadow: 0 10px 30px var(--line-soft);
-  padding: 0;
-  overflow: hidden;
-}
-
-.main-body {
-  overflow: hidden;
-}
-
 .tab-inner {
-  padding: 18px 20px 20px;
+  padding: 12px 0 0;
 }
 
 .tab-toolbar {
@@ -591,21 +584,47 @@ onMounted(fetchAll)
   font-weight: 700;
 }
 
-.premium-tabs :deep(.el-tabs__header),
-.audit-table,
-.bento-url {
-  background: var(--surface-soft) !important;
-  border-color: var(--line-muted) !important;
+.premium-tabs :deep(.el-tabs__header) {
+  margin: 0 0 20px 0 !important;
+  padding: 6px 10px !important;
+  background: #f5f5f7 !important;
+  border: 1px solid rgba(17, 17, 17, 0.06) !important;
+  border-radius: 16px !important;
 }
 
-.premium-tabs :deep(.el-tabs__item.is-active),
-.action-btn,
-.group-label {
+.premium-tabs :deep(.el-tabs__nav-wrap::after) {
+  display: none !important;
+}
+
+.premium-tabs :deep(.el-tabs__item) {
+  height: 38px !important;
+  line-height: 38px !important;
+  padding: 0 16px !important;
+  border-radius: 12px !important;
+  font-size: 13px !important;
+  font-weight: 700 !important;
+  color: var(--text-muted) !important;
+  transition: all 0.2s ease !important;
+}
+
+.premium-tabs :deep(.el-tabs__item:hover) {
   color: var(--text-strong) !important;
 }
 
+.premium-tabs :deep(.el-tabs__item.is-active) {
+  background: #ffffff !important;
+  color: var(--text-strong) !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06) !important;
+}
+
 .premium-tabs :deep(.el-tabs__active-bar) {
-  background-color: var(--text-strong) !important;
+  display: none !important;
+}
+
+.tab-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .action-btn {

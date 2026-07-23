@@ -37,6 +37,10 @@
             <el-icon><Tools /></el-icon>
             <span>插件/工具</span>
           </el-menu-item>
+          <el-menu-item index="modules">
+            <el-icon><Box /></el-icon>
+            <span>模块</span>
+          </el-menu-item>
         </el-menu>
       </div>
 
@@ -60,7 +64,7 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Monitor, Folder, Connection, Fold, Tools } from '@element-plus/icons-vue'
+import { Monitor, Folder, Connection, Fold, Tools, Box } from '@element-plus/icons-vue'
 import api from '../api/index'
 import { ElMessage } from 'element-plus'
 
@@ -77,6 +81,7 @@ const activeMenu = computed(() => {
   if (name === 'ClientTunnels') return 'tunnels'
   if (name === 'ClientProcesses') return 'processes'
   if (name === 'ClientPlugins') return 'plugins'
+  if (name === 'ClientModules') return 'modules'
   return 'terminals'
 })
 
@@ -86,7 +91,8 @@ const handleMenuSelect = (index) => {
     files: 'ClientFiles',
     tunnels: 'ClientTunnels',
     processes: 'ClientProcesses',
-    plugins: 'ClientPlugins'
+    plugins: 'ClientPlugins',
+    modules: 'ClientModules'
   }
   router.push({ name: routeMap[index], params: { id: clientId.value } })
 }
@@ -97,7 +103,8 @@ const getPageTitle = () => {
     ClientFiles: '文件管理',
     ClientTunnels: '隧道管理',
     ClientProcesses: '进程管理',
-    ClientPlugins: '插件与工具'
+    ClientPlugins: '插件与工具',
+    ClientModules: 'Stage0 模块'
   }
   return titleMap[route.name] || '终端'
 }

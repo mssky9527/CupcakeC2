@@ -1,5 +1,5 @@
 <template>
-  <div class="plugin-management-container">
+  <div class="view-shell plugin-shell">
     <section class="view-actions view-actions--between">
       <div class="view-actions__copy">
         <span class="panel-kicker">Plugin Center</span>
@@ -12,39 +12,39 @@
       </el-button>
     </section>
 
-    <div class="stats-row mb-24">
-      <article class="stat-module glass-panel">
-        <div class="stat-icon-box purple">
+    <section class="stat-grid">
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
           <el-icon><Collection /></el-icon>
         </div>
-        <div class="stat-info">
-          <div class="stat-label">已注册插件</div>
-          <div class="stat-value">{{ plugins.length }}</div>
+        <div>
+          <span class="stat-card__label">已注册插件</span>
+          <div class="stat-card__value">{{ plugins.length }}</div>
         </div>
       </article>
 
-      <article class="stat-module glass-panel">
-        <div class="stat-icon-box blue">
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
           <el-icon><Platform /></el-icon>
         </div>
-        <div class="stat-info">
-          <div class="stat-label">跨平台支持</div>
-          <div class="stat-value">{{ platformCount }}</div>
+        <div>
+          <span class="stat-card__label">跨平台支持</span>
+          <div class="stat-card__value">{{ platformCount }}</div>
         </div>
       </article>
 
-      <article class="stat-module glass-panel">
-        <div class="stat-icon-box orange">
+      <article class="surface-card stat-card">
+        <div class="stat-card__icon">
           <el-icon><Cpu /></el-icon>
         </div>
-        <div class="stat-info">
-          <div class="stat-label">内存载荷占比</div>
-          <div class="stat-value">{{ memoryPayloadCount }}</div>
+        <div>
+          <span class="stat-card__label">内存载荷占比</span>
+          <div class="stat-card__value">{{ memoryPayloadCount }}</div>
         </div>
       </article>
-    </div>
+    </section>
 
-    <div class="table-module glass-panel">
+    <section class="surface-card table-shell">
       <el-table :data="plugins" v-loading="loading" class="premium-table">
         <el-table-column width="64" align="center">
           <template #default="{ row }">
@@ -95,7 +95,7 @@
           </template>
         </el-table-column>
       </el-table>
-    </div>
+    </section>
 
     <el-dialog v-model="showUploadDialog" title="添加插件" width="620px" class="premium-dialog">
       <el-form label-position="top" class="upload-form">
@@ -108,21 +108,19 @@
         </el-form-item>
 
         <div class="upload-grid">
-          <el-form-item label="目标系统" required>
+          <el-form-item label="目标系统">
             <el-select v-model="uploadForm.required_os">
-              <el-option label="Windows" value="windows" />
+              <el-option label="Windows（默认）" value="windows" />
               <el-option label="Linux" value="linux" />
               <el-option label="全平台" value="multi" />
             </el-select>
           </el-form-item>
 
-          <el-form-item label="执行方式" required>
-            <el-select v-model="uploadForm.type" @change="onTypeChange">
-              <el-option label="CLR 内存加载" value="execute-assembly" />
-              <el-option label="Linux memfd 执行" value="memfd-exec" />
-              <el-option label="Shellcode 注入" value="shellcode-inject" />
-              <el-option label="原生可执行文件" value="native-exec" />
-            </el-select>
+          <el-form-item label="执行方式">
+            <el-input model-value="自动识别（按文件内容）" disabled />
+            <div class="field-hint">
+              原生 PE（fscan 等）→ native-exec；.NET DLL/EXE → execute-assembly；COFF/BOF → bof-exec
+            </div>
           </el-form-item>
         </div>
 
@@ -148,7 +146,7 @@
           >
             <el-icon class="up-icon"><UploadFilled /></el-icon>
             <div class="up-text">点击或拖拽插件文件到这里</div>
-            <div class="up-hint">支持 .exe、.dll、.elf、.bin 等插件载荷</div>
+            <div class="up-hint">支持 .exe / .dll（原生或 .NET）/ .o（BOF），类型自动识别</div>
           </el-upload>
         </el-form-item>
       </el-form>
@@ -188,7 +186,7 @@ const uploadForm = ref({
   name: '',
   description: '',
   required_os: 'windows',
-  type: 'execute-assembly',
+  type: 'auto',
   category: 'general',
   file: null
 })
@@ -209,7 +207,7 @@ const resetUploadForm = () => {
     name: '',
     description: '',
     required_os: 'windows',
-    type: 'execute-assembly',
+    type: 'auto',
     category: 'general',
     file: null
   }
@@ -227,13 +225,12 @@ const fetchPlugins = async () => {
   }
 }
 
-const onTypeChange = (type) => {
-  if (type === 'memfd-exec') uploadForm.value.required_os = 'linux'
-  if (type === 'execute-assembly' || type === 'shellcode-inject') uploadForm.value.required_os = 'windows'
-}
-
 const handleFileChange = (file) => {
   uploadForm.value.file = file.raw
+  // Suggest name from filename if empty
+  if (!uploadForm.value.name && file?.name) {
+    uploadForm.value.name = file.name.replace(/\.[^.]+$/, '')
+  }
 }
 
 const handleFileRemove = () => {
@@ -241,9 +238,12 @@ const handleFileRemove = () => {
 }
 
 const submitUpload = async () => {
-  if (!uploadForm.value.name || !uploadForm.value.file) {
-    ElMessage.warning('请先填写名称并选择插件文件')
+  if (!uploadForm.value.file) {
+    ElMessage.warning('请选择插件文件')
     return
+  }
+  if (!uploadForm.value.name) {
+    uploadForm.value.name = uploadForm.value.file.name || 'plugin'
   }
 
   uploading.value = true
@@ -251,20 +251,21 @@ const submitUpload = async () => {
   formData.append('file', uploadForm.value.file)
   formData.append('name', uploadForm.value.name)
   formData.append('description', uploadForm.value.description)
-  formData.append('required_os', uploadForm.value.required_os)
-  formData.append('type', uploadForm.value.type)
+  formData.append('required_os', uploadForm.value.required_os || 'windows')
+  formData.append('type', 'auto')
   formData.append('category', uploadForm.value.category)
 
   try {
-    await api.post('/api/plugins/upload', formData, {
+    const res = await api.post('/api/plugins/upload', formData, {
       headers: { 'Content-Type': 'multipart/form-data' }
     })
-    ElMessage.success('插件添加成功')
+    const note = res.data?.detection_note || res.data?.detected_type || ''
+    ElMessage.success(note ? `插件添加成功：${note}` : '插件添加成功（已自动识别类型）')
     showUploadDialog.value = false
     resetUploadForm()
     fetchPlugins()
   } catch (error) {
-    ElMessage.error('插件上传失败')
+    ElMessage.error(error?.response?.data?.error || '插件上传失败')
   } finally {
     uploading.value = false
   }
@@ -294,19 +295,22 @@ const getTypeTag = (type) => {
   const map = {
     'execute-assembly': 'type-orange',
     'memfd-exec': 'type-green',
-    'shellcode-inject': 'type-red'
+    'shellcode-inject': 'type-red',
+    'native-exec': 'type-green',
+    'bof-exec': 'type-orange'
   }
   return map[type] || 'type-grey'
 }
 
 const translateType = (type) => {
   const map = {
-    'execute-assembly': 'CLR 内存加载',
+    'execute-assembly': '.NET 内存执行',
     'memfd-exec': 'Linux memfd 执行',
     'shellcode-inject': 'Shellcode 注入',
-    'native-exec': '原生可执行文件'
+    'native-exec': '原生 PE（隔离进程）',
+    'bof-exec': 'BOF / COFF'
   }
-  return map[type] || type || '未知类型'
+  return map[type] || type || '自动识别'
 }
 
 const translateCategory = (category) => {
@@ -510,6 +514,13 @@ onMounted(fetchPlugins)
 .up-hint {
   font-size: 12px;
   margin-top: 4px;
+}
+
+.field-hint {
+  font-size: 12px;
+  margin-top: 6px;
+  opacity: 0.65;
+  line-height: 1.4;
 }
 
 .dialog-footer {

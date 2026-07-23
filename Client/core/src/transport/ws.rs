@@ -131,12 +131,11 @@ impl Transport for WebSocketTransport {
 
                 // Use TLS-enabled connect with connector
                 // The connector is automatically provided by tokio-tungstenite when TLS feature is enabled
-                #[cfg(any(feature = "ws-native-tls", feature = "ws-rustls", feature = "ws"))]
+                #[cfg(any(feature = "ws-tls", feature = "ws"))]
                 {
-                    // Default TLS connector (rustls with native roots or native-tls)
                     connect_async(req).await
                 }
-                #[cfg(not(any(feature = "ws-native-tls", feature = "ws-rustls", feature = "ws")))]
+                #[cfg(not(any(feature = "ws-tls", feature = "ws")))]
                 {
                     // Fallback: try connect_async anyway (may fail without TLS)
                     connect_async(req).await

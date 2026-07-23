@@ -1,12 +1,19 @@
 [workspace]
-members = ["core", "stager"]
+members = [
+    "core",
+    "stager",
+    "modules/shell",
+    "modules/bof",
+    "modules/dotnet",
+    "iso_host",
+]
 resolver = "2"
 
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "fat"
 codegen-units = 1
-panic = "unwind"
+panic = "abort"
 strip = "symbols"
 
 [profile.release.build-override]

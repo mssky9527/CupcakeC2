@@ -1,4 +1,4 @@
-﻿<template>
+<template>
   <div class="control-shell" :class="{ 'control-shell--mobile-nav': isMobileNavOpen, 'control-shell--collapsed': isSidebarCollapsed }">
     <button v-if="isCompact" class="mobile-nav-toggle" type="button" @click="isMobileNavOpen = !isMobileNavOpen">
       <el-icon><Operation /></el-icon>
@@ -110,6 +110,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  Box,
   Clock,
   Connection,
   Grid,
@@ -135,31 +136,42 @@ const menuItems = [
   { path: '/listeners', label: '监听器', icon: Headset },
   { path: '/tunnels', label: '隧道', icon: Share },
   { path: '/generator', label: '生成器', icon: Lightning },
+  { path: '/modules', label: '模块', icon: Box },
   { path: '/domain', label: '插件', icon: Connection },
   { path: '/settings', label: '设置', icon: Setting }
 ]
 
+const titleDisplayNames = {
+  Dashboard: '仪表盘',
+  Clients: '受控端',
+  Listeners: '监听器',
+  Tunnels: '隧道',
+  Generator: '生成器',
+  Modules: '模块',
+  Plugins: '插件',
+  Settings: '设置',
+  'Client Detail': '主机详情'
+}
+
 const titleDescriptions = {
-  Dashboard: '',
-  '仪表盘': '',
-  Clients: '',
-  '受控端': '',
-  Listeners: '',
-  '监听器': '',
-  Tunnels: '',
-  '隧道': '',
-  Generator: '',
-  '生成器': '',
-  Plugins: '',
-  '插件': '',
-  Settings: '',
-  '设置': '',
-  'Client Detail': '',
-  Terminal: '',
-  Files: '',
-  Processes: '',
-  'Client Tunnels': '',
-  'Client Plugins': ''
+  Dashboard: '实时全盘拓扑节点视场、各平台端点数量分布与核心资源指标汇聚。',
+  '仪表盘': '实时全盘拓扑节点视场、各平台端点数量分布与核心资源指标汇聚。',
+  Clients: '已接入主机的生命周期管理、正向/反向交互会话与实时状态监控。',
+  '受控端': '已接入主机的生命周期管理、正向/反向交互会话与实时状态监控。',
+  Listeners: '多协议传输通道监听、端口分配与通信数据接入服务管理。',
+  '监听器': '多协议传输通道监听、端口分配与通信数据接入服务管理。',
+  Tunnels: '内置 SOCKS5 及端口转发通道的建立、状态与数据桥接。',
+  '隧道': '内置 SOCKS5 及端口转发通道的建立、状态与数据桥接。',
+  Generator: '跨平台 Shell & Stager 载荷构建、定制模板与能力参数配置。',
+  '生成器': '跨平台 Shell & Stager 载荷构建、定制模板与能力参数配置。',
+  Modules: 'Stage0 L2 模块仓库：上传 shell 等模块并推送到在线主机。',
+  '模块': 'Stage0 L2 模块仓库：上传 shell 等模块并推送到在线主机。',
+  Plugins: '扩展功能模块集中注入、内存载荷加载与平台兼容插件管理。',
+  '插件': '扩展功能模块集中注入、内存载荷加载与平台兼容插件管理。',
+  Settings: '多角色操作员鉴权配置、系统审计日志与控制平面安全设置。',
+  '设置': '多角色操作员鉴权配置、系统审计日志与控制平面安全设置。',
+  'Client Detail': '特定受控端点的详细信息、命令行终端交互、文件管理与高级交互。',
+  '主机详情': '特定受控端点的详细信息、命令行终端交互、文件管理与高级交互。'
 }
 
 const userData = JSON.parse(localStorage.getItem('cupcake_user') || '{}')
@@ -167,8 +179,9 @@ const username = ref(userData.username || 'Operator')
 const userInitial = computed(() => username.value.charAt(0).toUpperCase())
 const activeMenu = computed(() => route.path.startsWith('/client/') ? '/clients' : route.path)
 
-const currentTitle = computed(() => route.meta.title || '仪表盘')
-const currentDescription = computed(() => titleDescriptions[currentTitle.value] || '具有单一布局和共享视觉系统的统一操作员工作流。')
+const rawTitle = computed(() => route.meta.title || 'Dashboard')
+const currentTitle = computed(() => titleDisplayNames[rawTitle.value] || rawTitle.value)
+const currentDescription = computed(() => titleDescriptions[rawTitle.value] || titleDescriptions[currentTitle.value] || '具有统一布局和共享视觉系统的控制舱操作工作流。')
 
 const currentTime = ref('')
 const currentDate = ref('')

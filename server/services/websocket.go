@@ -119,8 +119,8 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 			// 1. Deobfuscate
 			deobfuscated := utils.DeobfuscatePacket(message, ln.ObfuscateMode, sessionKey)
 			
-			// 2. Decrypt
-			decrypted, err := utils.DecryptAES(deobfuscated, sessionKey)
+			// 2. Decrypt (compat with legacy client default-padding on "none")
+			decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey)
 			if err != nil {
 				log.Printf("Decryption failed for %s: %v", remoteAddr, err)
 				break
@@ -129,7 +129,7 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 		} else if len(keyBytes) > 0 {
 			// Auto-detect compatibility
 			deobfuscated := utils.DeobfuscatePacket(message, ln.ObfuscateMode, sessionKey)
-			if decrypted, err := utils.DecryptAES(deobfuscated, sessionKey); err == nil {
+			if decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey); err == nil {
 				plaintext = decrypted
 			} else {
 				plaintext = message
@@ -226,6 +226,11 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 			if se, ok := pMap["stderr"].(string); ok { resp.Stderr = se }
 			if pa, ok := pMap["path"].(string); ok { resp.Path = pa }
 			if req, ok := pMap["req_id"].(string); ok { resp.ReqID = req }
+
+			// Stage0: auto-push L2 module when agent reports module_required:<id>
+			if client != nil && resp.Stderr != "" && strings.Contains(resp.Stderr, "module_required:") {
+				go MaybeAutoPushModule(client.UUID, resp.Stderr)
+			}
 
 			// Broadcast: Format output and send to Client.OutputChannel (Real-time Terminal)
 			if client != nil && client.OutputChannel != nil {
@@ -457,18 +462,21 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			// 1. Deobfuscate
 			deobfuscated := utils.DeobfuscatePacket(body, ln.ObfuscateMode, sessionKey)
 			
-			// 2. Decrypt
-			decrypted, err := utils.DecryptAES(deobfuscated, sessionKey)
+			// 2. Decrypt (compat: strip legacy default padding on GCM failure)
+			decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey)
 			if err != nil {
-				log.Printf("[TCP] Decryption failed: %v", err)
+				log.Printf("[TCP] Decryption failed from %s: body=%d deobf=%d obf_mode=%q key_len=%d err=%v",
+					remoteAddr, len(body), len(deobfuscated), ln.ObfuscateMode, len(sessionKey), err)
 				break
 			}
 			plaintext = decrypted
 		} else if len(keyBytes) > 0 {
 			// Auto-detect compatibility
 			deobfuscated := utils.DeobfuscatePacket(body, ln.ObfuscateMode, sessionKey)
-			if decrypted, err := utils.DecryptAES(deobfuscated, sessionKey); err == nil {
+			if decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey); err == nil {
 				plaintext = decrypted
+			} else {
+				log.Printf("[TCP] Auto-detect decrypt failed from %s: body=%d err=%v", remoteAddr, len(body), err)
 			}
 		}
 
@@ -579,6 +587,10 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			if se, ok := pMap["stderr"].(string); ok { resp.Stderr = se }
 			if pa, ok := pMap["path"].(string); ok { resp.Path = pa }
 			if req, ok := pMap["req_id"].(string); ok { resp.ReqID = req }
+
+			if client != nil && resp.Stderr != "" && strings.Contains(resp.Stderr, "module_required:") {
+				go MaybeAutoPushModule(client.UUID, resp.Stderr)
+			}
 
 			if client != nil && client.OutputChannel != nil {
 				if resp.ReqID != "" {

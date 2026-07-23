@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"time"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -65,17 +65,49 @@ func HandleUploadPlugin(c *gin.Context) {
 	pluginID := c.PostForm("id")
 	name := c.PostForm("name")
 	desc := c.PostForm("description")
-	execType := c.PostForm("type")
+	// type is optional — auto-detected from file content
+	execType := strings.TrimSpace(c.PostForm("type"))
 	osReq := c.PostForm("required_os")
 	category := c.PostForm("category")
 
-	if pluginID == "" { pluginID = fmt.Sprintf("PL-%d", time.Now().Unix()) }
+	if pluginID == "" {
+		pluginID = fmt.Sprintf("PL-%d", time.Now().Unix())
+	}
 
 	os.MkdirAll("assets/plugins", 0755)
 	savePath := filepath.Join("assets/plugins", file.Filename)
 	if err := c.SaveUploadedFile(file, savePath); err != nil {
 		c.JSON(500, gin.H{"error": "Failed to save file"})
 		return
+	}
+
+	// Auto-detect exec type from magic / PE CLR directory
+	raw, err := os.ReadFile(savePath)
+	if err != nil {
+		c.JSON(500, gin.H{"error": "Failed to read uploaded file"})
+		return
+	}
+	detected := services.DetectPluginExecType(raw, file.Filename)
+	// Only honor manual type if explicitly "auto" empty or force; always prefer content
+	if execType == "" || execType == "auto" || execType == "自动" {
+		execType = detected
+	} else {
+		// Still override with content-based detection (user request: no manual choice needed)
+		execType = detected
+	}
+
+	if osReq == "" {
+		if execType == "memfd-exec" {
+			osReq = "linux"
+		} else {
+			osReq = "windows"
+		}
+	}
+	if name == "" {
+		name = file.Filename
+	}
+	if category == "" {
+		category = "general"
 	}
 
 	manifest := services.PluginMetadata{
@@ -93,7 +125,25 @@ func HandleUploadPlugin(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "success", "plugin": manifest})
+	c.JSON(http.StatusOK, gin.H{
+		"status":         "success",
+		"plugin":         manifest,
+		"detected_type":  execType,
+		"detection_note": typeDetectNote(execType),
+	})
+}
+
+func typeDetectNote(t string) string {
+	switch t {
+	case "native-exec":
+		return "识别为原生 PE（如 fscan），将走 PPID 隔离短命进程执行"
+	case "execute-assembly":
+		return "识别为 .NET 程序集，将走 iso_host CLR 内存执行"
+	case "bof-exec":
+		return "识别为 COFF/BOF 对象，将走 iso_host BOF 引擎"
+	default:
+		return "已自动选择执行类型: " + t
+	}
 }
 
 func HandleDeletePlugin(c *gin.Context) {

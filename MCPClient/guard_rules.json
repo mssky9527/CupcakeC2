@@ -1,0 +1,64 @@
+{
+    "_comment": "Cupcake C2 MCP 安全网关自定义规则配置",
+    "_usage": "在此文件中添加自定义黑名单规则，会与内置规则合并生效",
+    "enabled": true,
+    "shell_blocked": [
+        {
+            "pattern": "wget\\s+.*\\|\\s*(ba)?sh",
+            "reason": "禁止从网络下载并直接执行脚本",
+            "category": "remote_exec"
+        },
+        {
+            "pattern": "curl\\s+.*\\|\\s*(ba)?sh",
+            "reason": "禁止从网络下载并直接执行脚本",
+            "category": "remote_exec"
+        },
+        {
+            "pattern": "certutil\\s+-urlcache",
+            "reason": "禁止使用 certutil 下载文件",
+            "category": "download_abuse"
+        },
+        {
+            "pattern": "bitsadmin\\s+/transfer",
+            "reason": "禁止使用 BITS 传输下载文件",
+            "category": "download_abuse"
+        },
+        {
+            "pattern": "vssadmin\\s+delete\\s+shadows",
+            "reason": "禁止删除卷影副本（勒索软件行为）",
+            "category": "ransomware_behavior"
+        },
+        {
+            "pattern": "bcdedit\\s+/set\\s+.*recoveryenabled\\s+no",
+            "reason": "禁止禁用系统恢复（勒索软件行为）",
+            "category": "ransomware_behavior"
+        },
+        {
+            "pattern": "wbadmin\\s+delete\\s+catalog",
+            "reason": "禁止删除备份目录（勒索软件行为）",
+            "category": "ransomware_behavior"
+        },
+        {
+            "pattern": "reg\\s+delete\\s+HKLM\\\\SYSTEM",
+            "reason": "禁止删除系统注册表关键项",
+            "category": "registry_destructive"
+        },
+        {
+            "pattern": "reg\\s+delete\\s+HKLM\\\\SOFTWARE\\\\Microsoft\\\\Windows\\s+NT",
+            "reason": "禁止删除 Windows NT 注册表项",
+            "category": "registry_destructive"
+        }
+    ],
+    "file_blocked": [
+        {
+            "pattern": "^[A-Z]:\\\\Windows\\\\System32\\\\drivers\\\\etc\\\\hosts$",
+            "reason": "禁止操作 hosts 文件",
+            "category": "network_config"
+        },
+        {
+            "pattern": "^/etc/resolv\\.conf$",
+            "reason": "禁止操作 DNS 配置文件",
+            "category": "network_config"
+        }
+    ]
+}

