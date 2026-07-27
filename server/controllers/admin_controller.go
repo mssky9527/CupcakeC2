@@ -6,6 +6,7 @@ import (
 	"cupcake-server/pkg/store"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -13,8 +14,75 @@ import (
 	"cupcake-server/services"
 )
 
-// HandleLogin handles user authentication
+// loginLock: after 5 failed attempts, lock IP for 5 minutes
+const (
+	loginMaxFails   = 5
+	loginLockWindow = 5 * time.Minute
+)
+
+var loginLimiter = struct {
+	mu       sync.Mutex
+	fails    map[string]int       // consecutive failures
+	lockedAt map[string]time.Time // when lock started (zero = not locked)
+}{
+	fails:    make(map[string]int),
+	lockedAt: make(map[string]time.Time),
+}
+
+// loginLockRemaining returns remaining lock duration, or 0 if allowed.
+func loginLockRemaining(ip string) time.Duration {
+	loginLimiter.mu.Lock()
+	defer loginLimiter.mu.Unlock()
+	now := time.Now()
+	if t, ok := loginLimiter.lockedAt[ip]; ok && !t.IsZero() {
+		until := t.Add(loginLockWindow)
+		if now.Before(until) {
+			return until.Sub(now)
+		}
+		// lock expired
+		delete(loginLimiter.lockedAt, ip)
+		loginLimiter.fails[ip] = 0
+	}
+	return 0
+}
+
+func recordLoginFailure(ip string) {
+	loginLimiter.mu.Lock()
+	defer loginLimiter.mu.Unlock()
+	loginLimiter.fails[ip]++
+	if loginLimiter.fails[ip] >= loginMaxFails {
+		loginLimiter.lockedAt[ip] = time.Now()
+	}
+}
+
+func recordLoginSuccess(ip string) {
+	loginLimiter.mu.Lock()
+	defer loginLimiter.mu.Unlock()
+	loginLimiter.fails[ip] = 0
+	delete(loginLimiter.lockedAt, ip)
+}
+
+// sensitive settings cannot be written via generic settings API
+var blockedSettingKeys = map[string]bool{
+	"system_api_token":  true,
+	"web_auth_password": true,
+	"web_auth_user":     true,
+	"admin_pass":        true,
+	"admin_password":    true,
+}
+
+// HandleLogin handles user authentication (panel form login only)
 func HandleLogin(c *gin.Context) {
+	ip := c.ClientIP()
+	if rem := loginLockRemaining(ip); rem > 0 {
+		c.JSON(http.StatusTooManyRequests, gin.H{
+			"error":       "too many failed logins, account locked",
+			"retry_after": int(rem.Seconds()) + 1,
+			"lock_min":    5,
+		})
+		return
+	}
+
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
@@ -25,14 +93,23 @@ func HandleLogin(c *gin.Context) {
 	}
 
 	user, err := store.GetUserByUsername(req.Username)
-	if err != nil || !store.CheckPasswordHash(req.Password, user.Password) {
+	if err != nil || user == nil || !store.CheckPasswordHash(req.Password, user.Password) {
+		recordLoginFailure(ip)
 		store.SaveLoginLog(&model.LoginLog{
 			Username:  req.Username,
-			IP:        c.ClientIP(),
+			IP:        ip,
 			UserAgent: c.GetHeader("User-Agent"),
 			Status:    "failed",
 			Message:   "Invalid credentials",
 		})
+		// If just locked, tell client
+		if rem := loginLockRemaining(ip); rem > 0 {
+			c.JSON(http.StatusTooManyRequests, gin.H{
+				"error":       "too many failed logins, locked for 5 minutes",
+				"retry_after": int(rem.Seconds()) + 1,
+			})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
 		return
 	}
@@ -42,9 +119,10 @@ func HandleLogin(c *gin.Context) {
 		return
 	}
 
+	recordLoginSuccess(ip)
 	store.SaveLoginLog(&model.LoginLog{
 		Username:  req.Username,
-		IP:        c.ClientIP(),
+		IP:        ip,
 		UserAgent: c.GetHeader("User-Agent"),
 		Status:    "success",
 	})
@@ -160,7 +238,7 @@ func HandleGetSettings(c *gin.Context) {
 	}
 }
 
-// HandleUpdateSettings updates global config
+// HandleUpdateSettings updates global config (whitelist: rejects sensitive keys)
 func HandleUpdateSettings(c *gin.Context) {
 	var settings []model.GlobalSetting
 	if err := c.ShouldBindJSON(&settings); err != nil {
@@ -169,6 +247,12 @@ func HandleUpdateSettings(c *gin.Context) {
 	}
 
 	for _, s := range settings {
+		if blockedSettingKeys[s.Key] {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": fmt.Sprintf("setting key %q cannot be updated via generic endpoint", s.Key),
+			})
+			return
+		}
 		store.SetSetting(s.Key, s.Value, s.Group)
 	}
 	c.JSON(http.StatusOK, gin.H{"msg": "Settings updated"})
@@ -200,16 +284,46 @@ func HandleDeleteWebhook(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"msg": "Webhook deleted"})
 }
 
-// HandleMaintenanceReset clears sensitive history
+// HandleMaintenanceReset clears sensitive history (admin role + confirmation required)
 func HandleMaintenanceReset(c *gin.Context) {
+	var req struct {
+		Confirm string `json:"confirm"`
+	}
+	_ = c.ShouldBindJSON(&req)
+	confirm := req.Confirm
+	if confirm == "" {
+		confirm = c.GetHeader("X-Confirm-Reset")
+	}
+	if confirm != "RESET_ALL_AGENTS" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": `confirmation required: body {"confirm":"RESET_ALL_AGENTS"} or header X-Confirm-Reset`,
+		})
+		return
+	}
+
+	// Prefer admin role from bearer user session
+	authHeader := c.GetHeader("Authorization")
+	token := ""
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		token = authHeader[7:]
+	}
+	if token != "" {
+		var user model.User
+		if err := store.DB.Where("token = ?", token).First(&user).Error; err == nil {
+			if user.Role != "admin" && user.Role != "Admin" && user.Role != "administrator" {
+				c.JSON(http.StatusForbidden, gin.H{"error": "admin role required for maintenance reset"})
+				return
+			}
+		}
+		// Master API token (MCP) is treated as admin
+	}
+
 	store.DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.Agent{})
 	store.DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.CommandLog{})
 
 	globals.Clients.Range(func(key, value interface{}) bool {
 		client := value.(*globals.Client)
-		// 🛡️ 正确清理：先关闭 OutputChannel，防止 goroutine 泄漏
 		if client.OutputChannel != nil {
-			// 用 recover 保护，避免重复关闭 panic
 			func() {
 				defer func() { recover() }()
 				close(client.OutputChannel)
@@ -220,6 +334,20 @@ func HandleMaintenanceReset(c *gin.Context) {
 	})
 
 	c.JSON(http.StatusOK, gin.H{"msg": "Database reset successful (Agents and Logs cleared)"})
+}
+
+// HandleLogout invalidates the current user session token.
+func HandleLogout(c *gin.Context) {
+	authHeader := c.GetHeader("Authorization")
+	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
+		token := authHeader[7:]
+		var user model.User
+		if err := store.DB.Where("token = ?", token).First(&user).Error; err == nil {
+			user.Token = ""
+			_ = store.SaveUser(&user)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "logged out"})
 }
 
 // HandleMaintenanceExport exports all data

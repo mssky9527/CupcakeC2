@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -276,17 +275,11 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 		return "", err
 	}
 
-	// 用完即焚：隔离宿主为短命进程（退出即焚）；清掉 agent 侧缓存的 iso_host PE 可选
-	if cmdType == "bof_exec" || cmdType == "execute_assembly" {
-		go func(agent string) {
-			time.Sleep(3 * time.Second)
-			if err := SendModuleUnload(agent, "iso_host"); err != nil {
-				log.Printf("[Plugin] post-run unload iso_host on %s: %v", agent, err)
-			} else {
-				log.Printf("[Plugin] cleared staged iso_host PE on %s after use", agent)
-			}
-		}(agentID)
-	}
+	// Do NOT auto-unload iso_host after a fixed timer.
+	// Old 3s unload raced with long BOF/CLR jobs and concurrent plugins
+	// ("iso_host PE missing" mid-flight). Host process itself burns the
+	// temp PE on exit; staged PE in agent memory is reusable until operator
+	// unloads or agent dies. Optional explicit unload: module_unload iso_host.
 
 	_ = store.CreateCommandLog(agentID, reqID, meta.Name, fmt.Sprintf("Args: %s", args))
 	return reqID, nil

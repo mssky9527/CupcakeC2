@@ -114,6 +114,35 @@ func GetClients(c *gin.Context) {
 	if agents == nil {
 		agents = []model.Agent{}
 	}
+	// Optional pagination: ?page=1&page_size=50 (0/missing page_size = full list for compatibility)
+	page := 0
+	pageSize := 0
+	fmt.Sscanf(c.Query("page"), "%d", &page)
+	fmt.Sscanf(c.Query("page_size"), "%d", &pageSize)
+	if pageSize > 0 {
+		if page < 1 {
+			page = 1
+		}
+		if pageSize > 500 {
+			pageSize = 500
+		}
+		total := len(agents)
+		start := (page - 1) * pageSize
+		if start > total {
+			start = total
+		}
+		end := start + pageSize
+		if end > total {
+			end = total
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"items":     agents[start:end],
+			"total":     total,
+			"page":      page,
+			"page_size": pageSize,
+		})
+		return
+	}
 	c.JSON(http.StatusOK, agents)
 }
 

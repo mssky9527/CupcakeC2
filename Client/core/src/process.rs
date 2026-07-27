@@ -241,11 +241,31 @@ fn handle_kill(pid_u32: u32) -> ProcResponse {
             },
         }
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        // SIGTERM (15) — cooperative kill
+        let rc = unsafe { libc::kill(pid_u32 as i32, 15) };
+        if rc == 0 {
+            info!("[PROCESS] kill(SIGTERM) pid={}", pid_u32);
+            ProcResponse {
+                status: "ok".to_string(),
+                error: None,
+                processes: None,
+            }
+        } else {
+            let err = std::io::Error::last_os_error();
+            ProcResponse {
+                status: "error".to_string(),
+                error: Some(format!("kill failed: {err}")),
+                processes: None,
+            }
+        }
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "linux")))]
     {
         ProcResponse {
             status: "error".to_string(),
-            error: Some("Kill not implemented".to_string()),
+            error: Some("Kill not implemented on this platform".to_string()),
             processes: None,
         }
     }

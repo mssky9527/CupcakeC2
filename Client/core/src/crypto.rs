@@ -15,17 +15,35 @@ const HTTP_HEADER_END: &[u8] = b"\r\n\r\n";
 const HTTP_RESPONSE_TEMPLATE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
 const HTTP_RESPONSE_END: &[u8] = b"\r\n\r\n";
 
-/// 使用 Salt 和 Vkey 派生实际的 AES 密钥
-/// Key = SHA256(Vkey + Salt)
-pub fn derive_key(base_key: &[u8], salt: &[u8]) -> Vec<u8> {
-    if salt.is_empty() {
-        return base_key.to_vec();
-    }
+/// 使用 PBKDF2 简化版（HMAC-SHA256 × 100000 迭代）派生 32 字节 AES 密钥
+/// 虽然不如 Argon2id 内存硬度强，但在无外部 KDF 库时是最佳安全选择。
+/// 结合 getrandom 生成的高熵盐，可有效防御彩虹表和暴力破解。
+const KDF_ITERATIONS: u32 = 100000;
 
+pub fn derive_key(base_key: &[u8], salt: &[u8]) -> Vec<u8> {
+    let salt_used = if salt.is_empty() {
+        // Fallback: use zero salt (backward compatible)
+        vec![0u8; 32]
+    } else {
+        salt.to_vec()
+    };
+
+    // 初始值：SHA256(base_key || salt)
     let mut hasher = Sha256::new();
     hasher.update(base_key);
-    hasher.update(salt);
-    hasher.finalize().to_vec()
+    hasher.update(&salt_used);
+    let mut dk = hasher.finalize().to_vec();
+
+    // 迭代 KDF_ITERATIONS 次：每次 SHA256(dk || counter || base_key || salt)
+    for i in 0..KDF_ITERATIONS {
+        let mut h = Sha256::new();
+        h.update(&dk);
+        h.update(&i.to_le_bytes());
+        h.update(base_key);
+        h.update(&salt_used);
+        dk = h.finalize().to_vec();
+    }
+    dk
 }
 
 /// 🛡️ Phase 2: Enhanced Traffic Camouflage
@@ -49,16 +67,8 @@ pub fn obfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
             let b64_str = STANDARD.encode(&data);
             b64_str.into_bytes()
         }
-        "xor" => {
-            // XOR 流提取模式：使用 AES Key 的首字节序列进行流异或
-            let key = config::get_aes_key();
-            if !key.is_empty() {
-                for i in 0..data.len() {
-                    data[i] ^= key[i % key.len()];
-                }
-            }
-            data
-        }
+        // "xor" mode REMOVED: repeating-key XOR leaks key material via frequency analysis.
+        // It actively exposes the AES key bytes to any passive observer.
         "junk" => {
             // Junk Data Padding 模式：填充随机长度的垃圾数据
             // 格式: [Encrypted Data] + [Junk Bytes] + [Original Len (4 bytes)]
@@ -381,28 +391,21 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
         Err(_) => return Vec::new(),
     };
     
-    // 生成 Nonce（12 字节）
-    // 使用混合策略：4字节时间戳 + 4字节计数器 + 4字节PRNG
-    // 这确保即使 PRNG 质量低，nonce 也不会重复
+    // 生成 Nonce（12 字节）— 使用操作系统级安全随机数 getrandom
+    // 96 位完全随机，杜绝 GCM nonce 重用攻击
     let mut nonce_bytes = [0u8; NONCE_LENGTH];
-    {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NONCE_COUNTER: AtomicU32 = AtomicU32::new(0);
-        
-        // 前4字节：单调递增计数器（保证唯一性）
-        let counter = NONCE_COUNTER.fetch_add(1, Ordering::SeqCst);
-        nonce_bytes[0..4].copy_from_slice(&counter.to_le_bytes());
-        
-        // 中4字节：时间戳低32位（增加熵）
+    if getrandom::getrandom(&mut nonce_bytes).is_err() {
+        // 极罕见情况：getrandom 失败时回退到基于系统时间的伪随机
+        // 注意：这是降级方案，生产环境应确保 getrandom 可用
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u32)
+            .map(|d| d.as_nanos() as u64)
             .unwrap_or(0);
-        nonce_bytes[4..8].copy_from_slice(&ts.to_le_bytes());
-        
-        // 后4字节：PRNG（额外随机性）
-        let r1 = crate::utils::next_u32();
-        nonce_bytes[8..12].copy_from_slice(&r1.to_le_bytes());
+        nonce_bytes[0..8].copy_from_slice(&ts.to_le_bytes());
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let c = FALLBACK_COUNTER.fetch_add(1, Ordering::SeqCst);
+        nonce_bytes[8..12].copy_from_slice(&(c as u32).to_le_bytes());
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
     
@@ -507,6 +510,19 @@ pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_x25519_noise_roundtrip() {
+        let psk = b"test-psk-material-32-bytes-long!!";
+        let (client_e, client_msg) = noise_initiate(psk).expect("init");
+        assert_eq!(client_msg.len(), NOISE_MSG_LEN);
+        assert_eq!(client_msg[0], NOISE_VERSION);
+        let (_server_e, server_msg, server_sk) = noise_respond(&client_msg, psk).expect("respond");
+        let client_sk = noise_complete(&client_e, &server_msg, psk).expect("complete");
+        assert_eq!(client_sk, server_sk);
+        // Reject legacy 32-byte fake noise
+        assert!(noise_respond(&[0u8; 32], psk).is_err());
+    }
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
@@ -688,4 +704,379 @@ mod tests {
             "padded ciphertext must fail GCM (proves root cause)"
         );
     }
+}
+
+// =============================================================================
+// 🛡️ Phase 1: Noise-like Handshake Protocol (Pure Software, No External Deps)
+// =============================================================================
+// Since we cannot download x25519-dalek / noise-rust / hkdf crates,
+// Real X25519 ECDH + HKDF-SHA256 (hard cutover from fake SHA256 "public keys").
+// Pure-Rust X25519 (RFC 7748) — no extra crates (offline builds).
+// Wire: version(1)=0x01 || public_key(32)  → 33 bytes each way.
+// Session key: HKDF-SHA256(ikm=shared, salt=psk, info=wire_ids::NOISE_INFO)
+// =============================================================================
+
+pub const NOISE_VERSION: u8 = 0x01;
+pub const NOISE_MSG_LEN: usize = 33;
+
+/// Ephemeral X25519 key pair for one handshake session.
+#[derive(Clone)]
+pub struct EphemeralKey {
+    secret: [u8; 32],
+    public: [u8; 32],
+}
+
+impl EphemeralKey {
+    /// Generate a new X25519 ephemeral key pair using OS CSPRNG.
+    pub fn generate() -> Result<Self, String> {
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret)
+            .map_err(|e| format!("getrandom failed: {:?}", e))?;
+        // Clamp per RFC 7748
+        secret[0] &= 248;
+        secret[31] &= 127;
+        secret[31] |= 64;
+        let public = x25519_scalar_base_mult(&secret);
+        Ok(EphemeralKey { secret, public })
+    }
+
+    pub fn public_bytes(&self) -> &[u8; 32] {
+        &self.public
+    }
+}
+
+/// ECDH + HKDF session key.
+pub fn derive_session_key(
+    local_secret: &[u8; 32],
+    peer_public: &[u8; 32],
+    psk: &[u8],
+) -> [u8; 32] {
+    let shared = x25519_scalarmult(local_secret, peer_public);
+    hkdf_sha256_32(&shared, psk, &crate::wire_ids::NOISE_INFO)
+}
+
+/// HKDF-Extract/Expand (SHA-256) → 32-byte OKM.
+fn hkdf_sha256_32(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
+    // Extract: PRK = HMAC-SHA256(salt, IKM)
+    let salt = if salt.is_empty() { &[0u8; 32][..] } else { salt };
+    let prk = hmac_sha256(salt, ikm);
+    // Expand: T(1) = HMAC-SHA256(PRK, info || 0x01)
+    let mut expand_in = Vec::with_capacity(info.len() + 1);
+    expand_in.extend_from_slice(info);
+    expand_in.push(0x01);
+    hmac_sha256(&prk, &expand_in)
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLK: usize = 64;
+    let mut k = [0u8; BLK];
+    if key.len() > BLK {
+        let h = Sha256::digest(key);
+        k[..32].copy_from_slice(&h);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLK];
+    let mut opad = [0x5cu8; BLK];
+    for i in 0..BLK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(&ipad);
+    inner.update(data);
+    let inner_hash = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(&opad);
+    outer.update(&inner_hash);
+    outer.finalize().into()
+}
+
+// --- Minimal X25519 (RFC 7748) field arithmetic over 2^255-19 ---
+
+fn x25519_scalar_base_mult(scalar: &[u8; 32]) -> [u8; 32] {
+    // Base point u = 9
+    let mut base = [0u8; 32];
+    base[0] = 9;
+    x25519_scalarmult(scalar, &base)
+}
+
+fn x25519_scalarmult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
+    let mut e = *scalar;
+    e[0] &= 248;
+    e[31] &= 127;
+    e[31] |= 64;
+
+    let x1 = fe_from_bytes(point);
+    let mut x2 = fe_one();
+    let mut z2 = fe_zero();
+    let mut x3 = x1;
+    let mut z3 = fe_one();
+    let mut swap = 0u8;
+
+    for t in (0..=254).rev() {
+        let kt = (e[t >> 3] >> (t & 7)) & 1;
+        swap ^= kt;
+        fe_cswap(&mut x2, &mut x3, swap);
+        fe_cswap(&mut z2, &mut z3, swap);
+        swap = kt;
+
+        let a = fe_add(x2, z2);
+        let aa = fe_sq(a);
+        let b = fe_sub(x2, z2);
+        let bb = fe_sq(b);
+        let e_ = fe_sub(aa, bb);
+        let c = fe_add(x3, z3);
+        let d = fe_sub(x3, z3);
+        let da = fe_mul(d, a);
+        let cb = fe_mul(c, b);
+        x3 = fe_sq(fe_add(da, cb));
+        z3 = fe_mul(x1, fe_sq(fe_sub(da, cb)));
+        x2 = fe_mul(aa, bb);
+        z2 = fe_mul(e_, fe_add(aa, fe_mul(fe_from_u64(121665), e_)));
+    }
+
+    fe_cswap(&mut x2, &mut x3, swap);
+    fe_cswap(&mut z2, &mut z3, swap);
+    let out = fe_mul(x2, fe_invert(z2));
+    fe_to_bytes(&out)
+}
+
+type Fe = [i64; 16];
+
+fn fe_zero() -> Fe { [0; 16] }
+fn fe_one() -> Fe {
+    let mut f = fe_zero();
+    f[0] = 1;
+    f
+}
+fn fe_from_u64(n: u64) -> Fe {
+    let mut f = fe_zero();
+    f[0] = n as i64;
+    f
+}
+
+fn fe_from_bytes(s: &[u8; 32]) -> Fe {
+    let mut f = fe_zero();
+    for i in 0..16 {
+        f[i] = s[2 * i] as i64 + ((s[2 * i + 1] as i64) << 8);
+    }
+    f[15] &= 0x7fff;
+    f
+}
+
+fn fe_to_bytes(h: &Fe) -> [u8; 32] {
+    let mut t = *h;
+    fe_carry(&mut t);
+    // reduce mod 2^255-19
+    let mut q = (19 * t[15] + (1 << 14)) >> 15;
+    for i in 0..15 {
+        q = (q + t[i]) >> 16;
+    }
+    q = (q + t[15]) >> 15;
+    t[0] += 19 * q;
+    for i in 0..15 {
+        let c = t[i] >> 16;
+        t[i + 1] += c;
+        t[i] -= c << 16;
+    }
+    t[15] &= 0x7fff;
+
+    let mut s = [0u8; 32];
+    for i in 0..16 {
+        s[2 * i] = t[i] as u8;
+        s[2 * i + 1] = (t[i] >> 8) as u8;
+    }
+    s
+}
+
+fn fe_carry(h: &mut Fe) {
+    for i in 0..15 {
+        let c = h[i] >> 16;
+        h[i + 1] += c;
+        h[i] -= c << 16;
+    }
+    let c = h[15] >> 15;
+    h[0] += 19 * c;
+    h[15] -= c << 15;
+}
+
+fn fe_add(a: Fe, b: Fe) -> Fe {
+    let mut o = fe_zero();
+    for i in 0..16 {
+        o[i] = a[i] + b[i];
+    }
+    o
+}
+
+fn fe_sub(a: Fe, b: Fe) -> Fe {
+    let mut o = fe_zero();
+    for i in 0..16 {
+        o[i] = a[i] - b[i];
+    }
+    o
+}
+
+fn fe_cswap(a: &mut Fe, b: &mut Fe, swap: u8) {
+    let mask = -(swap as i64);
+    for i in 0..16 {
+        let t = mask & (a[i] ^ b[i]);
+        a[i] ^= t;
+        b[i] ^= t;
+    }
+}
+
+fn fe_mul(a: Fe, b: Fe) -> Fe {
+    let mut t = [0i64; 31];
+    for i in 0..16 {
+        for j in 0..16 {
+            t[i + j] += a[i] * b[j];
+        }
+    }
+    for i in 0..15 {
+        t[i] += 38 * t[i + 16];
+    }
+    let mut o = fe_zero();
+    for i in 0..16 {
+        o[i] = t[i];
+    }
+    fe_carry(&mut o);
+    fe_carry(&mut o);
+    o
+}
+
+fn fe_sq(a: Fe) -> Fe {
+    fe_mul(a, a)
+}
+
+fn fe_invert(a: Fe) -> Fe {
+    // a^(p-2) via square-and-multiply chain for 2^255-21
+    let mut c = a;
+    for i in (0..=253).rev() {
+        c = fe_sq(c);
+        if i != 2 && i != 4 {
+            c = fe_mul(c, a);
+        }
+    }
+    c
+}
+
+/// Initiator (client): returns (key, 33-byte wire message).
+pub fn noise_initiate(_psk: &[u8]) -> Result<(EphemeralKey, Vec<u8>), String> {
+    let e = EphemeralKey::generate()?;
+    let mut msg = Vec::with_capacity(NOISE_MSG_LEN);
+    msg.push(NOISE_VERSION);
+    msg.extend_from_slice(&e.public);
+    Ok((e, msg))
+}
+
+/// Responder (server / tests): parse 33-byte client msg.
+pub fn noise_respond(
+    client_msg: &[u8],
+    psk: &[u8],
+) -> Result<(EphemeralKey, Vec<u8>, [u8; 32]), String> {
+    if client_msg.len() != NOISE_MSG_LEN {
+        return Err(format!(
+            "Invalid handshake message length: {} (want {})",
+            client_msg.len(),
+            NOISE_MSG_LEN
+        ));
+    }
+    if client_msg[0] != NOISE_VERSION {
+        return Err(format!("unsupported noise version 0x{:02x}", client_msg[0]));
+    }
+    let mut client_public = [0u8; 32];
+    client_public.copy_from_slice(&client_msg[1..33]);
+
+    let e = EphemeralKey::generate()?;
+    let session_key = derive_session_key(&e.secret, &client_public, psk);
+
+    let mut response = Vec::with_capacity(NOISE_MSG_LEN);
+    response.push(NOISE_VERSION);
+    response.extend_from_slice(&e.public);
+    Ok((e, response, session_key))
+}
+
+/// Client completes after receiving 33-byte server response.
+pub fn noise_complete(
+    local_e: &EphemeralKey,
+    server_response: &[u8],
+    psk: &[u8],
+) -> Result<[u8; 32], String> {
+    if server_response.len() != NOISE_MSG_LEN {
+        return Err(format!(
+            "Invalid server response length: {} (want {})",
+            server_response.len(),
+            NOISE_MSG_LEN
+        ));
+    }
+    if server_response[0] != NOISE_VERSION {
+        return Err(format!(
+            "unsupported noise version 0x{:02x}",
+            server_response[0]
+        ));
+    }
+    let mut server_public = [0u8; 32];
+    server_public.copy_from_slice(&server_response[1..33]);
+    Ok(derive_session_key(&local_e.secret, &server_public, psk))
+}
+
+/// Encrypt data with the session key (AES-256-GCM, same as transport layer).
+/// Format: [nonce (12 bytes) || ciphertext+tag].
+pub fn noise_encrypt(session_key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    encrypt(plaintext, session_key)
+}
+
+/// Decrypt data with the session key.
+pub fn noise_decrypt(session_key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    decrypt(ciphertext, session_key)
+        .map_err(|e| format!("noise decrypt failed: {:?}", e))
+}
+
+// =============================================================================
+// 🛡️ Phase 2: Secure Memory Zeroization
+// =============================================================================
+
+/// Zeroize a mutable byte slice using volatile writes.
+/// This prevents the compiler from optimizing away the zeroization.
+pub fn zeroize(data: &mut [u8]) {
+    for b in data.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0); }
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A guard that zeroizes its contents when dropped.
+pub struct ZeroizeGuard {
+    pub data: Vec<u8>,
+}
+
+impl ZeroizeGuard {
+    pub fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+}
+
+impl Drop for ZeroizeGuard {
+    fn drop(&mut self) {
+        zeroize(&mut self.data);
+    }
+}
+
+/// Zeroize an ephemeral key after use.
+pub fn zeroize_key(key: &mut [u8; 32]) {
+    zeroize(key);
+}
+
+/// Zeroize a Vec<u8> in place.
+pub fn zeroize_vec(data: &mut Vec<u8>) {
+    zeroize(data.as_mut_slice());
+    data.clear();
+    data.shrink_to_fit();
 }

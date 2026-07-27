@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -50,8 +51,14 @@ type Client struct {
 	EncryptKey     string          `json:"-"`
 	EncryptionSalt string          `json:"-"`
 	ObfuscateMode  string          `json:"-"`
+	// Phase 1: Noise-like ephemeral session key (forward secrecy)
+	NoiseSessionKey [32]byte       `json:"-"`
+	// Cached Argon2id-derived static session key (set once after register / first use)
+	SessionKey     []byte          `json:"-"`
 	CommandChannel chan string     `json:"-"`
 	OutputChannel  chan string     `json:"-"`
+	// Protect concurrent WebSocket writes (admin shell, multi-subscriber)
+	WSWriteMu      sync.Mutex      `json:"-"`
 	ListenerID     string          `json:"listener_id"`
 	ListenerPort   int             `json:"listener_port"`
 	CachedPlugins  map[string]bool `json:"-"`
@@ -103,10 +110,28 @@ var (
 	PTYState          sync.Map
 	ActivePTYSessions sync.Map // UUID -> *PTYSession (用于保持后端 PTY 历史和分发)
 	LogsMap           sync.Map
+	LogsMapMu         sync.Mutex // serializes LoadOrStore+append+Store on LogsMap
 	PendingResponses  sync.Map
 	Listeners         sync.Map
 	Upgrader          = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
+		// Restrict Origin to same-host / localhost to reduce CSWSH risk.
+		// Empty Origin allowed for non-browser agents and same-site direct connects.
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true
+			}
+			// Local admin panel / dev tools
+			if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
+				return true
+			}
+			// Same host as request
+			host := r.Host
+			if host != "" && (strings.Contains(origin, host) || strings.HasSuffix(origin, "://"+host)) {
+				return true
+			}
+			return false
+		},
 	}
 	// 修复6: 使用 atomic 替代 Mutex，性能更高（无锁原子操作）
 	reqCounter uint64

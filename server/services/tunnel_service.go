@@ -2,6 +2,7 @@ package services
 
 import (
     "bufio"
+    "crypto/subtle"
     "encoding/base64"
     "encoding/binary"
     "fmt"
@@ -266,8 +267,8 @@ func handleSocksConnection(conn net.Conn, agentID, user, pass string) {
 		pBuf := make([]byte, pLen)
 		if _, err := io.ReadAtLeast(conn, pBuf, pLen); err != nil { return }
 
-		if string(uBuf) != user || string(pBuf) != pass {
-			log.Printf("[SOCKS] ❌ %s: auth FAILED (user=%s)", remoteAddr, string(uBuf))
+		if subtle.ConstantTimeCompare(uBuf, []byte(user)) != 1 || subtle.ConstantTimeCompare(pBuf, []byte(pass)) != 1 {
+			log.Printf("[SOCKS] ❌ %s: auth FAILED", remoteAddr)
 			conn.Write([]byte{0x01, 0x01}) // Auth Failed
 			return
 		}

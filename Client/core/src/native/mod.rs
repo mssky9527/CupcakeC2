@@ -7,6 +7,8 @@ pub mod process;
 pub mod memory;
 #[cfg(windows)]
 pub mod spawn;
+#[cfg(all(windows, target_arch = "x86_64"))]
+pub mod ghost_host;
 
 pub mod netinfo;
 pub mod users;

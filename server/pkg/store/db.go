@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"cupcake-server/pkg/model"
+	"cupcake-server/pkg/paths"
 
 	"github.com/glebarez/sqlite"
 	"golang.org/x/crypto/bcrypt"
@@ -18,7 +19,8 @@ var DB *gorm.DB
 
 func InitDB() {
 	var err error
-	dbPath := "storage/cupcake.db"
+	paths.Init()
+	dbPath := paths.Join("cupcake.db")
 	
 	// Create storage directory if not exists
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0755); err != nil {

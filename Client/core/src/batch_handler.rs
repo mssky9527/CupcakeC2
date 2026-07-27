@@ -112,7 +112,7 @@ impl BatchMessageHandler {
                 interval_secs.saturating_sub(jitter as u64).max(10)
             };
 
-            crate::utils::db_print(&format!("[Cupcake] Batch loop active. Next heartbeat in {}s", final_delay));
+            crate::utils::db_print(&format!("[agent] batch loop; next heartbeat {}s", final_delay));
             tokio::select! {
                 // Scenario 1: Receive message from server
                 recv_res = tokio::time::timeout(receive_timeout, self.transport.receive()) => {

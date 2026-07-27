@@ -230,6 +230,15 @@
               <strong>回连地址</strong> = 上方「回连地址」+ 监听器端口（Agent C2）。
               二者不要混用。
             </p>
+            <div class="stager-meta" style="margin-bottom: 8px">
+              <div class="stager-meta__row">
+                <span>交付方式</span>
+                <el-radio-group v-model="stagerDelivery" size="small" @change="fetchStagerCommand">
+                  <el-radio-button label="disk">落盘 EXE</el-radio-button>
+                  <el-radio-button label="fileless">内存 Fileless</el-radio-button>
+                </el-radio-group>
+              </div>
+            </div>
             <div v-if="stagerMeta.panel_host || stagerMeta.callback" class="stager-meta">
               <div class="stager-meta__row">
                 <span>面板下载 Host</span>
@@ -452,7 +461,8 @@ const loading = ref(false)
 const activeListeners = ref([])
 const stagerLoading = ref(false)
 const stagerCommand = ref('')
-const stagerMeta = ref({ panel_host: '', callback: '', profile: '', profile_label: '' })
+const stagerDelivery = ref('disk') // disk | fileless
+const stagerMeta = ref({ panel_host: '', callback: '', profile: '', profile_label: '', delivery: 'disk', stage2_url: '' })
 
 const currentTaskId = ref('')
 const terminalDialogVisible = ref(false)
@@ -775,10 +785,39 @@ const attachBuildSocket = () => {
     }
   }
 
-  const token = localStorage.getItem('cupcake_token')
+  const token = localStorage.getItem('cupcake_token') || ''
+  if (!token) {
+    pushTerminalLog('[FAIL] 未登录或会话已过期，无法连接构建日志')
+    buildStatusText.value = '鉴权失败'
+    buildFinished.value = true
+    syncBuildTimer(false)
+    return
+  }
 
   closeBuildSocket()
-  ws = new WebSocket(`${socketBase}/api/build/logs/${currentTaskId.value}?token=${token}`)
+  ws = new WebSocket(
+    `${socketBase}/api/build/logs/${currentTaskId.value}?token=${encodeURIComponent(token)}`
+  )
+
+  ws.onopen = () => {
+    pushTerminalLog('[*] 构建日志通道已连接')
+  }
+
+  ws.onerror = () => {
+    pushTerminalLog('[FAIL] 构建日志 WebSocket 连接失败（鉴权/网络）')
+    if (!buildFinished.value) {
+      buildStatusText.value = '日志通道连接失败'
+    }
+  }
+
+  ws.onclose = (ev) => {
+    if (!buildFinished.value && buildStatusText.value === '正在准备构建环境') {
+      pushTerminalLog(`[FAIL] 日志通道已断开 (code=${ev.code})，构建可能仍在后台进行，请刷新后重试`)
+      buildStatusText.value = '日志通道断开'
+      buildFinished.value = true
+      syncBuildTimer(false)
+    }
+  }
 
   ws.onmessage = async (event) => {
     const payload = JSON.parse(event.data)
@@ -786,6 +825,15 @@ const attachBuildSocket = () => {
     if (payload.type === 'log') {
       pushTerminalLog(payload.content)
       const text = String(payload.content).toLowerCase()
+      // 任意构建日志都先离开「准备环境」；命中编译关键字再进编译阶段
+      if (buildStage.value < 2) {
+        buildStage.value = 1
+        if (text.includes('沙箱') || text.includes('sandbox') || text.includes('准备')) {
+          buildStatusText.value = '正在准备沙箱环境'
+        } else {
+          buildStatusText.value = '构建进行中'
+        }
+      }
       if (text.includes('cargo') || text.includes('compiling') || text.includes('profile')) {
         buildStage.value = 2
         buildStatusText.value = '正在编译核心'
@@ -916,7 +964,7 @@ const doGenerate = async () => {
 const fetchStagerCommand = async () => {
   if (!form.value.listenerId) {
     stagerCommand.value = ''
-    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '' }
+    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '', delivery: 'disk', stage2_url: '' }
     return
   }
   stagerLoading.value = true
@@ -931,7 +979,8 @@ const fetchStagerCommand = async () => {
         os,
         arch,
         host: form.value.lhost,
-        profile: form.value.profile || 'reverse'
+        profile: form.value.profile || 'reverse',
+        delivery: stagerDelivery.value || 'disk'
       }
     })
     stagerCommand.value = response.data.command || ''
@@ -942,11 +991,13 @@ const fetchStagerCommand = async () => {
       panel_host: response.data.panel_host || '',
       callback: response.data.callback || form.value.lhost || '',
       profile: response.data.profile || form.value.profile || '',
-      profile_label: response.data.profile_label || profileLabel.value
+      profile_label: response.data.profile_label || profileLabel.value,
+      delivery: response.data.delivery || stagerDelivery.value || 'disk',
+      stage2_url: response.data.stage2_url || response.data.download || ''
     }
   } catch (e) {
     stagerCommand.value = ''
-    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '' }
+    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '', delivery: 'disk', stage2_url: '' }
     const msg = e?.response?.data?.error || '一键上线命令生成失败'
     ElMessage.error(msg)
   } finally {

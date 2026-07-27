@@ -3,6 +3,7 @@ package services
 import (
 	"bytes"
 	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/utils"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -74,14 +75,20 @@ func sendWebhook(hookType, url, content string) {
 		}
 	}
 
+	if err := utils.ValidateWebhookURL(url); err != nil {
+		log.Printf("[Notify] blocked SSRF webhook %s: %v", url, err)
+		return
+	}
+
 	jsonBytes, _ := json.Marshal(payload)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonBytes))
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Post(url, "application/json", bytes.NewBuffer(jsonBytes))
 	if err != nil {
 		log.Printf("[Notify] Failed to send %s webhook: %v", hookType, err)
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode >= 400 {
 		log.Printf("[Notify] %s webhook returned status %d", hookType, resp.StatusCode)
 	}

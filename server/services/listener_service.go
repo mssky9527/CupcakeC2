@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/utils"
 	"fmt"
 	"log"
 	"net/http"
@@ -158,13 +159,7 @@ func configureTLS(ln *globals.Listener) error {
 
 // Generate a self-signed certificate for development/testing
 func generateSelfSignedCert() (tls.Certificate, error) {
-	// This is a simplified self-signed cert generation
-	// In production, use proper certificates from Let's Encrypt or internal CA
-
-	// For now, we'll return an error prompting the user to provide certs
-	// A proper implementation would use crypto/x509 to generate certs
-
-	return tls.Certificate{}, fmt.Errorf("no TLS certificate provided. Please configure TLSCertPath/TLSKeyPath or TLSCertPEM/TLSKeyPEM")
+	return utils.GenerateSelfSignedCert([]string{"localhost", "127.0.0.1", "0.0.0.0"})
 }
 
 func StopListenerInstance(ln *globals.Listener) {
@@ -184,23 +179,4 @@ func StopListenerInstance(ln *globals.Listener) {
 	ln.Status = "Stopped"
 }
 
-func HandleDNSQuery(w dns.ResponseWriter, r *dns.Msg) {
-	m := new(dns.Msg)
-	m.SetReply(r)
-	m.Compress = false
-
-	switch r.Opcode {
-	case dns.OpcodeQuery:
-		for _, q := range m.Question {
-			if q.Qtype == dns.TypeTXT {
-				name := strings.ToLower(q.Name)
-				if strings.HasPrefix(name, "ping.") {
-					txt := "alive"
-					rr, _ := dns.NewRR(fmt.Sprintf("%s 3600 IN TXT \"%s\"", q.Name, txt))
-					m.Answer = append(m.Answer, rr)
-				}
-			}
-		}
-	}
-	w.WriteMsg(m)
-}
+// HandleDNSQuery is defined in dns_tunnel.go (TXT cmd:/alive/ok protocol).

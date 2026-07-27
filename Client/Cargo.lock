@@ -253,12 +253,14 @@ dependencies = [
 name = "cupcake-core"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "async-trait",
  "base64",
  "encoding_rs",
  "env_logger",
  "futures-util",
+ "getrandom 0.2.17",
  "hex",
  "lazy_static",
  "libc",

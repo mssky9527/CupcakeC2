@@ -9,9 +9,11 @@ Cargo.lock             # 本项目作 binary，Cargo.lock 可以提交；如不�
 
 # ---- Go (Server) ----
 /server/dist/        # Go embed 打包用的前端产物
-/server/*.exe        # Windows 编译产物
+/server/*.exe        # Windows 编译产物 (includes services.test.exe from go test -c)
+/server/*.test.exe
 /server/cupcake-server  # Linux 编译产物
 /server/temp_builds/
+/server/services_crash.txt
 
 # ---- Vue / Node.js (Frontend) ----
 /server/frontend-v2/node_modules/

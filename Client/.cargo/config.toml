@@ -1,19 +1,10 @@
-[build]
-rustflags = [
-    "--remap-path-prefix", "E:\\学习\\C2\\Client=/src",
-    "--remap-path-prefix", "C:\\Users\\47993=/u",
-]
+# Do NOT force a remote replace-with here: this machine often has packages only in
+# %USERPROFILE%\.cargo\registry\src\index.crates.io-* (default crates-io layout).
+# For China online builds, set user-level mirror or run:
+#   powershell -File scripts/cargo-use-rsproxy.ps1
+#
+# Offline: powershell -File scripts/cargo-use-local-cache.ps1
+# then: cargo test --manifest-path core/Cargo.toml --lib --offline
 
-[target.x86_64-pc-windows-msvc]
-rustflags = [
-    "--remap-path-prefix", "E:\\学习\\C2\\Client=/src",
-    "--remap-path-prefix", "C:\\Users\\47993=/u",
-    "-Clink-arg=/DEBUG:NONE",
-]
-
-[target.i686-pc-windows-msvc]
-rustflags = [
-    "--remap-path-prefix", "E:\\学习\\C2\\Client=/src",
-    "--remap-path-prefix", "C:\\Users\\47993=/u",
-    "-Clink-arg=/DEBUG:NONE",
-]
+[net]
+git-fetch-with-cli = true

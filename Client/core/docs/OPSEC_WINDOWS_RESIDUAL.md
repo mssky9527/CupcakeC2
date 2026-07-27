@@ -92,6 +92,13 @@ Stack spoof: `stealth::stack::with_spoofed_stack` (noise + x64 bait locals) is *
 - `GetConsoleWindow` / `ShowWindow` / `AllocConsole` / `OutputDebugStringA` / `CreateFileA` / `WriteConsoleA`
 - PEB-resolved; **production should skip** `setup_diagnostic_console` (only when `RUST_LOG` / debug).
 
+### P1 — Heavy-op pacing (default on)
+
+**Location:** `utils::opsec_heavy_pace*` — called before iso_host BOF/.NET, native_exec, module LoadLibrary.
+
+- Default random 300–1200 ms between heavy jobs (env `CUPCAKE_OPSEC_PACE_MS`).
+- Stage residual: INetCache `~DF*.dll` / `~DF*.tmp` (not `cpx_*` under %TEMP%).
+
 ### P1 — Sleep mask / heap walk (feature-gated)
 
 **Location:** `stealth/mask.rs` (`sleep-mask` feature)

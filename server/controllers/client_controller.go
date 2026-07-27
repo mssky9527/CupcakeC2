@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"cupcake-server/pkg/globals"
@@ -303,13 +304,23 @@ func HandleAdminShell(c *gin.Context) {
 	// 🛡️ Anti-DoS: 限制管理员 Shell WebSocket 单帧大小为 1MB
 	ws.SetReadLimit(1 * 1024 * 1024)
 
+	// Serialize all writes to this admin shell WebSocket (concurrent WriteJSON panics)
+	var writeMu sync.Mutex
+	writeJSON := func(v interface{}) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return ws.WriteJSON(v)
+	}
+
 	go func() {
 		for output := range client.OutputChannel {
 			var packet hub.WsPacket
 			if err := json.Unmarshal([]byte(output), &packet); err != nil {
 				packet = hub.WsPacket{MsgType: "TERM", Content: output}
 			}
-			ws.WriteJSON(packet)
+			if err := writeJSON(packet); err != nil {
+				return
+			}
 		}
 	}()
 
@@ -346,9 +357,9 @@ func SendCommand(c *gin.Context) {
 func HandleConnectBindAgent(c *gin.Context) {
 	var req struct {
 		TargetAddr     string `json:"target_addr"`
-		AesKey         string `json:"aes_key"`          
-		EncryptionSalt string `json:"encryption_salt"`  
-		ListenerID     string `json:"listener_id"`      
+		AesKey         string `json:"aes_key"`          // deprecated: prefer listener_id only
+		EncryptionSalt string `json:"encryption_salt"`  // deprecated
+		ListenerID     string `json:"listener_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
@@ -359,28 +370,27 @@ func HandleConnectBindAgent(c *gin.Context) {
 		return
 	}
 
+	// Prefer listener_id — never require key material in the HTTP body
 	fakeLn := &globals.Listener{
-		EncryptMode:    "aes",
-		EncryptKey:     req.AesKey,
-		EncryptionSalt: req.EncryptionSalt,
-		ObfuscateMode:  "none",
+		EncryptMode:   "aes",
+		ObfuscateMode: "none",
 	}
-
-	if req.AesKey == "" {
-		if req.ListenerID == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "aes_key or listener_id is required"})
-			return
-		}
-		val, ok := globals.Listeners.Load(req.ListenerID)
-		if !ok {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Listener not found or offline"})
-			return
-		}
-		ln := val.(*globals.Listener)
-		fakeLn.EncryptKey     = ln.EncryptKey
-		fakeLn.EncryptionSalt = ln.EncryptionSalt
-		fakeLn.ObfuscateMode  = ln.ObfuscateMode
+	if req.ListenerID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "listener_id is required (aes_key in body is no longer accepted)"})
+		return
 	}
+	val, ok := globals.Listeners.Load(req.ListenerID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Listener not found or offline"})
+		return
+	}
+	ln := val.(*globals.Listener)
+	fakeLn.EncryptKey = ln.EncryptKey
+	fakeLn.EncryptionSalt = ln.EncryptionSalt
+	fakeLn.ObfuscateMode = ln.ObfuscateMode
+	// Ignore client-supplied aes_key/encryption_salt even if present (SSRF/key-exfil hardening)
+	_ = req.AesKey
+	_ = req.EncryptionSalt
 
 	target := req.TargetAddr
 	if !strings.Contains(target, ":") {
@@ -402,6 +412,32 @@ func HandleConnectBindAgent(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "Connecting to bind agent..."})
 }
 
+// GetResponse returns buffered agent output logs (by uuid) and/or a pending req_id reply.
 func GetResponse(c *gin.Context) {
-	c.JSON(200, gin.H{"status": "ok"})
+	uuidStr := c.Query("uuid")
+	reqID := c.Query("req_id")
+	out := gin.H{"status": "ok"}
+
+	if uuidStr != "" {
+		if v, ok := globals.LogsMap.Load(uuidStr); ok {
+			out["logs"] = v
+		} else {
+			out["logs"] = []string{}
+		}
+	}
+	if reqID != "" {
+		if ch, found := globals.PendingResponses.Load(reqID); found {
+			select {
+			case msg := <-ch.(chan interface{}):
+				out["response"] = msg
+			default:
+				out["response"] = nil
+				out["pending"] = true
+			}
+		} else {
+			out["response"] = nil
+			out["pending"] = false
+		}
+	}
+	c.JSON(http.StatusOK, out)
 }

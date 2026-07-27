@@ -126,6 +126,14 @@ pub struct BatchExecutionManager {
     result_buffer: Arc<Mutex<VecDeque<BufferedResult>>>,
     /// Network callback for sending results
     network_callback: SyncMutex<Option<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>>,
+    /// Shared with background task for periodic flush
+    network_callback_shared: Option<
+        Arc<
+            SyncMutex<
+                Option<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>,
+            >,
+        >,
+    >,
     /// Manager handle for shutdown
     manager_handle: SyncMutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -141,11 +149,16 @@ impl BatchExecutionManager {
             task_tx,
             result_buffer,
             network_callback: SyncMutex::new(None),
+            network_callback_shared: None,
             manager_handle: SyncMutex::new(None),
         };
         
-        // Start the background manager
-        manager.start_background_manager(task_rx);
+        // Start the background manager with shared callback handle
+        let callback_shared = Arc::new(SyncMutex::new(
+            None::<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>,
+        ));
+        manager.network_callback_shared = Some(callback_shared.clone());
+        manager.start_background_manager(task_rx, callback_shared);
         
         manager
     }
@@ -180,7 +193,12 @@ impl BatchExecutionManager {
     /// Set network callback for sending results
     pub fn set_network_callback(&self, callback: Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>) {
         if let Ok(mut cb) = self.network_callback.lock() {
-            *cb = Some(callback);
+            *cb = Some(callback.clone());
+        }
+        if let Some(ref shared) = self.network_callback_shared {
+            if let Ok(mut cb) = shared.lock() {
+                *cb = Some(callback);
+            }
         }
     }
     
@@ -232,7 +250,15 @@ impl BatchExecutionManager {
     }
     
     /// Start background manager task
-    fn start_background_manager(&mut self, mut task_rx: mpsc::UnboundedReceiver<BatchExecutionRequest>) {
+    fn start_background_manager(
+        &mut self,
+        mut task_rx: mpsc::UnboundedReceiver<BatchExecutionRequest>,
+        callback_shared: Arc<
+            SyncMutex<
+                Option<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>,
+            >,
+        >,
+    ) {
         let config = self.config.clone();
         let result_buffer = Arc::clone(&self.result_buffer);
         
@@ -312,14 +338,34 @@ impl BatchExecutionManager {
                         let _ = request.response_tx.send(Ok(task_id_for_response));
                     }
                     
-                    // Periodic buffer flush
+                    // Periodic buffer flush via shared network callback
                     _ = flush_interval.tick() => {
-                        let buffer = result_buffer.lock().await;
-                        if !buffer.is_empty() {
-                            // In this background thread context, we can't easily access self.network_callback
-                            // because it's not shared. We'll rely on the BatchMessageHandler 
-                            // to call flush_buffer() periodically or we need to rethink the Arc strategy.
-                            // For now, let's keep it simple as the MessageHandler calls flush_buffer.
+                        let cb_opt = callback_shared.lock().ok().and_then(|g| g.clone());
+                        if let Some(callback) = cb_opt {
+                            let mut buffer = result_buffer.lock().await;
+                            if !buffer.is_empty() {
+                                let results: Vec<BufferedResult> = buffer.drain(..).collect();
+                                let n = results.len();
+                                drop(buffer);
+                                let backup = results.clone();
+                                let buffer_clone = Arc::clone(&result_buffer);
+                                let max_retries = config.max_retries;
+                                let handle = callback(results);
+                                tokio::spawn(async move {
+                                    let success = handle.await.unwrap_or(false);
+                                    if !success {
+                                        let mut b = buffer_clone.lock().await;
+                                        for mut res in backup.into_iter().rev() {
+                                            if res.retry_count < max_retries {
+                                                res.retry_count += 1;
+                                                b.push_front(res);
+                                            }
+                                        }
+                                    } else {
+                                        debug!("Background flush sent {} results", n);
+                                    }
+                                });
+                            }
                         }
                     }
                     

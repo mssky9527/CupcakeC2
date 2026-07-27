@@ -6,11 +6,22 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
+
+// sanitizeFileName removes path traversal components and unsafe characters from a filename.
+// It strips directory separators and returns only the base name.
+func sanitizeFileName(name string) string {
+	name = filepath.Base(name)
+	name = strings.ReplaceAll(name, "..", "")
+	name = strings.ReplaceAll(name, "/", "")
+	name = strings.ReplaceAll(name, "\\", "")
+	return name
+}
 
 func HandleListPlugins(c *gin.Context) {
 	plugins, err := services.LoadPluginManifest()
@@ -75,7 +86,12 @@ func HandleUploadPlugin(c *gin.Context) {
 	}
 
 	os.MkdirAll("assets/plugins", 0755)
-	savePath := filepath.Join("assets/plugins", file.Filename)
+	safeFileName := sanitizeFileName(file.Filename)
+	if safeFileName == "" || safeFileName == "." {
+		c.JSON(400, gin.H{"error": "Invalid file name"})
+		return
+	}
+	savePath := filepath.Join("assets/plugins", safeFileName)
 	if err := c.SaveUploadedFile(file, savePath); err != nil {
 		c.JSON(500, gin.H{"error": "Failed to save file"})
 		return
@@ -154,13 +170,22 @@ func HandleDeletePlugin(c *gin.Context) {
 		return
 	}
 	if fileName != "" {
-		os.Remove(filepath.Join("assets/plugins", fileName))
+		safeFileName := sanitizeFileName(fileName)
+		if safeFileName != "" && safeFileName != "." {
+			os.Remove(filepath.Join("assets/plugins", safeFileName))
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "success"})
 }
 
 func HandleGetPluginResult(c *gin.Context) {
 	taskID := c.Param("task_id")
+	// Validate task_id: only allow alphanumeric characters to prevent path traversal
+	validID := regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	if !validID.MatchString(taskID) {
+		c.JSON(400, gin.H{"error": "Invalid task ID"})
+		return
+	}
 	logPath := filepath.Join("storage/logs", fmt.Sprintf("task_%s.txt", taskID))
 	data, err := os.ReadFile(logPath)
 	if err != nil {

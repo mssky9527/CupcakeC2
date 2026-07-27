@@ -169,20 +169,22 @@ fn shell_words_split(s: &str) -> Vec<String> {
     s.split_whitespace().map(|x| x.to_string()).collect()
 }
 
-unsafe fn slice_str(p: *const u8, len: u32) -> Option<&'static str> {
+/// Lifetime is tied to the caller's buffers (cmd/payload) — not truly 'static.
+unsafe fn slice_str<'a>(p: *const u8, len: u32) -> Option<&'a str> {
     if p.is_null() || len == 0 {
         return None;
     }
     std::str::from_utf8(std::slice::from_raw_parts(p, len as usize)).ok()
 }
 
-unsafe fn slice_bytes(p: *const u8, len: u32) -> Option<&'static [u8]> {
+unsafe fn slice_bytes<'a>(p: *const u8, len: u32) -> Option<&'a [u8]> {
     if p.is_null() || len == 0 {
         return None;
     }
     Some(std::slice::from_raw_parts(p, len as usize))
 }
 
+/// Heap buffer for host: always shrink_to_fit so len==cap for mod_free.
 unsafe fn write_json(out_ptr: *mut *mut u8, out_len: *mut u32, stdout: &str, stderr: &str) -> i32 {
     let v = serde_json::json!({ "stdout": stdout, "stderr": stderr, "path": null });
     let mut bytes = match serde_json::to_vec(&v) {
@@ -190,6 +192,7 @@ unsafe fn write_json(out_ptr: *mut *mut u8, out_len: *mut u32, stdout: &str, std
         Err(_) => return -4,
     };
     bytes.shrink_to_fit();
+    debug_assert_eq!(bytes.len(), bytes.capacity());
     let len = bytes.len() as u32;
     let ptr = bytes.as_mut_ptr();
     std::mem::forget(bytes);

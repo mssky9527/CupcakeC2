@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -11,44 +12,81 @@ import (
 	"cupcake-server/pkg/store"
 )
 
-var (
+// tokenCache holds auth-related settings with RWMutex protection (request-path safe).
+var tokenCache struct {
+	mu            sync.RWMutex
 	cachedToken   string
 	lastTokenLoad time.Time
 	allowedIPs    string
 	lastIPLoad    time.Time
 	mcpEnabled    bool
 	lastMcpSync   time.Time
-)
+}
 
-// GetCurrentToken returns the active API token (refreshes if needed)
+// GetCurrentToken returns the active API token (refreshes if needed).
+// Never calls log.Fatal — empty token returns empty string for callers to handle.
 func GetCurrentToken() string {
 	now := time.Now()
-	if cachedToken == "" || now.Sub(lastTokenLoad) > 1*time.Minute {
-		cachedToken = store.GetSetting("system_api_token")
-		lastTokenLoad = now
-		if cachedToken == "" {
-			cachedToken = "cupcake_master_key_default_replace_me"
-		}
+	tokenCache.mu.RLock()
+	if tokenCache.cachedToken != "" && now.Sub(tokenCache.lastTokenLoad) <= 1*time.Minute {
+		t := tokenCache.cachedToken
+		tokenCache.mu.RUnlock()
+		return t
 	}
-	return cachedToken
+	tokenCache.mu.RUnlock()
+
+	tokenCache.mu.Lock()
+	defer tokenCache.mu.Unlock()
+	// Double-check after acquiring write lock
+	if tokenCache.cachedToken != "" && now.Sub(tokenCache.lastTokenLoad) <= 1*time.Minute {
+		return tokenCache.cachedToken
+	}
+	tokenCache.cachedToken = store.GetSetting("system_api_token")
+	tokenCache.lastTokenLoad = now
+	return tokenCache.cachedToken
+}
+
+// allowQueryToken restricts URL token to WS endpoints used by the browser.
+func allowQueryToken(path string) bool {
+	if strings.HasPrefix(path, "/api/build/logs/") {
+		return true
+	}
+	if strings.HasPrefix(path, "/api/pty/") {
+		return true
+	}
+	if strings.HasPrefix(path, "/api/shell/") {
+		return true
+	}
+	return false
 }
 
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		
+
 		// 1. 静态资源和登录接口免鉴权
 		if path == "/api/auth/login" || strings.HasPrefix(path, "/api/s/") || !strings.HasPrefix(path, "/api") {
 			c.Next()
 			return
 		}
 
-		// 2. IP 白名单防御 (由基础物理层面阻断爆破)
+		// 2. IP 白名单防御
 		now := time.Now()
-		if allowedIPs == "" || now.Sub(lastIPLoad) > 1*time.Minute {
-			allowedIPs = store.GetSetting("allowed_ips")
-			lastIPLoad = now
+		tokenCache.mu.RLock()
+		needIP := tokenCache.allowedIPs == "" || now.Sub(tokenCache.lastIPLoad) > 1*time.Minute
+		tokenCache.mu.RUnlock()
+		if needIP {
+			tokenCache.mu.Lock()
+			if tokenCache.allowedIPs == "" || now.Sub(tokenCache.lastIPLoad) > 1*time.Minute {
+				tokenCache.allowedIPs = store.GetSetting("allowed_ips")
+				tokenCache.lastIPLoad = now
+			}
+			tokenCache.mu.Unlock()
 		}
+
+		tokenCache.mu.RLock()
+		allowedIPs := tokenCache.allowedIPs
+		tokenCache.mu.RUnlock()
 
 		clientIP := c.ClientIP()
 		if allowedIPs != "" {
@@ -62,20 +100,22 @@ func AuthMiddleware() gin.HandlerFunc {
 			}
 			if !isAllowed {
 				log.Printf("[Security] Access Denied for IP: %s (Not in whitelist)", clientIP)
-				// OpSec: Return generic 403 without detail
 				c.Status(http.StatusForbidden)
 				c.Abort()
 				return
 			}
 		}
 
-		// 3. Token 提取 (支持 Header 和 Query)
+		// 3. Token 提取：优先 Authorization Bearer。
+		// Query ?token= only for browser WebSocket upgrades (cannot set headers):
+		// /api/build/logs/*, /api/pty/*, /api/shell/* — avoid logging tokens on REST.
 		authHeader := c.GetHeader("Authorization")
 		token := ""
 		if strings.HasPrefix(authHeader, "Bearer ") {
 			token = strings.TrimPrefix(authHeader, "Bearer ")
-		} else {
-			token = c.Query("token")
+		}
+		if token == "" && allowQueryToken(path) {
+			token = strings.TrimSpace(c.Query("token"))
 		}
 
 		if token == "" {
@@ -84,18 +124,33 @@ func AuthMiddleware() gin.HandlerFunc {
 			return
 		}
 
-		// 4. Token 校验与同步 (带 1 分钟缓存，减小 DB 压力)
-		if cachedToken == "" || now.Sub(lastTokenLoad) > 1*time.Minute {
-			cachedToken = store.GetSetting("system_api_token")
-			lastTokenLoad = now
-			
-			// Sync MCP Status too
-			mcpStatus := store.GetSetting("system_mcp_enabled")
-			mcpEnabled = (mcpStatus == "true" || mcpStatus == "")
-			
-			if cachedToken == "" {
-				cachedToken = "cupcake_master_key_default_replace_me"
+		// 4. Token 校验与同步 (带 1 分钟缓存，减小 DB 压力) — mutex protected, no log.Fatal
+		tokenCache.mu.RLock()
+		needToken := tokenCache.cachedToken == "" || now.Sub(tokenCache.lastTokenLoad) > 1*time.Minute
+		tokenCache.mu.RUnlock()
+		if needToken {
+			tokenCache.mu.Lock()
+			if tokenCache.cachedToken == "" || now.Sub(tokenCache.lastTokenLoad) > 1*time.Minute {
+				tokenCache.cachedToken = store.GetSetting("system_api_token")
+				tokenCache.lastTokenLoad = now
+				mcpStatus := store.GetSetting("system_mcp_enabled")
+				tokenCache.mcpEnabled = (mcpStatus == "true" || mcpStatus == "")
+				tokenCache.lastMcpSync = now
 			}
+			tokenCache.mu.Unlock()
+		}
+
+		tokenCache.mu.RLock()
+		cachedToken := tokenCache.cachedToken
+		mcpEnabled := tokenCache.mcpEnabled
+		tokenCache.mu.RUnlock()
+
+		if cachedToken == "" {
+			// Request path must not kill the process — misconfiguration → 500
+			log.Printf("[Security] No API token configured (system_api_token empty)")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "server auth not configured"})
+			c.Abort()
+			return
 		}
 
 		// 5. 验证 Token (Master Key 或 User Session)
@@ -111,47 +166,13 @@ func AuthMiddleware() gin.HandlerFunc {
 			}
 			isAuthenticated = true
 		} else {
-		// Check User Session Token (Web UI)
-		var user model.User
-		if err := store.DB.Where("token = ?", token).First(&user).Error; err == nil {
-			if user.IsActive {
-				isAuthenticated = true
-			}
-		}
-
-		// OpSec/Robustness: If query-based token fails, it might be due to URL decoding issues (+ -> space) 
-		// or truncation at '&'. This is common for WebSocket handshakes.
-		if !isAuthenticated && c.Query("token") != "" {
-			// 1. Try restoring '+' from spaces (common Gin/URL decoding behavior)
-			if strings.Contains(token, " ") {
-				fixedToken := strings.ReplaceAll(token, " ", "+")
-				if err := store.DB.Where("token = ?", fixedToken).First(&user).Error; err == nil {
-					if user.IsActive {
-						isAuthenticated = true
-					}
+			// Check User Session Token (Web UI)
+			var user model.User
+			if err := store.DB.Where("token = ?", token).First(&user).Error; err == nil {
+				if user.IsActive {
+					isAuthenticated = true
 				}
 			}
-			
-			// 2. Deep scan: If it still fails, the token might be truncated at '&'.
-			// We scan the RawQuery for the full 'token=' value.
-			if !isAuthenticated {
-				raw := c.Request.URL.RawQuery
-				if strings.Contains(raw, "token=") {
-					// Find token= and extract until end of string or next legitimate param
-					parts := strings.Split(raw, "token=")
-					if len(parts) > 1 {
-						fullToken := parts[1]
-						// If there were other params after token, they might be part of the token itself 
-						// if the client failed to encode. We try the whole remaining part.
-						if err := store.DB.Where("token = ?", fullToken).First(&user).Error; err == nil {
-							if user.IsActive {
-								isAuthenticated = true
-							}
-						}
-					}
-				}
-			}
-		}
 		}
 
 		if !isAuthenticated {

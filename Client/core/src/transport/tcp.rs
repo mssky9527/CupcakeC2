@@ -3,9 +3,12 @@
 // 提供基于原始 TCP 套接字的传输层实现，使用 Yamux 多路复用。
 
 use crate::backoff::ExponentialBackoff;
-use crate::config::get_aes_key;
+use crate::config::{get_aes_key, get_aes_key_base};
 use crate::crypto;
 use crate::error::{ClientError, Result};
+use crate::transport::session_crypto::{
+    seal_for_wire, traffic_key, FragReassembler, OpenResult,
+};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use std::io::Write;
@@ -20,17 +23,22 @@ pub struct TcpTransport {
     url: String,
     control_stream: Option<tokio_util::compat::Compat<yamux::Stream>>,
     aes_key: Vec<u8>,
+    noise_psk: Vec<u8>,
     backoff: ExponentialBackoff,
+    noise_session_key: Option<[u8; 32]>,
+    reassembler: FragReassembler,
 }
 
 impl TcpTransport {
     pub fn new(url: String) -> Self {
-        let aes_key = get_aes_key();
         Self {
             url,
             control_stream: None,
-            aes_key,
+            aes_key: get_aes_key(),
+            noise_psk: get_aes_key_base(),
             backoff: ExponentialBackoff::default(),
+            noise_session_key: None,
+            reassembler: FragReassembler::new(),
         }
     }
     
@@ -193,6 +201,62 @@ impl Transport for TcpTransport {
                         
                         crate::utils::db_print("[Cupcake] Control established.");
                         self.control_stream = Some(control_stream.compat());
+                        self.noise_session_key = None;
+                        self.reassembler.clear();
+
+                        // X25519 with BASE key as PSK (matches server resolveAESKey — no salt)
+                        if !self.noise_psk.is_empty() {
+                            let (ephemeral_key, handshake_msg) =
+                                crypto::noise_initiate(&self.noise_psk).map_err(|e| {
+                                    ClientError::ConnectionError(format!("Noise init: {e}"))
+                                })?;
+
+                            let stream = self.control_stream.as_mut().unwrap();
+                            let msg_len = handshake_msg.len() as u32;
+                            stream
+                                .write_u32(msg_len)
+                                .await
+                                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+                            stream
+                                .write_all(&handshake_msg)
+                                .await
+                                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+                            stream
+                                .flush()
+                                .await
+                                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+
+                            let resp_len = stream
+                                .read_u32()
+                                .await
+                                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+                            if resp_len as usize != crypto::NOISE_MSG_LEN {
+                                return Err(ClientError::ConnectionError(format!(
+                                    "Invalid Noise resp len: {} (want {})",
+                                    resp_len,
+                                    crypto::NOISE_MSG_LEN
+                                )));
+                            }
+                            let mut server_response = vec![0u8; crypto::NOISE_MSG_LEN];
+                            stream
+                                .read_exact(&mut server_response)
+                                .await
+                                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+
+                            let session_key = crypto::noise_complete(
+                                &ephemeral_key,
+                                &server_response,
+                                &self.noise_psk,
+                            )
+                            .map_err(|e| {
+                                ClientError::ConnectionError(format!("Noise complete: {e}"))
+                            })?;
+                            self.noise_session_key = Some(session_key);
+                            crate::utils::db_print(
+                                "[Cupcake] X25519 Noise OK — traffic uses session key",
+                            );
+                        }
+
                         self.backoff.reset();
                         return Ok(());
                     } else {
@@ -211,37 +275,66 @@ impl Transport for TcpTransport {
     }
     
     async fn send(&mut self, data: &[u8]) -> Result<()> {
-        let stream = self.control_stream.as_mut().ok_or_else(|| ClientError::ConnectionError("No stream".into()))?;
-        let encrypted = crypto::encrypt(data, &self.aes_key);
-        let obfuscated = crypto::obfuscate_packet(encrypted);
-        let len = obfuscated.len() as u32;
-        stream.write_u32(len).await.map_err(|e| ClientError::ConnectionError(e.to_string()))?;
-        stream.write_all(&obfuscated).await.map_err(|e| ClientError::ConnectionError(e.to_string()))?;
-        stream.flush().await.map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+        let key = traffic_key(self.noise_session_key.as_ref(), &self.aes_key)?.to_vec();
+        let frames = seal_for_wire(data, &key, 0)?;
+        let stream = self
+            .control_stream
+            .as_mut()
+            .ok_or_else(|| ClientError::ConnectionError("No stream".into()))?;
+        for frame in frames {
+            stream
+                .write_u32(frame.len() as u32)
+                .await
+                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+            stream
+                .write_all(&frame)
+                .await
+                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+        }
+        stream
+            .flush()
+            .await
+            .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
         Ok(())
     }
-    
+
     async fn receive(&mut self) -> Result<Vec<u8>> {
-        let stream = self.control_stream.as_mut().ok_or_else(|| ClientError::ConnectionError("No stream".into()))?;
-        
-        // 🛡️ Read timeout: detect half-open connections (server silently died)
-        // If no data arrives within 120s, assume connection is dead and trigger reconnect
-        let len = match tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            stream.read_u32()
-        ).await {
-            Ok(Ok(l)) => l as usize,
-            Ok(Err(e)) => return Err(ClientError::ConnectionError(e.to_string())),
-            Err(_) => return Err(ClientError::ConnectionError("Read timeout (half-open)".into())),
-        };
-        
-        if len > 100 * 1024 * 1024 { return Err(ClientError::ConnectionError("Too big".into())); }
-        let mut buffer = vec![0u8; len];
-        stream.read_exact(&mut buffer).await.map_err(|e| ClientError::ConnectionError(e.to_string()))?;
-        let deobfuscated = crypto::deobfuscate_packet(buffer);
-        let plaintext = crypto::decrypt(&deobfuscated, &self.aes_key)
-            .map_err(|e| ClientError::ConnectionError(format!("Decryption error: {}", e)))?;
-        Ok(plaintext)
+        let key = traffic_key(self.noise_session_key.as_ref(), &self.aes_key)?.to_vec();
+        loop {
+            let stream = self
+                .control_stream
+                .as_mut()
+                .ok_or_else(|| ClientError::ConnectionError("No stream".into()))?;
+
+            let len = match tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                stream.read_u32(),
+            )
+            .await
+            {
+                Ok(Ok(l)) => l as usize,
+                Ok(Err(e)) => return Err(ClientError::ConnectionError(e.to_string())),
+                Err(_) => {
+                    return Err(ClientError::ConnectionError(
+                        "Read timeout (half-open)".into(),
+                    ))
+                }
+            };
+
+            if len > 100 * 1024 * 1024 {
+                return Err(ClientError::ConnectionError("Too big".into()));
+            }
+            let mut buffer = vec![0u8; len];
+            stream
+                .read_exact(&mut buffer)
+                .await
+                .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+            let deobf = crypto::deobfuscate_packet(buffer);
+            match self.reassembler.push(deobf, &key)? {
+                OpenResult::Complete(pt) => return Ok(pt),
+                OpenResult::NeedMore => continue,
+            }
+        }
     }
     
     fn is_connected(&self) -> bool { self.control_stream.is_some() }

@@ -152,14 +152,15 @@ fn parse_bof_payload(body: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     Ok((body.to_vec(), Vec::new()))
 }
 
-unsafe fn slice_str(p: *const u8, len: u32) -> Option<&'static str> {
+/// Bound to caller's payload buffers — not 'static.
+unsafe fn slice_str<'a>(p: *const u8, len: u32) -> Option<&'a str> {
     if p.is_null() || len == 0 {
         return None;
     }
     std::str::from_utf8(std::slice::from_raw_parts(p, len as usize)).ok()
 }
 
-unsafe fn slice_bytes(p: *const u8, len: u32) -> Option<&'static [u8]> {
+unsafe fn slice_bytes<'a>(p: *const u8, len: u32) -> Option<&'a [u8]> {
     if p.is_null() || len == 0 {
         return None;
     }
