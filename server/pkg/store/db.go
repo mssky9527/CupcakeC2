@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"cupcake-server/pkg/model"
 	"cupcake-server/pkg/paths"
@@ -17,6 +18,52 @@ import (
 
 var DB *gorm.DB
 
+// applySQLitePragmas enforces WAL + busy_timeout after open (belt-and-suspenders vs DSN).
+func applySQLitePragmas(db *gorm.DB) error {
+	if db == nil {
+		return nil
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return err
+	}
+	if _, err := sqlDB.Exec("PRAGMA journal_mode=WAL;"); err != nil {
+		return err
+	}
+	if _, err := sqlDB.Exec("PRAGMA busy_timeout=5000;"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// JournalMode returns current SQLite journal_mode (for tests / diagnostics).
+func JournalMode() string {
+	if DB == nil {
+		return ""
+	}
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return ""
+	}
+	var mode string
+	_ = sqlDB.QueryRow("PRAGMA journal_mode;").Scan(&mode)
+	return mode
+}
+
+// BusyTimeoutMs returns PRAGMA busy_timeout in milliseconds.
+func BusyTimeoutMs() int {
+	if DB == nil {
+		return 0
+	}
+	sqlDB, err := DB.DB()
+	if err != nil {
+		return 0
+	}
+	var ms int
+	_ = sqlDB.QueryRow("PRAGMA busy_timeout;").Scan(&ms)
+	return ms
+}
+
 func InitDB() {
 	var err error
 	paths.Init()
@@ -27,9 +74,16 @@ func InitDB() {
 		log.Fatalf("Failed to create storage directory: %v", err)
 	}
 
-	DB, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	// Enable WAL + busy_timeout via DSN (glebarez/sqlite).
+	// journal_mode=WAL improves concurrent readers; busy_timeout avoids SQLITE_BUSY under multi-goroutine writes.
+	dsn := dbPath + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
+	DB, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
+	}
+
+	if err := applySQLitePragmas(DB); err != nil {
+		log.Printf("[DB] warning: pragma apply: %v", err)
 	}
 
 	// Auto Migrate
@@ -52,17 +106,8 @@ func InitDB() {
 }
 
 func initDefaultAdmin() {
-	var count int64
-	DB.Model(&model.User{}).Count(&count)
-	if count == 0 {
-		hashed, _ := HashPassword("cupcake123")
-		admin := model.User{
-			Username: "admin",
-			Password: hashed,
-			Role:     "admin",
-		}
-		DB.Create(&admin)
-	}
+	// Do NOT seed a weak default password here.
+	// Admin user is created by main.bootstrapAdminPassword (config / random / CUPCAKE_FORCE_DEV_PASS).
 
 	// Initialize API Token
 	var tokenCount int64
@@ -86,6 +131,11 @@ func initDefaultAdmin() {
 			Group: "security",
 		})
 	}
+}
+
+// IsBcryptHash reports whether s looks like a bcrypt hash (not plaintext).
+func IsBcryptHash(s string) bool {
+	return strings.HasPrefix(s, "$2a$") || strings.HasPrefix(s, "$2b$") || strings.HasPrefix(s, "$2y$")
 }
 
 func HashPassword(password string) (string, error) {

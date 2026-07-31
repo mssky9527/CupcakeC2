@@ -172,10 +172,12 @@ fn main() {
         }
         
         // Prefer NtCreateThreadEx (syscall); no CreateThread IAT dependency.
+        // stack_size=0 → OS default (do NOT pass large commit with 0 reserve:
+        // Server 2012 R2 / Win8.1 reject or mis-handle commit>reserve).
         let h_thread = match cupcake_core::native::create_thread_ex(
             agent_thread_proc,
             std::ptr::null_mut(),
-            8 * 1024 * 1024, // 8MB commit stack
+            0,
         ) {
             Ok(h) => h,
             Err(e) => {

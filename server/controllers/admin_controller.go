@@ -323,12 +323,7 @@ func HandleMaintenanceReset(c *gin.Context) {
 
 	globals.Clients.Range(func(key, value interface{}) bool {
 		client := value.(*globals.Client)
-		if client.OutputChannel != nil {
-			func() {
-				defer func() { recover() }()
-				close(client.OutputChannel)
-			}()
-		}
+		client.CloseOutputChannel()
 		globals.Clients.Delete(key)
 		return true
 	})

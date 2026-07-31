@@ -56,6 +56,13 @@ pub struct MappedModule {
     >,
     pub mod_free: Option<unsafe extern "C" fn(*mut u8, u32)>,
     pub mod_shutdown: Option<unsafe extern "C" fn() -> i32>,
+    /// Optional desktop stream exports (mod_desktop).
+    pub mod_stream_attach: Option<unsafe extern "C" fn(u32) -> i32>,
+    pub mod_stream_poll_frame: Option<
+        unsafe extern "C" fn(u32, u32, *mut u8, u32, *mut u32, *mut *mut u8, *mut u32) -> i32,
+    >,
+    pub mod_stream_push_input: Option<unsafe extern "C" fn(u32, *const u8, u32) -> i32>,
+    pub mod_stream_detach: Option<unsafe extern "C" fn(u32) -> i32>,
     /// True if DllMain was invoked on attach (must detach on unmap).
     pub dll_main_called: bool,
 }
@@ -267,6 +274,32 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
     let mod_shutdown =
         unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_shutdown") }
             .map(|a| unsafe { std::mem::transmute(a) });
+    let mod_stream_attach =
+        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_stream_attach") }
+            .map(|a| unsafe { std::mem::transmute(a) });
+    let mod_stream_poll_frame = unsafe {
+        resolve_export(
+            base,
+            size_of_image,
+            export_rva,
+            export_size,
+            b"mod_stream_poll_frame",
+        )
+    }
+    .map(|a| unsafe { std::mem::transmute(a) });
+    let mod_stream_push_input = unsafe {
+        resolve_export(
+            base,
+            size_of_image,
+            export_rva,
+            export_size,
+            b"mod_stream_push_input",
+        )
+    }
+    .map(|a| unsafe { std::mem::transmute(a) });
+    let mod_stream_detach =
+        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_stream_detach") }
+            .map(|a| unsafe { std::mem::transmute(a) });
 
     if mod_invoke.is_none() {
         let _ = unmap_pe_inner(base, size_of_image, dll_main_called);
@@ -284,6 +317,10 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         mod_invoke,
         mod_free,
         mod_shutdown,
+        mod_stream_attach,
+        mod_stream_poll_frame,
+        mod_stream_push_input,
+        mod_stream_detach,
         dll_main_called,
     })
 }

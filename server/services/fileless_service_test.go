@@ -1,8 +1,6 @@
 package services
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -40,57 +38,8 @@ func TestStage2CacheRoundTrip(t *testing.T) {
 	}
 }
 
-func TestBuildFilelessStage2FromTemplateOrSkip(t *testing.T) {
-	// Prefer a real client template when present; otherwise skip Donut conversion.
-	candidates := []string{
-		filepath.Join("assets", "client_template_windows_tcp_minimal.exe"),
-		filepath.Join("..", "assets", "client_template_windows_tcp_minimal.exe"),
-		filepath.Join("assets", "client_template_windows.exe"),
-		filepath.Join("storage", "modules", "shell.bin"),
-		filepath.Join("..", "storage", "modules", "shell.bin"),
-	}
-	var pe []byte
-	var used string
-	for _, p := range candidates {
-		b, err := os.ReadFile(p)
-		if err == nil && len(b) > 64 && b[0] == 'M' && b[1] == 'Z' {
-			pe = b
-			used = p
-			break
-		}
-	}
-	if pe == nil {
-		t.Skip("no PE template/module available for Donut conversion")
-	}
-
-	// Patch with dummy C2 (placeholders may or may not match — still MZ PE)
-	patched, err := PatchPayload(pe, "tcp://127.0.0.1:4444", "testkey123456789012345678901234", 30, 20, "", false, 0, "salt", "none")
-	if err != nil {
-		// Use raw PE if placeholders missing
-		t.Logf("PatchPayload: %v — using raw PE from %s", err, used)
-		patched = pe
-	}
-	sc, err := BuildFilelessStage2(patched, "x64")
-	if err != nil {
-		// Environment may lack Donut-compatible PE layout
-		t.Logf("BuildFilelessStage2 failed (recorded): %v", err)
-		// Still prove contract rejects garbage
-		if _, err2 := BuildFilelessStage2([]byte("not-a-pe"), "x64"); err2 == nil {
-			t.Fatal("expected reject non-PE")
-		}
-		return
-	}
-	if len(sc) == 0 {
-		t.Fatal("empty shellcode")
-	}
-	t.Logf("fileless stage2 from %s: %d bytes", used, len(sc))
-	id := "e2e-fileless-sc"
-	StoreStage2(id, sc, "x64", "test", "tcp://127.0.0.1:4444")
-	got, _, err := LoadStage2(id)
-	if err != nil || len(got) != len(sc) {
-		t.Fatalf("cache roundtrip after build: %v len=%d", err, len(got))
-	}
-}
+// Donut-linked conversion tests live in fileless_donut_test.go (!nodonut).
+// Default / safe suite (-tags nodonut) only exercises cache + input validation.
 
 func TestBuildFilelessStage2RejectsGarbage(t *testing.T) {
 	if _, err := BuildFilelessStage2(nil, "x64"); err == nil {
@@ -98,6 +47,10 @@ func TestBuildFilelessStage2RejectsGarbage(t *testing.T) {
 	}
 	if _, err := BuildFilelessStage2([]byte("MZ"), "x64"); err == nil {
 		t.Fatal("expected error for tiny buffer")
+	}
+	// Non-PE should fail before or at converter (stub or real donut)
+	if _, err := BuildFilelessStage2([]byte("not-a-pe-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), "x64"); err == nil {
+		t.Fatal("expected reject non-PE")
 	}
 }
 
@@ -113,5 +66,9 @@ func TestModuleDescribeLoadMode(t *testing.T) {
 	_, _, _, mode = ModuleDescribeEx("bof")
 	if mode != "legacy" {
 		t.Fatalf("bof load_mode=%s", mode)
+	}
+	name, _, kind, mode := ModuleDescribeEx("inject")
+	if mode != "mem" || kind != "runtime" {
+		t.Fatalf("inject name=%s kind=%s mode=%s", name, kind, mode)
 	}
 }

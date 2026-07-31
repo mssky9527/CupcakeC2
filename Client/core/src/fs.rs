@@ -27,7 +27,7 @@ pub struct FileInfo {
     pub modified_time: u64,
 }
 
-/// 文件系统请求 (用于 Yamux Stream 0x03)
+/// 文件系统请求 (YamuxStreamFS / YAMUX_STREAM_FS)
 #[derive(Serialize, Deserialize, Debug)]
 pub struct FsRequest {
     pub action: String,
@@ -291,6 +291,12 @@ pub fn download(path: &str) -> Result<String> {
 /// 分块上传文件
 pub fn upload_chunk(path: &str, data_base64: &str, is_append: bool) -> Result<()> {
     info!("Uploading file chunk: {} (append: {})", path, is_append);
+    if path.trim().is_empty() {
+        return Err(ClientError::IoError(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "upload path is empty",
+        )));
+    }
     let data = match BASE64.decode(data_base64) {
         Ok(d) => d,
         Err(e) => {
@@ -300,22 +306,42 @@ pub fn upload_chunk(path: &str, data_base64: &str, is_append: bool) -> Result<()
             )));
         }
     };
-    if let Some(parent) = Path::new(path).parent() {
-        if !parent.exists() {
-            fs::create_dir_all(parent)?;
+    let path_obj = Path::new(path);
+    if let Some(parent) = path_obj.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ClientError::IoError(std::io::Error::new(
+                    e.kind(),
+                    format!("create_dir_all({}): {}", parent.display(), e),
+                ))
+            })?;
         }
     }
     use std::fs::OpenOptions;
     use std::io::Write;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .append(is_append)
-        .truncate(!is_append)
-        .open(path)
-        .map_err(ClientError::IoError)?;
-        
-    file.write_all(&data).map_err(ClientError::IoError)?;
+    // First chunk: create/truncate. Later chunks: append only.
+    // On Windows, combining append+truncate is undefined — keep them exclusive.
+    let mut opts = OpenOptions::new();
+    opts.write(true).create(true);
+    if is_append {
+        opts.append(true);
+    } else {
+        opts.truncate(true);
+    }
+    let mut file = opts.open(path).map_err(|e| {
+        ClientError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("open({}): {}", path, e),
+        ))
+    })?;
+
+    file.write_all(&data).map_err(|e| {
+        ClientError::IoError(std::io::Error::new(
+            e.kind(),
+            format!("write({}): {}", path, e),
+        ))
+    })?;
+    file.flush().map_err(ClientError::IoError)?;
     Ok(())
 }
 
@@ -381,7 +407,7 @@ pub fn remove(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// 处理文件系统控制流 (Stream Type 0x03)
+/// 处理文件系统控制流 (YamuxStreamFS)
 pub async fn handle_stream(stream: Stream) {
     info!("[FS] Handling file system stream");
     let (mut reader, mut writer) = tokio::io::split(stream.compat());

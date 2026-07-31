@@ -268,6 +268,8 @@ dependencies = [
  "mockall",
  "nix",
  "proptest",
+ "rustls 0.22.4",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
@@ -308,6 +310,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cupcake-mod-desktop"
+version = "0.1.0"
+dependencies = [
+ "cupcake-core",
+ "serde_json",
+]
+
+[[package]]
 name = "cupcake-mod-dotnet"
 version = "0.1.0"
 dependencies = [
@@ -316,6 +326,17 @@ dependencies = [
  "log",
  "serde_json",
  "tokio",
+ "winapi",
+]
+
+[[package]]
+name = "cupcake-mod-inject"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "cupcake-core",
+ "log",
+ "serde_json",
  "winapi",
 ]
 

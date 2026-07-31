@@ -283,6 +283,16 @@ impl BatchMessageHandler {
     /// Handle plugin command asynchronously (non-blocking)
     async fn handle_plugin_command_async(&mut self, command_payload: CommandPayload) -> Result<()> {
         // Map command types to plugin execution types
+        // Process inject is L2 module path (not plugin batch) — refuse plugin routing
+        if matches!(
+            command_payload.command_type.as_str(),
+            "process_inject" | "shellcode_inject" | "inject_shellcode" | "inject"
+        ) {
+            return Err(ClientError::ConnectionError(
+                "process inject uses L2 module_loader (command_type=process_inject), not plugin batch"
+                    .into(),
+            ));
+        }
         let execution_type = match command_payload.command_type.as_str() {
             "execute_assembly" => "execute-assembly",
             "shell_script" => "shell-script",
@@ -292,7 +302,7 @@ impl BatchMessageHandler {
             "bof_exec" => "bof-exec",
             _ => {
                 return Err(ClientError::ConnectionError(format!(
-                    "Unknown or removed plugin type: {} (process injection is not supported)",
+                    "Unknown plugin type: {}",
                     command_payload.command_type
                 )))
             }

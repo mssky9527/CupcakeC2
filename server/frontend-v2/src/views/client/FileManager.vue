@@ -236,7 +236,13 @@ const processUpload = async (event) => {
   } catch (e) {
     transferStatus.value = 'exception'
     setTimeout(() => { transferVisible.value = false }, 1500)
-    ElMessage.error('上传失败')
+    const detail =
+      e?.response?.data?.error ||
+      e?.response?.data?.msg ||
+      e?.message ||
+      '未知错误'
+    ElMessage.error('上传失败: ' + detail)
+    console.error('[FileManager] upload failed', e)
   } finally {
     loading.value = false
     event.target.value = ''

@@ -1,6 +1,6 @@
 // 进程管理模块
 //
-// 通过 Yamux Stream 0x04 处理进程操作：列出进程和终止进程
+// 通过 YamuxStreamPROCESS (YAMUX_STREAM_PROCESS) 处理进程操作：列出进程和终止进程
 
 use yamux::Stream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

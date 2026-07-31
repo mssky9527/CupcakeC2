@@ -44,6 +44,9 @@ pub struct RegisterPayload {
     /// Per-build KDF salt (base64), so server module HMAC matches agent get_aes_key().
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kdf_salt: Option<String>,
+    /// HMAC-SHA256(session_key, "cupcake-reg-v1|"||uuid) base64 — required by server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reg_proof: Option<String>,
 }
 
 fn default_source() -> String { "disk".to_string() }
@@ -155,6 +158,12 @@ impl SystemInfo {
                 &salt,
             ))
         };
+        let session_key = crate::config::get_aes_key();
+        let reg_proof = if session_key.len() == 32 {
+            Some(crate::crypto::register_proof(&session_key, &self.uuid))
+        } else {
+            None
+        };
         let payload = RegisterPayload {
             uuid: self.uuid.clone(),
             hostname: self.hostname.clone(),
@@ -163,6 +172,7 @@ impl SystemInfo {
             username: self.username.clone(),
             source: self.source.clone(),
             kdf_salt,
+            reg_proof,
         };
 
         MessageWrapper {
@@ -217,6 +227,7 @@ mod tests {
             username: "testuser".to_string(),
             source: "test".to_string(),
             kdf_salt: None,
+            reg_proof: Some("dGVzdA==".to_string()),
         };
 
         // 序列化
@@ -270,6 +281,7 @@ mod tests {
             username: "testuser".to_string(),
             source: "test".to_string(),
             kdf_salt: None,
+            reg_proof: None,
         };
 
         let wrapper = MessageWrapper {

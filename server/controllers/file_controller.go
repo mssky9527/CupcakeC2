@@ -2,11 +2,14 @@ package controllers
 
 import (
 	"encoding/base64"
+	"io"
+	"net/http"
+	"strconv"
+
 	"cupcake-server/pkg/globals"
 	"cupcake-server/services"
+
 	"github.com/gin-gonic/gin"
-	"net/http"
-	"io"
 )
 
 func ReadFileController(c *gin.Context) {
@@ -125,42 +128,58 @@ func ListFilesController(c *gin.Context) {
 }
 
 func Upload(c *gin.Context) {
+	// Allow larger multipart bodies (default is often too low for multi-MB files).
+	_ = c.Request.ParseMultipartForm(64 << 20) // 64 MiB memory budget; rest spilled to temp
+
 	uuid := c.PostForm("uuid")
 	targetPath := c.PostForm("path")
 	file, err := c.FormFile("file")
 
-	if uuid == "" || targetPath == "" || err != nil {
-		c.JSON(400, gin.H{"error": "Missing params"})
+	if uuid == "" {
+		c.JSON(400, gin.H{"error": "missing form field: uuid"})
+		return
+	}
+	if targetPath == "" {
+		c.JSON(400, gin.H{"error": "missing form field: path (remote destination path)"})
+		return
+	}
+	if err != nil {
+		// Most common: frontend set Content-Type: multipart/form-data without boundary
+		c.JSON(400, gin.H{
+			"error": "missing form file field 'file' (or multipart parse failed: " + err.Error() + ")",
+		})
 		return
 	}
 
-	val, ok := globals.Clients.Load(uuid)
-	if !ok {
+	if _, ok := globals.Clients.Load(uuid); !ok {
 		c.JSON(404, gin.H{"error": "Agent Offline"})
 		return
 	}
-	_ = val.(*globals.Client) // Keep this for validation
 
 	f, err := file.Open()
 	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to open upload stream"})
+		c.JSON(500, gin.H{"error": "Failed to open upload stream: " + err.Error()})
 		return
 	}
 	defer f.Close()
 
-	// Stream to Agent in 2MB Chunks
-	buffer := make([]byte, 2*1024*1024)
+	// 512 KiB raw chunks → ~680 KiB base64 — safer for encrypt/obfuscate frames than 2 MiB.
+	const chunkSize = 512 * 1024
+	buffer := make([]byte, chunkSize)
 	isAppend := false
+	var total int64
 
 	for {
 		n, readErr := f.Read(buffer)
 		if n > 0 {
 			b64Data := base64.StdEncoding.EncodeToString(buffer[:n])
-			errSend := services.UploadChunk(uuid, targetPath, b64Data, isAppend)
-			if errSend != nil {
-				c.JSON(500, gin.H{"error": "Agent upload failed: " + errSend.Error()})
+			if errSend := services.UploadChunk(uuid, targetPath, b64Data, isAppend); errSend != nil {
+				c.JSON(500, gin.H{
+					"error": "Agent upload failed at offset " + formatInt64(total) + ": " + errSend.Error(),
+				})
 				return
 			}
+			total += int64(n)
 			isAppend = true
 		}
 
@@ -173,5 +192,9 @@ func Upload(c *gin.Context) {
 		}
 	}
 
-	c.JSON(200, gin.H{"status": "upload_success"})
+	c.JSON(200, gin.H{"status": "upload_success", "bytes": total, "path": targetPath})
+}
+
+func formatInt64(n int64) string {
+	return strconv.FormatInt(n, 10)
 }

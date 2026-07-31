@@ -216,4 +216,47 @@ mod tests {
         let k = traffic_key(Some(&noise), &static_k).unwrap();
         assert_eq!(k[0], 7);
     }
+
+    #[test]
+    fn seal_8kb_produces_multiple_frames() {
+        let key = b"01234567890123456789012345678901";
+        let pt = vec![0xCDu8; 8192];
+        let frames = seal_for_wire(&pt, key, 1024).unwrap();
+        assert!(
+            frames.len() >= 2,
+            "8KB payload should fragment into ≥2 frames, got {}",
+            frames.len()
+        );
+        let mut ra = FragReassembler::new();
+        let mut done = None;
+        for f in frames {
+            let deobf = crypto::deobfuscate_packet(f);
+            match ra.push(deobf, key).unwrap() {
+                OpenResult::Complete(p) => done = Some(p),
+                OpenResult::NeedMore => {}
+            }
+        }
+        assert_eq!(done.unwrap(), pt);
+    }
+
+    #[test]
+    fn reassembly_rejects_missing_fragment() {
+        let key = b"01234567890123456789012345678901";
+        let pt = vec![1u8; 3000];
+        let frames = seal_for_wire(&pt, key, 512).unwrap();
+        assert!(frames.len() > 2);
+        // Feed only first frame — must stay incomplete (no plaintext leak)
+        let mut ra = FragReassembler::new();
+        let deobf0 = crypto::deobfuscate_packet(frames[0].clone());
+        match ra.push(deobf0, key).unwrap() {
+            OpenResult::NeedMore => {}
+            OpenResult::Complete(_) => panic!("should need more after first fragment"),
+        }
+        // Feed last only (middle still missing) — still must not complete
+        let last = crypto::deobfuscate_packet(frames[frames.len() - 1].clone());
+        match ra.push(last, key).unwrap() {
+            OpenResult::NeedMore => {}
+            OpenResult::Complete(_) => panic!("must not complete with missing middle fragment"),
+        }
+    }
 }

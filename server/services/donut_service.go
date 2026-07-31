@@ -1,3 +1,5 @@
+//go:build !nodonut
+
 package services
 
 import (
@@ -7,9 +9,9 @@ import (
 	"github.com/Binject/go-donut/donut"
 )
 
-// ToShellcodeFromBytes converts raw PE bytes to PIC Shellcode using Donut.
+// ToShellcodeFromBytes converts raw PE bytes to PIC shellcode using Donut.
+// Omitted from the package when building with -tags nodonut (safe unit tests).
 func ToShellcodeFromBytes(raw []byte, arch string) ([]byte, error) {
-	// Configure Donut
 	donutArch := donut.X64
 	if arch == "i386" || arch == "x86" || arch == "386" {
 		donutArch = donut.X32
@@ -24,8 +26,10 @@ func ToShellcodeFromBytes(raw []byte, arch string) ([]byte, error) {
 		Method:     "",
 		Parameters: "",
 		Verbose:    false,
-		Bypass:     1, // 1 = DONUT_OPT_BYPASS_NONE. Crucial: prevents Donut from doing VirtualProtect on AMSI/ETW which causes CFG/PatchGuard crashes.
-		Thread:     0, // 0 = Execute in current thread. We now manually manage thread creation via NtCreateThreadEx in the loader for better control.
+		// Bypass=1: DONUT_OPT_BYPASS_NONE — avoid AMSI/ETW patching that trips CFG.
+		Bypass: 1,
+		// Thread=0: run in current thread; agent loader creates the thread.
+		Thread: 0,
 	}
 
 	payload, err := donut.ShellcodeFromBytes(bytes.NewBuffer(raw), config)

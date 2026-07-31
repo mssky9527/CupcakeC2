@@ -27,13 +27,28 @@ export function deleteFiles(data) {
     })
 }
 
-// 4. 上传必须是POST，路径必须是 /files/upload
+// 4. 上传必须是 POST，路径 /api/files/upload
+// 重要：不要手动设置 Content-Type: multipart/form-data。
+// 必须由浏览器/axios 自动带上 boundary，否则服务端 FormFile 解析失败（表现为“无法上传但可下载”）。
 export function uploadFile(data, onUploadProgress) {
     return request({
         url: '/api/files/upload',
         method: 'post',
         data,
-        headers: { 'Content-Type': 'multipart/form-data' },
-        onUploadProgress
+        // 大文件走服务端分块转发，放宽超时
+        timeout: 0,
+        onUploadProgress,
+        // 显式删除可能被拦截器/默认配置写上的 Content-Type
+        transformRequest: [
+            (body, headers) => {
+                if (typeof FormData !== 'undefined' && body instanceof FormData) {
+                    if (headers && typeof headers === 'object') {
+                        delete headers['Content-Type']
+                        delete headers['content-type']
+                    }
+                }
+                return body
+            },
+        ],
     })
 }

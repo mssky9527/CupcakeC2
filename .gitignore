@@ -9,11 +9,25 @@ Cargo.lock             # 本项目作 binary，Cargo.lock 可以提交；如不�
 
 # ---- Go (Server) ----
 /server/dist/        # Go embed 打包用的前端产物
+/server/ui/          # legacy frontend — obsolete; only dist is embedded
+# keep ui/README.md if present (not ignored by directory pattern for tracked files)
 /server/*.exe        # Windows 编译产物 (includes services.test.exe from go test -c)
 /server/*.test.exe
+/**/*.test.exe       # never commit go test -c outputs (AV magnet)
+/server/services.test.exe
 /server/cupcake-server  # Linux 编译产物
+/server/cupcake-server-linux
+/server/cupcake-server-linux-amd64
 /server/temp_builds/
 /server/services_crash.txt
+/server/config.json  # local secrets — use config.example.json
+
+# Agent templates / third-party plugins (build or download; do not commit binaries)
+/server/assets/*.exe
+/server/assets/plugins/*.exe
+/server/storage/modules/*
+!/server/storage/modules/.gitkeep
+/storage/
 
 # ---- Vue / Node.js (Frontend) ----
 /server/frontend-v2/node_modules/

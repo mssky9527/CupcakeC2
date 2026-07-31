@@ -25,6 +25,35 @@ func TestOpenWireLegacySingle(t *testing.T) {
 	}
 }
 
+func TestOpenWireMissingFragmentDoesNotComplete(t *testing.T) {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 5)
+	}
+	chunks := [][]byte{[]byte("part0"), []byte("part1"), []byte("part2")}
+	re := NewFragReassembler()
+	// Only feed seq 0 and 2
+	for _, seq := range []int{0, 2} {
+		ct, err := EncryptAES(chunks[seq], key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body := make([]byte, 9+len(ct))
+		binary.BigEndian.PutUint32(body[0:4], uint32(seq))
+		binary.BigEndian.PutUint32(body[4:8], uint32(len(chunks)))
+		body[8] = 0x01
+		copy(body[9:], ct)
+		wire := append(append([]byte{}, FragMagic()...), body...)
+		out, more, err := OpenWire(re, wire, "none", key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !more || out != nil {
+			t.Fatalf("seq %d: expected needMore incomplete reassembly", seq)
+		}
+	}
+}
+
 func TestOpenWireCKF1Multi(t *testing.T) {
 	key := make([]byte, 32)
 	for i := range key {

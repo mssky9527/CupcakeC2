@@ -1,8 +1,10 @@
 package utils
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"io"
 
@@ -11,14 +13,21 @@ import (
 )
 
 // =============================================================================
-// Real X25519 ECDH handshake (hard cutover — not the old SHA256-fake "Noise")
-// Wire: version(1)=0x01 || public_key(32)  → 33 bytes each direction
+// X25519 ECDH handshake with PSK MAC authentication (v2)
+// Wire: version(1)=0x02 || public_key(32) || psk_mac(16)  → 49 bytes each way
+// psk_mac = HMAC-SHA256(psk, domain||pubkeys)[:16]
 // Session key: HKDF-SHA256(ikm=shared_secret, salt=psk, info=WireIDs.NoiseInfo)
 // =============================================================================
 
 const (
-	NoiseVersion byte = 0x01
-	NoiseMsgLen       = 33 // version + 32-byte X25519 public
+	NoiseVersion byte = 0x02
+	NoiseMacLen       = 16
+	NoiseMsgLen       = 1 + 32 + NoiseMacLen // 49
+)
+
+var (
+	noiseInitDom = []byte("cupcake-noise-init-v2|")
+	noiseRespDom = []byte("cupcake-noise-resp-v2|")
 )
 
 // NoiseInfoBytes returns build-seed derived HKDF info (not a product string).
@@ -70,36 +79,98 @@ func deriveSessionKeyHKDF(sharedSecret, psk []byte) ([32]byte, error) {
 	return sk, nil
 }
 
-// NoiseRespond processes client handshake (33-byte v1 or legacy reject).
-// Returns (serverResponse 33 bytes, sessionKey, error).
+func noisePSKMac(psk, domain []byte, parts ...[]byte) []byte {
+	mac := hmac.New(sha256.New, psk)
+	mac.Write(domain)
+	for _, p := range parts {
+		mac.Write(p)
+	}
+	sum := mac.Sum(nil)
+	return sum[:NoiseMacLen]
+}
+
+// NoiseInitiate builds a client handshake message (for tests / tooling).
+func NoiseInitiate(psk []byte) (e *EphemeralKey, msg []byte, err error) {
+	if len(psk) == 0 {
+		return nil, nil, fmt.Errorf("noise psk required")
+	}
+	e, err = GenerateEphemeralKey()
+	if err != nil {
+		return nil, nil, err
+	}
+	m := noisePSKMac(psk, noiseInitDom, e.Public[:])
+	msg = make([]byte, NoiseMsgLen)
+	msg[0] = NoiseVersion
+	copy(msg[1:33], e.Public[:])
+	copy(msg[33:49], m)
+	return e, msg, nil
+}
+
+// NoiseComplete finishes client side after server response (verifies PSK MAC).
+func NoiseComplete(local *EphemeralKey, serverMsg, psk []byte) ([32]byte, error) {
+	var zero [32]byte
+	if len(psk) == 0 {
+		return zero, fmt.Errorf("noise psk required")
+	}
+	if len(serverMsg) != NoiseMsgLen {
+		return zero, fmt.Errorf("invalid server handshake length: %d", len(serverMsg))
+	}
+	if serverMsg[0] != NoiseVersion {
+		return zero, fmt.Errorf("unsupported noise version: 0x%02x", serverMsg[0])
+	}
+	var serverPub [32]byte
+	copy(serverPub[:], serverMsg[1:33])
+	expect := noisePSKMac(psk, noiseRespDom, local.Public[:], serverPub[:])
+	if subtle.ConstantTimeCompare(serverMsg[33:49], expect) != 1 {
+		return zero, fmt.Errorf("noise psk auth failed (server mac)")
+	}
+	shared, err := ecdhShared(&local.Secret, &serverPub)
+	if err != nil {
+		return zero, err
+	}
+	return deriveSessionKeyHKDF(shared[:], psk)
+}
+
+// NoiseRespond processes client handshake (49-byte v2 with PSK MAC).
+// Returns (serverResponse 49 bytes, sessionKey, error).
 func NoiseRespond(clientMsg []byte, psk []byte) ([]byte, [32]byte, error) {
+	var zero [32]byte
+	if len(psk) == 0 {
+		return nil, zero, fmt.Errorf("noise psk required")
+	}
 	if len(clientMsg) != NoiseMsgLen {
-		return nil, [32]byte{}, fmt.Errorf("invalid handshake length: %d (want %d X25519)", len(clientMsg), NoiseMsgLen)
+		return nil, zero, fmt.Errorf("invalid handshake length: %d (want %d X25519+mac)", len(clientMsg), NoiseMsgLen)
 	}
 	if clientMsg[0] != NoiseVersion {
-		return nil, [32]byte{}, fmt.Errorf("unsupported noise version: 0x%02x", clientMsg[0])
-	}
-
-	e, err := GenerateEphemeralKey()
-	if err != nil {
-		return nil, [32]byte{}, err
+		return nil, zero, fmt.Errorf("unsupported noise version: 0x%02x", clientMsg[0])
 	}
 
 	var clientPublic [32]byte
 	copy(clientPublic[:], clientMsg[1:33])
+	expectMac := noisePSKMac(psk, noiseInitDom, clientPublic[:])
+	if subtle.ConstantTimeCompare(clientMsg[33:49], expectMac) != 1 {
+		return nil, zero, fmt.Errorf("noise psk auth failed (client mac)")
+	}
+
+	e, err := GenerateEphemeralKey()
+	if err != nil {
+		return nil, zero, err
+	}
 
 	shared, err := ecdhShared(&e.Secret, &clientPublic)
 	if err != nil {
-		return nil, [32]byte{}, err
+		return nil, zero, err
 	}
 	sessionKey, err := deriveSessionKeyHKDF(shared[:], psk)
 	if err != nil {
-		return nil, [32]byte{}, err
+		return nil, zero, err
 	}
 
+	respMac := noisePSKMac(psk, noiseRespDom, clientPublic[:], e.Public[:])
 	resp := make([]byte, NoiseMsgLen)
 	resp[0] = NoiseVersion
-	copy(resp[1:], e.Public[:])
+	copy(resp[1:33], e.Public[:])
+	copy(resp[33:49], respMac)
 	return resp, sessionKey, nil
 }
 

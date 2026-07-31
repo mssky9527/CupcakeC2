@@ -39,6 +39,8 @@ func CreateListener(c *gin.Context) {
 		HeartbeatJitter   int `json:"heartbeat_jitter"`
 		MaxRetry          int `json:"max_retry"`
 		CustomPath        string `json:"custom_path"`
+		Profile           string `json:"profile"`
+		ProfileStrict     bool   `json:"profile_strict"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(400, gin.H{"error": "Invalid input"})
@@ -71,6 +73,8 @@ func CreateListener(c *gin.Context) {
 		EncryptionSalt:    req.EncryptionSalt,
 		ObfuscateMode:     req.ObfuscateMode,
 		CustomPath:        req.CustomPath,
+		Profile:           req.Profile,
+		ProfileStrict:     req.ProfileStrict,
 		NSDomain:          req.NSDomain,
 		PublicDNS:         req.PublicDNS,
 		HeartbeatInterval: req.HeartbeatInterval,
@@ -100,6 +104,8 @@ func CreateListener(c *gin.Context) {
 		EncryptionSalt:    req.EncryptionSalt,
 		ObfuscateMode:     req.ObfuscateMode,
 		CustomPath:        req.CustomPath,
+		Profile:           req.Profile,
+		ProfileStrict:     req.ProfileStrict,
 		NSDomain:          req.NSDomain,
 		PublicDNS:         req.PublicDNS,
 		HeartbeatInterval: req.HeartbeatInterval,

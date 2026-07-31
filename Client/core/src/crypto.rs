@@ -2,12 +2,60 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
+use base64::Engine;
 use log::{debug, error};
 use sha2::{Sha256, Digest};
 use crate::config;
 
 /// Nonce 长度（12 字节，AES-GCM 标准）
 const NONCE_LENGTH: usize = 12;
+
+/// Test-only switch: force fill_aes_nonce to fail so encrypt is fail-closed.
+///
+/// `thread_local!` so concurrent `#[test]`s cannot pollute each other — a
+/// `--test-threads=N` run with the fail-closed test setting this true never
+/// bleeds into sibling crypto tests on other threads (root cause of the
+/// `test_encrypt_decrypt_roundtrip` / `test_encrypt_empty_data` flakes).
+#[cfg(test)]
+thread_local! {
+    static FORCE_NONCE_RANDOM_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fill a 12-byte AES-GCM nonce from OS CSPRNG. Fail-closed (no time/counter fallback).
+fn fill_aes_nonce(out: &mut [u8; NONCE_LENGTH]) -> Result<(), ()> {
+    #[cfg(test)]
+    {
+        if FORCE_NONCE_RANDOM_FAIL.with(|f| f.get()) {
+            return Err(());
+        }
+    }
+    getrandom::getrandom(out).map_err(|_| ())
+}
+
+/// Domain for agent register proof: HMAC-SHA256(session_key, REG_PROOF_DOMAIN || uuid).
+pub const REG_PROOF_DOMAIN: &[u8] = b"cupcake-reg-v1|";
+
+/// HMAC-SHA256(key, domain||uuid) as base64 — proves possession of session material at register.
+pub fn register_proof(session_key: &[u8], uuid: &str) -> String {
+    let mac = hmac_sha256(session_key, &[REG_PROOF_DOMAIN, uuid.as_bytes()].concat());
+    base64::engine::general_purpose::STANDARD.encode(mac)
+}
+
+/// Verify register proof (constant-time compare of MAC bytes).
+pub fn verify_register_proof(session_key: &[u8], uuid: &str, proof_b64: &str) -> bool {
+    let Ok(got) = base64::engine::general_purpose::STANDARD.decode(proof_b64.trim()) else {
+        return false;
+    };
+    let expect = hmac_sha256(session_key, &[REG_PROOF_DOMAIN, uuid.as_bytes()].concat());
+    if got.len() != expect.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in got.iter().zip(expect.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
 
 /// Phase 2: Traffic Camouflage Constants
 const HTTP_HEADER_TEMPLATE: &[u8] = b"POST /api/v1/sync HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ";
@@ -391,21 +439,12 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
         Err(_) => return Vec::new(),
     };
     
-    // 生成 Nonce（12 字节）— 使用操作系统级安全随机数 getrandom
-    // 96 位完全随机，杜绝 GCM nonce 重用攻击
+    // Nonce: OS CSPRNG only (fail-closed). Never timestamp/counter fallback —
+    // predictable nonces break AES-GCM confidentiality under reuse.
     let mut nonce_bytes = [0u8; NONCE_LENGTH];
-    if getrandom::getrandom(&mut nonce_bytes).is_err() {
-        // 极罕见情况：getrandom 失败时回退到基于系统时间的伪随机
-        // 注意：这是降级方案，生产环境应确保 getrandom 可用
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0);
-        nonce_bytes[0..8].copy_from_slice(&ts.to_le_bytes());
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static FALLBACK_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let c = FALLBACK_COUNTER.fetch_add(1, Ordering::SeqCst);
-        nonce_bytes[8..12].copy_from_slice(&(c as u32).to_le_bytes());
+    if fill_aes_nonce(&mut nonce_bytes).is_err() {
+        error!("AES-GCM nonce: secure random unavailable (fail-closed)");
+        return Vec::new();
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
     
@@ -518,10 +557,50 @@ mod tests {
         assert_eq!(client_msg.len(), NOISE_MSG_LEN);
         assert_eq!(client_msg[0], NOISE_VERSION);
         let (_server_e, server_msg, server_sk) = noise_respond(&client_msg, psk).expect("respond");
+        assert_eq!(server_msg.len(), NOISE_MSG_LEN);
         let client_sk = noise_complete(&client_e, &server_msg, psk).expect("complete");
         assert_eq!(client_sk, server_sk);
         // Reject legacy 32-byte fake noise
         assert!(noise_respond(&[0u8; 32], psk).is_err());
+        // Reject v1 length 33 without mac
+        assert!(noise_respond(&[0u8; 33], psk).is_err());
+    }
+
+    #[test]
+    fn test_noise_wrong_psk_fails_handshake() {
+        let psk_a = b"correct-psk-material-32bytes!!!!!";
+        let psk_b = b"wrong-psk-material-xxxxxxxxxxxx!!";
+        let (client_e, client_msg) = noise_initiate(psk_a).expect("init");
+        // Responder with wrong PSK rejects client MAC
+        assert!(
+            noise_respond(&client_msg, psk_b).is_err(),
+            "wrong PSK must fail respond"
+        );
+        // Matching respond then client with wrong PSK fails complete
+        let (_se, server_msg, _sk) = noise_respond(&client_msg, psk_a).expect("respond ok");
+        assert!(
+            noise_complete(&client_e, &server_msg, psk_b).is_err(),
+            "wrong PSK must fail complete"
+        );
+        // Empty PSK rejected
+        assert!(noise_initiate(b"").is_err());
+        assert!(noise_respond(&client_msg, b"").is_err());
+    }
+
+    #[test]
+    fn test_noise_psk_required_on_initiate() {
+        let psk = b"another-psk-for-noise-auth-tests!";
+        let (e1, m1) = noise_initiate(psk).unwrap();
+        let (e2, m2) = noise_initiate(psk).unwrap();
+        // Different ephemerals → different messages; both authenticate with same PSK
+        assert_ne!(m1[1..33], m2[1..33]);
+        let (_, r1, sk1) = noise_respond(&m1, psk).unwrap();
+        let sk1b = noise_complete(&e1, &r1, psk).unwrap();
+        assert_eq!(sk1, sk1b);
+        let (_, r2, sk2) = noise_respond(&m2, psk).unwrap();
+        let sk2b = noise_complete(&e2, &r2, psk).unwrap();
+        assert_eq!(sk2, sk2b);
+        assert_ne!(sk1, sk2); // different ECDH sessions
     }
 
     #[test]
@@ -663,6 +742,57 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// Fail-closed: when CSPRNG is unavailable, encrypt returns empty (no time/counter nonce).
+    ///
+    /// Isolation:
+    /// - flag is `thread_local` → other test threads never see it
+    /// - `ForceGuard` sets true on create and false on Drop → same-thread reuse after
+    ///   panic/assert cannot leave the flag sticky for a later test on this worker
+    #[test]
+    fn test_encrypt_fail_closed_when_random_unavailable() {
+        let key = b"01234567890123456789012345678901";
+        let plaintext = b"must-not-encrypt-with-weak-nonce";
+
+        struct ForceGuard;
+        impl ForceGuard {
+            fn arm() -> Self {
+                FORCE_NONCE_RANDOM_FAIL.with(|f| f.set(true));
+                ForceGuard
+            }
+        }
+        impl Drop for ForceGuard {
+            fn drop(&mut self) {
+                FORCE_NONCE_RANDOM_FAIL.with(|f| f.set(false));
+            }
+        }
+
+        {
+            let _guard = ForceGuard::arm();
+            let out = encrypt(plaintext, key);
+            assert!(
+                out.is_empty(),
+                "encrypt must return empty ciphertext when nonce RNG fails"
+            );
+        } // Drop clears flag before any further asserts
+
+        // Round-trip path still works after flag cleared
+        let ok = encrypt(plaintext, key);
+        assert!(!ok.is_empty());
+        assert_eq!(decrypt(&ok, key).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_register_proof_binds_uuid_to_session_key() {
+        let key = b"01234567890123456789012345678901";
+        let uuid = "11111111-2222-3333-4444-555555555555";
+        let proof = register_proof(key, uuid);
+        assert!(verify_register_proof(key, uuid, &proof));
+        assert!(!verify_register_proof(key, "other-uuid", &proof));
+        assert!(!verify_register_proof(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", uuid, &proof));
+        assert!(!verify_register_proof(key, uuid, "not-valid-base64!!!"));
+        assert!(!verify_register_proof(key, uuid, ""));
+    }
+
     /// Regression: obfuscation mode "none" must not alter ciphertext bytes.
     /// Server expects pure AES-GCM frames; padding breaks GCM auth tags.
     #[test]
@@ -712,12 +842,16 @@ mod tests {
 // Since we cannot download x25519-dalek / noise-rust / hkdf crates,
 // Real X25519 ECDH + HKDF-SHA256 (hard cutover from fake SHA256 "public keys").
 // Pure-Rust X25519 (RFC 7748) — no extra crates (offline builds).
-// Wire: version(1)=0x01 || public_key(32)  → 33 bytes each way.
+// Wire v2: version(1)=0x02 || public_key(32) || psk_mac(16)  → 49 bytes each way.
+// psk_mac = HMAC-SHA256(psk, domain || pubkey)[..16]  — wrong PSK fails handshake.
 // Session key: HKDF-SHA256(ikm=shared, salt=psk, info=wire_ids::NOISE_INFO)
 // =============================================================================
 
-pub const NOISE_VERSION: u8 = 0x01;
-pub const NOISE_MSG_LEN: usize = 33;
+pub const NOISE_VERSION: u8 = 0x02;
+pub const NOISE_MAC_LEN: usize = 16;
+pub const NOISE_MSG_LEN: usize = 1 + 32 + NOISE_MAC_LEN; // 49
+const NOISE_INIT_DOM: &[u8] = b"cupcake-noise-init-v2|";
+const NOISE_RESP_DOM: &[u8] = b"cupcake-noise-resp-v2|";
 
 /// Ephemeral X25519 key pair for one handshake session.
 #[derive(Clone)]
@@ -961,20 +1095,52 @@ fn fe_invert(a: Fe) -> Fe {
     c
 }
 
-/// Initiator (client): returns (key, 33-byte wire message).
-pub fn noise_initiate(_psk: &[u8]) -> Result<(EphemeralKey, Vec<u8>), String> {
+/// Truncated HMAC-SHA256(psk, domain||parts...) for handshake authentication.
+fn noise_psk_mac(psk: &[u8], domain: &[u8], parts: &[&[u8]]) -> [u8; NOISE_MAC_LEN] {
+    let mut msg = Vec::with_capacity(64 + parts.iter().map(|p| p.len()).sum::<usize>());
+    msg.extend_from_slice(domain);
+    for p in parts {
+        msg.extend_from_slice(p);
+    }
+    let full = hmac_sha256(psk, &msg);
+    let mut out = [0u8; NOISE_MAC_LEN];
+    out.copy_from_slice(&full[..NOISE_MAC_LEN]);
+    out
+}
+
+fn noise_mac_ok(got: &[u8], expect: &[u8; NOISE_MAC_LEN]) -> bool {
+    if got.len() != NOISE_MAC_LEN {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in got.iter().zip(expect.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+/// Initiator (client): returns (key, 49-byte wire message with PSK MAC).
+pub fn noise_initiate(psk: &[u8]) -> Result<(EphemeralKey, Vec<u8>), String> {
+    if psk.is_empty() {
+        return Err("noise psk required".into());
+    }
     let e = EphemeralKey::generate()?;
+    let mac = noise_psk_mac(psk, NOISE_INIT_DOM, &[&e.public]);
     let mut msg = Vec::with_capacity(NOISE_MSG_LEN);
     msg.push(NOISE_VERSION);
     msg.extend_from_slice(&e.public);
+    msg.extend_from_slice(&mac);
     Ok((e, msg))
 }
 
-/// Responder (server / tests): parse 33-byte client msg.
+/// Responder: verify client PSK MAC, return (key, 49-byte response, session_key).
 pub fn noise_respond(
     client_msg: &[u8],
     psk: &[u8],
 ) -> Result<(EphemeralKey, Vec<u8>, [u8; 32]), String> {
+    if psk.is_empty() {
+        return Err("noise psk required".into());
+    }
     if client_msg.len() != NOISE_MSG_LEN {
         return Err(format!(
             "Invalid handshake message length: {} (want {})",
@@ -987,22 +1153,32 @@ pub fn noise_respond(
     }
     let mut client_public = [0u8; 32];
     client_public.copy_from_slice(&client_msg[1..33]);
+    let client_mac = &client_msg[33..49];
+    let expect_mac = noise_psk_mac(psk, NOISE_INIT_DOM, &[&client_public]);
+    if !noise_mac_ok(client_mac, &expect_mac) {
+        return Err("noise psk auth failed (client mac)".into());
+    }
 
     let e = EphemeralKey::generate()?;
     let session_key = derive_session_key(&e.secret, &client_public, psk);
+    let resp_mac = noise_psk_mac(psk, NOISE_RESP_DOM, &[&client_public, &e.public]);
 
     let mut response = Vec::with_capacity(NOISE_MSG_LEN);
     response.push(NOISE_VERSION);
     response.extend_from_slice(&e.public);
+    response.extend_from_slice(&resp_mac);
     Ok((e, response, session_key))
 }
 
-/// Client completes after receiving 33-byte server response.
+/// Client completes after receiving 49-byte server response (verifies PSK MAC).
 pub fn noise_complete(
     local_e: &EphemeralKey,
     server_response: &[u8],
     psk: &[u8],
 ) -> Result<[u8; 32], String> {
+    if psk.is_empty() {
+        return Err("noise psk required".into());
+    }
     if server_response.len() != NOISE_MSG_LEN {
         return Err(format!(
             "Invalid server response length: {} (want {})",
@@ -1018,6 +1194,11 @@ pub fn noise_complete(
     }
     let mut server_public = [0u8; 32];
     server_public.copy_from_slice(&server_response[1..33]);
+    let server_mac = &server_response[33..49];
+    let expect = noise_psk_mac(psk, NOISE_RESP_DOM, &[&local_e.public, &server_public]);
+    if !noise_mac_ok(server_mac, &expect) {
+        return Err("noise psk auth failed (server mac)".into());
+    }
     Ok(derive_session_key(&local_e.secret, &server_public, psk))
 }
 

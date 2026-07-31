@@ -56,12 +56,6 @@ const routes = [
         meta: { title: 'Settings' }
       },
       {
-        path: 'review',
-        name: 'FrontendReview',
-        component: () => import('../views/FrontendReview.vue'),
-        meta: { title: 'Review' }
-      },
-      {
         path: 'client/:id',
         name: 'ClientDetail',
         component: () => import('../views/ClientDetail.vue'),
@@ -103,6 +97,12 @@ const routes = [
             name: 'ClientModules',
             component: () => import('../views/client/ModulePanel.vue'),
             meta: { title: 'Client Modules' }
+          },
+          {
+            path: 'desktop',
+            name: 'ClientDesktop',
+            component: () => import('../views/client/RemoteDesktop.vue'),
+            meta: { title: 'Remote Desktop' }
           }
         ]
       }

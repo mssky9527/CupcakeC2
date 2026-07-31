@@ -2,6 +2,7 @@ package services
 
 import (
 	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/utils"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -53,8 +54,8 @@ func executeProcCommand(agentID string, req ProcRequest) (*ProcResponse, error) 
 	}
 	defer stream.Close()
 
-	// 1. Send Header (0x04 for Process)
-	if _, err := stream.Write([]byte{0x04}); err != nil {
+	// 1. Send Header (YamuxStreamProcess)
+	if _, err := stream.Write([]byte{utils.YamuxStreamProcess}); err != nil {
 		return nil, err
 	}
 

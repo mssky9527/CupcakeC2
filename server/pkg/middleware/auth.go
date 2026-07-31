@@ -57,6 +57,9 @@ func allowQueryToken(path string) bool {
 	if strings.HasPrefix(path, "/api/shell/") {
 		return true
 	}
+	if strings.HasPrefix(path, "/api/desktop/") {
+		return true
+	}
 	return false
 }
 

@@ -9,6 +9,31 @@ use async_trait::async_trait;
 // 🛡️ Phase 3: Malleable C2 Profile — customizable HTTP headers/UA
 pub mod profile;
 
+// Yamux first-byte stream type tags (PTY/SOCKS/FS/PROCESS/DESKTOP) — not HTTP profiles
+pub mod stream_types;
+pub use stream_types::{
+    YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FS, YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY,
+    YAMUX_STREAM_RESERVED, YAMUX_STREAM_SOCKS, YAMUX_STREAM_TYPE_TABLE,
+};
+
+// CPXD desktop framing codec (pure; always available for tests / L2)
+pub mod desktop_proto;
+pub use desktop_proto::{
+    encode_message, map_input_to_physical, parse_header, DESKTOP_MAGIC, DESKTOP_MAX_PAYLOAD,
+    DESKTOP_PROTO_VERSION, MSG_ERROR, MSG_FRAME, MSG_HELLO, MSG_HELLO_ACK, MSG_STOP,
+};
+
+// Always available: reply ERROR when agent has no module-loader path.
+pub mod desktop_reject;
+
+// Thin Yamux DESKTOP bridge: L2 module path (standard) + optional in-process engine.
+#[cfg(feature = "module-loader")]
+pub mod desktop_bridge;
+
+// In-process engine only when feature=desktop (L2 crate also uses this).
+#[cfg(feature = "desktop")]
+pub mod desktop_engine;
+
 // 🛡️ Phase 2: Message Fragmentation — split large payloads for DPI evasion
 pub mod fragment;
 
@@ -18,6 +43,10 @@ pub mod session_crypto;
 // 条件编译：仅在启用 ws 特性时包含 WebSocket 模块
 #[cfg(feature = "ws")]
 pub mod ws;
+
+// rustls ClientHello / cipher order by ja3_hint (WSS)
+#[cfg(feature = "ws-tls")]
+pub mod tls_ja3;
 
 // 条件编译：仅在启用 tcp 特性时包含 TCP 模块
 #[cfg(feature = "tcp")]

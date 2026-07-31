@@ -1,4 +1,4 @@
-// Interactive terminal over Yamux stream 0x01.
+// Interactive terminal over Yamux stream YAMUX_STREAM_PTY.
 //
 // Default: HybridSession (Mode A) — builtins + direct exe spawn with streamed pipes.
 // No cmd.exe / powershell by default.

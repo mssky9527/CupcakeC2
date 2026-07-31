@@ -81,9 +81,19 @@ impl Transport for WebSocketTransport {
             let profile =
                 crate::transport::profile::get_profile(&crate::config::get_profile_name());
 
+            // Path/query from malleable uri_template (scheme+host from configured URL)
+            let connect_url =
+                crate::transport::profile::url_with_profile_path(&self.url, &profile);
+            debug!(
+                "profile={} connect_url={} ja3_hint={}",
+                profile.name,
+                connect_url,
+                crate::transport::profile::get_ja3_hint(&profile)
+            );
+
             // Build request then apply malleable profile via shared helper
             let mut req = Request::builder()
-                .uri(&self.url)
+                .uri(&connect_url)
                 .body(())
                 .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
 
@@ -119,8 +129,41 @@ impl Transport for WebSocketTransport {
                 }
             }
 
-            let is_tls = self.url.starts_with("wss://");
-            let connect_result = connect_async(req).await;
+            let is_tls = connect_url.starts_with("wss://");
+            let ja3_hint = crate::transport::profile::get_ja3_hint(&profile);
+            // M-007: with feature `ws-tls`, use rustls + cipher order from ja3_hint.
+            // Without ws-tls, fall back to default connector (platform TLS / default rustls).
+            let connect_result = {
+                #[cfg(feature = "ws-tls")]
+                {
+                    if is_tls {
+                        use tokio_tungstenite::connect_async_tls_with_config;
+                        match crate::transport::tls_ja3::connector_for_ja3_hint(ja3_hint) {
+                            Ok(connector) => {
+                                connect_async_tls_with_config(
+                                    req,
+                                    None,
+                                    false,
+                                    Some(connector),
+                                )
+                                .await
+                            }
+                            Err(e) => {
+                                debug!("tls_ja3 connector failed ({e}), falling back to connect_async");
+                                connect_async(req).await
+                            }
+                        }
+                    } else {
+                        connect_async(req).await
+                    }
+                }
+                #[cfg(not(feature = "ws-tls"))]
+                {
+                    let _ = ja3_hint;
+                    // Platform default — enable feature `ws-tls` for rustls cipher control
+                    connect_async(req).await
+                }
+            };
 
             match connect_result {
                 Ok((ws_stream, response)) => {

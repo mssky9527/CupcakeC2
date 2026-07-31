@@ -9,6 +9,9 @@ pub mod memory;
 pub mod spawn;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod ghost_host;
+/// Remote process shellcode inject — feature `inject` only (L2 mod_inject).
+#[cfg(all(windows, feature = "inject"))]
+pub mod inject;
 
 pub mod netinfo;
 pub mod users;
@@ -21,6 +24,8 @@ pub use process::{
 };
 #[cfg(windows)]
 pub use memory::{nt_alloc_rw, nt_free};
+#[cfg(all(windows, feature = "inject"))]
+pub use inject::{inject_shellcode, wait_inject_thread, InjectResult};
 #[cfg(windows)]
 pub use spawn::{
     pipe_read_exact, pipe_read_to_end, pipe_write_all, spawn_piped_plain, spawn_spoofed_piped,

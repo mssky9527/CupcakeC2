@@ -595,6 +595,11 @@ pub fn close_handle(handle: usize) -> i32 {
 }
 
 /// NtCreateThreadEx in the current process (syscall → D/Invoke; no Win32 CreateThread IAT).
+///
+/// `stack_size` semantics (both paths):
+/// - `0` → OS default stack (recommended; safest across Win7–Win11 / Server SKUs)
+/// - non-zero → commit size; reserve is set to `max(stack_size, default-ish 1MiB)` so
+///   commit never exceeds reserve (old kernels reject / mis-handle commit>reserve).
 pub fn create_thread_ex(
     start: unsafe extern "system" fn(*mut winapi::ctypes::c_void) -> u32,
     param: *mut winapi::ctypes::c_void,
@@ -605,6 +610,17 @@ pub fn create_thread_ex(
         let desired_access: u32 = 0x1F_FFFF;
         let create_flags: u32 = 0;
         let start_addr = start as usize;
+
+        // NtCreateThreadEx(StackCommit, StackReserve): reserve must be ≥ commit.
+        // Passing commit=8MiB with reserve=0 caused STATUS_INVALID_PARAMETER or
+        // unstable behavior on Server 2012 R2 (6.3). Use 0/0 for defaults.
+        let (commit, reserve) = if stack_size == 0 {
+            (0usize, 0usize)
+        } else {
+            let commit = stack_size;
+            let reserve = stack_size.max(1024 * 1024);
+            (commit, reserve)
+        };
 
         let status = unsafe {
             invoke_nt(
@@ -618,8 +634,8 @@ pub fn create_thread_ex(
                     param as usize,
                     create_flags as usize,
                     0,
-                    stack_size,
-                    0,
+                    commit,
+                    reserve,
                     0,
                 ],
             )
@@ -646,6 +662,7 @@ pub fn create_thread_ex(
                         format!("NtCreateThreadEx 0x{:08X}; CreateThread unresolved", status as u32)
                     })?,
             );
+            // CreateThread: 0 = default; non-zero = commit size (fine without reserve).
             let h = ct(
                 std::ptr::null_mut(),
                 stack_size,

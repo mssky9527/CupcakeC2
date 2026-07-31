@@ -258,6 +258,16 @@ func ModuleDescribeEx(id string) (name, desc, kind, loadMode string) {
 		return "Shell 模块（实验）",
 			"实验性终端模块；同进程 Manual-Map 优先，失败再 LoadLibrary。",
 			"legacy", "mem"
+	case "inject", "mod_inject", "process_inject":
+		return "进程注入模块",
+			"L2 远程 shellcode 注入（不在 Stage0）。method: nt|crt|apc|stomping|auto。" +
+				"stomping=覆写远程模块 .text（无 VirtualAlloc）；auto 不含 stomp。作业后建议 unload inject。",
+			"runtime", "mem"
+	case "desktop", "mod_desktop":
+		return "远程桌面模块",
+			"L2 远程桌面（Yamux 0x0D / CPXD）。须在模块面板显式加载后再开 Desktop 视图（禁止 auto-stage）。" +
+				"Agent 需 feature=desktop 的 full-gui 构建；仅 TCP Yamux；JPEG MVP。",
+			"runtime", "mem"
 	default:
 		return id, "自定义模块二进制（CKMS 打包后可下发；Manual-Map 优先）。", "custom", "mem"
 	}

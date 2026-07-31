@@ -5,6 +5,8 @@ members = [
     "modules/shell",
     "modules/bof",
     "modules/dotnet",
+    "modules/inject",
+    "modules/desktop",
     "iso_host",
 ]
 resolver = "2"

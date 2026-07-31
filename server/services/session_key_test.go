@@ -66,12 +66,13 @@ func TestResolveClientSessionKeyCaches(t *testing.T) {
 }
 
 func TestDeriveStaticSessionKeyStable(t *testing.T) {
-	a := deriveStaticSessionKey("same-key", "same-salt")
-	b := deriveStaticSessionKey("same-key", "same-salt")
+	// Keys must be ≥32 bytes (agent-aligned; short keys normalize to empty).
+	a := deriveStaticSessionKey("same-key-material-32bytes-long!!", "same-salt")
+	b := deriveStaticSessionKey("same-key-material-32bytes-long!!", "same-salt")
 	if !bytes.Equal(a, b) {
 		t.Fatalf("deriveStaticSessionKey not deterministic")
 	}
-	c := deriveStaticSessionKey("other-key", "same-salt")
+	c := deriveStaticSessionKey("other-key-material-32bytes-long!", "same-salt")
 	if bytes.Equal(a, c) {
 		t.Fatalf("different base keys must differ")
 	}

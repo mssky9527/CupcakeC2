@@ -1,6 +1,6 @@
 // SOCKS5 代理处理模块
 //
-// 当服务器通过 Yamux 发起 SOCKS 代理请求时（Type Byte 0x02），
+// 当服务器通过 Yamux 发起 SOCKS 代理请求时（YAMUX_STREAM_SOCKS），
 // 客户端读取目标地址并建立到目标的 TCP 连接，然后进行双向数据转发
 
 use tokio::net::TcpStream;

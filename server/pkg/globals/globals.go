@@ -57,12 +57,26 @@ type Client struct {
 	SessionKey     []byte          `json:"-"`
 	CommandChannel chan string     `json:"-"`
 	OutputChannel  chan string     `json:"-"`
+	// outputCloseOnce ensures OutputChannel is closed at most once (reconnect races).
+	outputCloseOnce sync.Once `json:"-"`
 	// Protect concurrent WebSocket writes (admin shell, multi-subscriber)
 	WSWriteMu      sync.Mutex      `json:"-"`
 	ListenerID     string          `json:"listener_id"`
 	ListenerPort   int             `json:"listener_port"`
 	CachedPlugins  map[string]bool `json:"-"`
 	PluginMutex    sync.RWMutex    `json:"-"`
+}
+
+// CloseOutputChannel closes OutputChannel at most once (safe under reconnect/offline races).
+func (c *Client) CloseOutputChannel() {
+	if c == nil {
+		return
+	}
+	c.outputCloseOnce.Do(func() {
+		if c.OutputChannel != nil {
+			close(c.OutputChannel)
+		}
+	})
 }
 
 // PTYSession 代表一个底层的异步 PTY 会话状态（支持断线重连与多端复用，类似 Tmux/CobaltStrike）
@@ -85,6 +99,10 @@ type Listener struct {
 	EncryptionSalt    string       `json:"encryption_salt"`
 	ObfuscateMode     string       `json:"obfuscate_mode"`
 	CustomPath        string       `json:"custom_path"` // e.g. /ws or /api/updates
+	// Profile: expected malleable profile (gmail|outlook|aws|github|default); empty = any
+	Profile           string       `json:"profile"`
+	// ProfileStrict: reject handshake when profile headers/path do not match
+	ProfileStrict     bool         `json:"profile_strict"`
 	// DNS-specific fields
 	NSDomain          string       `json:"ns_domain"`
 	PublicDNS         string       `json:"public_dns"`
@@ -113,29 +131,47 @@ var (
 	LogsMapMu         sync.Mutex // serializes LoadOrStore+append+Store on LogsMap
 	PendingResponses  sync.Map
 	Listeners         sync.Map
-	Upgrader          = websocket.Upgrader{
-		// Restrict Origin to same-host / localhost to reduce CSWSH risk.
-		// Empty Origin allowed for non-browser agents and same-site direct connects.
-		CheckOrigin: func(r *http.Request) bool {
-			origin := r.Header.Get("Origin")
-			if origin == "" {
-				return true
-			}
-			// Local admin panel / dev tools
-			if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
-				return true
-			}
-			// Same host as request
-			host := r.Host
-			if host != "" && (strings.Contains(origin, host) || strings.HasSuffix(origin, "://"+host)) {
-				return true
-			}
-			return false
-		},
+	// Upgrader for agent listener WebSockets (Rust agents typically omit Origin).
+	Upgrader = websocket.Upgrader{
+		CheckOrigin: AgentCheckOrigin,
 	}
-	// 修复6: 使用 atomic 替代 Mutex，性能更高（无锁原子操作）
-	reqCounter uint64
+	// AdminUpgrader for browser-facing panel WS (PTY / shell / build logs).
+	// Empty Origin is rejected — modern browsers always send Origin on WS.
+	AdminUpgrader = websocket.Upgrader{
+		CheckOrigin: AdminCheckOrigin,
+	}
 )
+
+// AgentCheckOrigin allows empty Origin (non-browser agents) and same-host/localhost.
+func AgentCheckOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	return originAllowed(origin, r.Host)
+}
+
+// AdminCheckOrigin rejects empty Origin and requires localhost or same-host match.
+func AdminCheckOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	return originAllowed(origin, r.Host)
+}
+
+func originAllowed(origin, host string) bool {
+	if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
+		return true
+	}
+	if host != "" && (strings.Contains(origin, host) || strings.HasSuffix(origin, "://"+host)) {
+		return true
+	}
+	return false
+}
+
+// reqCounter is lock-free monotonic IDs for command correlation.
+var reqCounter uint64
 
 // GetNextReqID returns a globally unique monotonic request ID (thread-safe, lock-free)
 func GetNextReqID() uint64 {

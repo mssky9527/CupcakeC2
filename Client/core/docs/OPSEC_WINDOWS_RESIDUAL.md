@@ -42,7 +42,7 @@ Version helpers live in `stealth/version.rs` (Layer A implementation, used by La
 
 Caches (arch-agnostic): module base (`ntdll`/`kernel32`/`kernelbase`), export `(base, hash)→VA`.
 
-Stack spoof: `stealth::stack::with_spoofed_stack` (noise + x64 bait locals) is **default** on high-risk ops listed below.
+Stack spoof: `stealth::stack::with_spoofed_stack` → **hard path on x64 Windows 10+ only** (return-address rewrite of *this image* frames via `RtlCaptureStackBackTrace` + synthetic RBP locals + ntdll gadgets). **Pre-Win10 (Win8.1 / Server 2012 R2 = 6.3) defaults to soft path** (stack noise only) — hard rewrite caused BEX64 / `StackHash` / `PCH_AB_FROM_ntdll` AVs under AppCompat. Override: `CUPCAKE_HARD_SPOOF=0|1`. RBP+8 rewrite requires validated frame pointer (omit-fp safe). **Not CET/shadow-stack proof.**
 
 ---
 

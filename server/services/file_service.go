@@ -2,6 +2,7 @@ package services
 
 import (
 	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/utils"
 	"encoding/json"
 	"fmt"
 	"github.com/hashicorp/yamux"
@@ -66,8 +67,8 @@ func callFsAgent(agentID string, req FsRequest) (*FsResponse, error) {
 	}
 	defer stream.Close()
 
-	// 1. Send Header (0x03 for FS)
-	if _, err := stream.Write([]byte{0x03}); err != nil {
+	// 1. Send Header (YamuxStreamFS)
+	if _, err := stream.Write([]byte{utils.YamuxStreamFS}); err != nil {
 		return nil, err
 	}
 
@@ -260,17 +261,23 @@ func UploadChunk(agentID, path, dataBase64 string, isAppend bool) error {
 	}
 
 	if err := WriteEncryptedMessage(client, msg); err != nil {
-		return err
+		return fmt.Errorf("send encrypted command: %w", err)
 	}
 
+	// Larger chunks / slow agents need more than 30s
+	timeout := 90 * time.Second
 	select {
 	case res := <-resChan:
-		pMap := res.(map[string]interface{})
+		pMap, ok := res.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("invalid agent response type")
+		}
 		if stderr, ok := pMap["stderr"].(string); ok && stderr != "" {
 			return fmt.Errorf("%s", stderr)
 		}
 		return nil
-	case <-time.After(30 * time.Second):
-		return fmt.Errorf("agent chunk response timeout")
+	case <-time.After(timeout):
+		return fmt.Errorf("agent chunk response timeout after %s (req_id=%s path=%s append=%v b64_len=%d)",
+			timeout, reqID, path, isAppend, len(dataBase64))
 	}
 }

@@ -1,4 +1,4 @@
-// Unit tests for shipped capability gates (process injection removed).
+// Unit tests for shipped capability gates (Stage0 must not enable inject).
 
 use crate::config;
 use crate::crypto::{decrypt, encrypt};
@@ -59,12 +59,37 @@ fn encrypt_rejects_wrong_key_length_without_panic() {
 }
 
 #[test]
-fn inject_feature_is_gone() {
-    // Process injection must not be available as a compile feature.
+fn inject_not_in_product_default_tiers() {
+    // Stage0 product tiers (minimal/standard/beacon) must never enable inject.
+    // inject is L2-only (`cupcake-mod-inject` with --features inject).
+    // This test runs under product features (ws+minimal or default); inject must be off.
     assert!(
         !cfg!(feature = "inject"),
-        "inject feature must not exist in any default build"
+        "inject must not be compiled into Stage0 product agent (use L2 mod_inject)"
     );
+}
+
+/// Only runs when `desktop` is off (product CI: ws,standard). When testing the
+/// opt-in bridge (`--features desktop`), this gate is intentionally skipped.
+#[cfg(not(feature = "desktop"))]
+#[test]
+fn desktop_bridge_not_in_product_default_tiers() {
+    // desktop Yamux 0x0D bridge is opt-in only (full-gui / custom). Never default/standard/beacon.
+    assert!(
+        !cfg!(feature = "desktop"),
+        "desktop bridge must not be compiled into Stage0 product agent (use feature desktop + L2)"
+    );
+}
+
+#[test]
+fn yamux_stream_type_constants_match_design_table() {
+    use crate::transport::stream_types::*;
+    assert_eq!(YAMUX_STREAM_PTY, 0x01);
+    assert_eq!(YAMUX_STREAM_SOCKS, 0x02);
+    assert_eq!(YAMUX_STREAM_FS, 0x03);
+    assert_eq!(YAMUX_STREAM_PROCESS, 0x04);
+    assert_eq!(YAMUX_STREAM_DESKTOP, 0x0D);
+    assert_eq!(YAMUX_STREAM_RESERVED, 0xFF);
 }
 
 #[test]

