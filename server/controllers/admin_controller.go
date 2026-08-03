@@ -1,16 +1,19 @@
 package controllers
 
 import (
-	"cupcake-server/pkg/globals"
-	"cupcake-server/pkg/model"
-	"cupcake-server/pkg/store"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
+
+	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/middleware"
+	"cupcake-server/pkg/model"
+	"cupcake-server/pkg/store"
 	"cupcake-server/services"
 )
 
@@ -65,6 +68,19 @@ func recordLoginSuccess(ip string) {
 // sensitive settings cannot be written via generic settings API
 var blockedSettingKeys = map[string]bool{
 	"system_api_token":  true,
+	"mcp_api_token":     true,
+	"system_mcp_enabled": true,
+	"mcp_allowed_cidrs": true,
+	"mcp_read_only":     true,
+	"web_auth_password": true,
+	"web_auth_user":     true,
+	"admin_pass":        true,
+	"admin_password":    true,
+}
+
+var sensitiveSettingKeys = map[string]bool{
+	"system_api_token":  true,
+	"mcp_api_token":     true,
 	"web_auth_password": true,
 	"web_auth_user":     true,
 	"admin_pass":        true,
@@ -170,6 +186,53 @@ func HandleAddUser(c *gin.Context) {
 	c.JSON(http.StatusOK, user)
 }
 
+// HandleChangeMyPassword lets any authenticated user change their own password
+// (does not require admin /settings/*).
+func HandleChangeMyPassword(c *gin.Context) {
+	var req struct {
+		OldPassword string `json:"old_password"`
+		NewPassword string `json:"new_password"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil || req.NewPassword == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "new_password required"})
+		return
+	}
+	// Resolve current user from bearer token (AuthMiddleware already validated)
+	token := ""
+	if authHeader := c.GetHeader("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	}
+	if token == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	var user model.User
+	if err := store.DB.Where("token = ?", token).First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	if req.OldPassword != "" && !store.CheckPasswordHash(req.OldPassword, user.Password) {
+		// Allow empty old_password for bootstrap UX; if provided must match
+		c.JSON(http.StatusForbidden, gin.H{"error": "old password incorrect"})
+		return
+	}
+	hashed, err := store.HashPassword(req.NewPassword)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	user.Password = hashed
+	// Invalidate the existing session so a leaked bearer token stops working
+	// immediately after the password is changed.
+	newToken := store.GenerateSecureToken(32)
+	user.Token = newToken
+	if err := store.SaveUser(&user); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "password updated", "token": newToken})
+}
+
 // HandleUpdateUser updates an existing operator's password or role
 func HandleUpdateUser(c *gin.Context) {
 	var req struct {
@@ -228,14 +291,23 @@ func HandleGetLoginLogs(c *gin.Context) {
 // HandleGetSettings returns global config
 func HandleGetSettings(c *gin.Context) {
 	group := c.Query("group")
-	if group != "" {
-		settings, _ := store.GetSettingsByGroup(group)
-		c.JSON(http.StatusOK, settings)
-	} else {
-		var settings []model.GlobalSetting
-		store.DB.Find(&settings)
-		c.JSON(http.StatusOK, settings)
+	if group == "mcp" {
+		HandleGetMCPSettings(c)
+		return
 	}
+	var settings []model.GlobalSetting
+	if group != "" {
+		settings, _ = store.GetSettingsByGroup(group)
+	} else {
+		store.DB.Find(&settings)
+	}
+	filtered := make([]model.GlobalSetting, 0, len(settings))
+	for _, setting := range settings {
+		if !sensitiveSettingKeys[setting.Key] {
+			filtered = append(filtered, setting)
+		}
+	}
+	c.JSON(http.StatusOK, filtered)
 }
 
 // HandleUpdateSettings updates global config (whitelist: rejects sensitive keys)
@@ -256,6 +328,68 @@ func HandleUpdateSettings(c *gin.Context) {
 		store.SetSetting(s.Key, s.Value, s.Group)
 	}
 	c.JSON(http.StatusOK, gin.H{"msg": "Settings updated"})
+}
+
+type mcpSettingsRequest struct {
+	Enabled      *bool  `json:"enabled"`
+	AllowedCIDRs string `json:"allowed_cidrs"`
+	ReadOnly     *bool  `json:"read_only"`
+}
+
+// HandleGetMCPSettings deliberately returns policy metadata only. MCP tokens
+// are write-only and revealed exactly once by the rotation endpoint.
+func HandleGetMCPSettings(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"enabled":          store.GetSetting("system_mcp_enabled") == "true",
+		"allowed_cidrs":    store.GetSetting("mcp_allowed_cidrs"),
+		"read_only":        store.GetSetting("mcp_read_only") != "false",
+		"token_configured": store.GetSetting("mcp_api_token") != "",
+	})
+}
+
+func HandleUpdateMCPSettings(c *gin.Context) {
+	var req mcpSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid MCP settings"})
+		return
+	}
+	if req.Enabled != nil {
+		if *req.Enabled && middleware.ValidateIPRules(req.AllowedCIDRs, false) != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "MCP must have at least one valid source IP/CIDR when enabled"})
+			return
+		}
+		value := "false"
+		if *req.Enabled {
+			value = "true"
+		}
+		_ = store.SetSetting("system_mcp_enabled", value, "mcp")
+	}
+	if req.AllowedCIDRs != "" {
+		if err := middleware.ValidateIPRules(req.AllowedCIDRs, false); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		_ = store.SetSetting("mcp_allowed_cidrs", req.AllowedCIDRs, "mcp")
+	}
+	if req.ReadOnly != nil {
+		value := "false"
+		if *req.ReadOnly {
+			value = "true"
+		}
+		_ = store.SetSetting("mcp_read_only", value, "mcp")
+	}
+	middleware.InvalidateAuthCache()
+	HandleGetMCPSettings(c)
+}
+
+func HandleRotateMCPToken(c *gin.Context) {
+	token := store.GenerateSecureToken(48)
+	if err := store.SetSetting("mcp_api_token", token, "mcp"); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to rotate MCP token"})
+		return
+	}
+	middleware.InvalidateAuthCache()
+	c.JSON(http.StatusOK, gin.H{"token": token})
 }
 
 // HandleGetWebhooks returns all notification hooks

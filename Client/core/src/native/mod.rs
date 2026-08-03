@@ -1,35 +1,37 @@
 // Native helpers: process / memory / spawn / netinfo / users
 // Windows: prefer indirect syscalls + PEB; other platforms: OS fallbacks.
 
-#[cfg(windows)]
-pub mod process;
-#[cfg(windows)]
-pub mod memory;
-#[cfg(windows)]
-pub mod spawn;
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub mod ghost_host;
 /// Remote process shellcode inject — feature `inject` only (L2 mod_inject).
 #[cfg(all(windows, feature = "inject"))]
 pub mod inject;
+#[cfg(windows)]
+pub mod memory;
+#[cfg(windows)]
+pub mod process;
+#[cfg(windows)]
+pub mod spawn;
 
 pub mod netinfo;
 pub mod users;
 
-#[cfg(windows)]
-pub use process::{
-    list_processes, open_process, terminate_process, close_handle, find_pid_by_name,
-    create_thread_ex, wait_for_single_object, ProcessInfo, PROCESS_TERMINATE,
-    PROCESS_CREATE_PROCESS, CURRENT_PROCESS,
-};
-#[cfg(windows)]
-pub use memory::{nt_alloc_rw, nt_free};
 #[cfg(all(windows, feature = "inject"))]
 pub use inject::{inject_shellcode, wait_inject_thread, InjectResult};
 #[cfg(windows)]
+pub use memory::{nt_alloc_rw, nt_free};
+#[cfg(windows)]
+pub use process::{
+    close_handle, create_thread_ex, find_pid_by_name, list_processes, open_process,
+    terminate_process, terminate_process_handle, wait_for_single_object,
+    wait_for_single_object_timeout, ProcessInfo, CURRENT_PROCESS, PROCESS_CREATE_PROCESS,
+    PROCESS_TERMINATE,
+};
+#[cfg(windows)]
 pub use spawn::{
-    pipe_read_exact, pipe_read_to_end, pipe_write_all, spawn_piped_plain, spawn_spoofed_piped,
-    spawn_spoofed_piped_result, spawn_spoofed_process, SpoofedPipedChild,
+    pipe_read_exact, pipe_read_to_end, pipe_read_to_end_bounded, pipe_write_all,
+    spawn_piped_plain, spawn_spoofed_piped, spawn_spoofed_piped_result, spawn_spoofed_process,
+    SpoofedPipedChild,
 };
 
 pub use netinfo::{format_adapters_text, list_adapters, AdapterInfo};

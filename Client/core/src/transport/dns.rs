@@ -103,9 +103,10 @@ impl DnsTransport {
     /// Opaque agent tag (not raw UUID) — first 12 hex of SHA256(uuid).
     fn agent_tag(&self) -> Result<String> {
         use sha2::{Digest, Sha256};
-        let uuid = self.client_uuid.as_ref().ok_or_else(|| {
-            ClientError::ConnectionError("DNS UUID not set".into())
-        })?;
+        let uuid = self
+            .client_uuid
+            .as_ref()
+            .ok_or_else(|| ClientError::ConnectionError("DNS UUID not set".into()))?;
         let h = Sha256::digest(uuid.as_bytes());
         Ok(hex::encode(&h[..6]))
     }
@@ -154,7 +155,9 @@ impl DnsTransport {
             }
             Err(e) => {
                 error!("DNS TXT failed {}: {}", domain, e);
-                Err(ClientError::ConnectionError(format!("DNS query failed: {e}")))
+                Err(ClientError::ConnectionError(format!(
+                    "DNS query failed: {e}"
+                )))
             }
         }
     }
@@ -171,7 +174,9 @@ impl DnsTransport {
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(rest.trim()) {
                     return Some(bytes);
                 }
-                if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(rest.trim()) {
+                if let Ok(bytes) =
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(rest.trim())
+                {
                     return Some(bytes);
                 }
             }

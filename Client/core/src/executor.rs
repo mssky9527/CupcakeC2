@@ -194,11 +194,8 @@ async fn force_kill_child(child: &mut tokio::process::Child) {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(500), child.wait()).await;
 }
 
-async fn drain_pipe<R, F>(
-    pipe: &mut Option<R>,
-    buf: &mut [u8],
-    on_output: &mut F,
-) where
+async fn drain_pipe<R, F>(pipe: &mut Option<R>, buf: &mut [u8], on_output: &mut F)
+where
     R: AsyncReadExt + Unpin,
     F: FnMut(&[u8]),
 {
@@ -525,10 +522,7 @@ fn builtin_ls(path: &Path) -> CommandResult {
         let time_s = format_unix_time_cmd(*mtime);
         if *is_dir {
             dir_count += 1;
-            out.push_str(&format!(
-                "{:<20}    {:<14} {}\r\n",
-                time_s, "<DIR>", name
-            ));
+            out.push_str(&format!("{:<20}    {:<14} {}\r\n", time_s, "<DIR>", name));
         } else {
             file_count += 1;
             total_bytes += size;
@@ -546,10 +540,7 @@ fn builtin_ls(path: &Path) -> CommandResult {
         file_count,
         format_int_commas(total_bytes)
     ));
-    out.push_str(&format!(
-        "               {} Dir(s)\r\n",
-        dir_count
-    ));
+    out.push_str(&format!("               {} Dir(s)\r\n", dir_count));
     ok_out(out)
 }
 

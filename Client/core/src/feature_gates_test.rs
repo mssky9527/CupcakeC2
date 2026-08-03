@@ -59,26 +59,38 @@ fn encrypt_rejects_wrong_key_length_without_panic() {
 }
 
 #[test]
-fn inject_not_in_product_default_tiers() {
-    // Stage0 product tiers (minimal/standard/beacon) must never enable inject.
-    // inject is L2-only (`cupcake-mod-inject` with --features inject).
-    // This test runs under product features (ws+minimal or default); inject must be off.
+fn inject_not_in_product_minimal() {
+    // Sole product tier is minimal; inject is L2-only (`cupcake-mod-inject`).
     assert!(
         !cfg!(feature = "inject"),
         "inject must not be compiled into Stage0 product agent (use L2 mod_inject)"
     );
 }
 
-/// Only runs when `desktop` is off (product CI: ws,standard). When testing the
-/// opt-in bridge (`--features desktop`), this gate is intentionally skipped.
-#[cfg(not(feature = "desktop"))]
 #[test]
-fn desktop_bridge_not_in_product_default_tiers() {
-    // desktop Yamux 0x0D bridge is opt-in only (full-gui / custom). Never default/standard/beacon.
+fn product_minimal_has_no_fat_or_in_process_runtime() {
+    // Product = minimal only. No Stage0 BOF/.NET loaders, logging, multi-rt, plugin, stealth-adv.
+    assert!(!cfg!(feature = "bof"), "bof not in product Stage0");
+    assert!(!cfg!(feature = "dotnet"), "dotnet not in product Stage0");
+    assert!(!cfg!(feature = "logging"), "logging not in product Stage0");
     assert!(
-        !cfg!(feature = "desktop"),
-        "desktop bridge must not be compiled into Stage0 product agent (use feature desktop + L2)"
+        !cfg!(feature = "rt-multi"),
+        "rt-multi not in product Stage0"
     );
+    assert!(!cfg!(feature = "plugin"), "plugin not in product Stage0");
+    assert!(
+        !cfg!(feature = "stealth-adv"),
+        "stealth-adv not in product Stage0"
+    );
+}
+
+#[test]
+fn product_minimal_core_caps() {
+    assert!(cfg!(feature = "socks"), "socks in minimal");
+    assert!(cfg!(feature = "isolated-exec"), "isolated-exec in minimal");
+    assert!(cfg!(feature = "module-loader"), "module-loader in minimal");
+    assert!(cfg!(feature = "post-ex"), "post-ex in minimal");
+    assert!(cfg!(feature = "pty"), "pty in minimal");
 }
 
 #[test]
@@ -98,12 +110,15 @@ fn stealth_adv_cfg_is_explicit() {
 }
 
 #[test]
-fn beacon_and_post_ex_are_orthogonal() {
-    // When building pure Stage0: --features ws,beacon (no post-ex).
-    // Standard always enables post-ex via Cargo.toml.
-    let _ = cfg!(feature = "beacon");
-    let _ = cfg!(feature = "post-ex");
-    let _ = cfg!(feature = "module-loader");
+fn agent_uuid_stable_in_process() {
+    use crate::utils::get_agent_uuid;
+    let a = get_agent_uuid();
+    let b = get_agent_uuid();
+    assert_eq!(
+        a, b,
+        "UUID must be process-stable even if disk persist fails"
+    );
+    assert_eq!(a.len(), 36);
 }
 
 #[cfg(windows)]

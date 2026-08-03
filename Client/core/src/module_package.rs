@@ -58,10 +58,7 @@ pub fn unpack_and_verify(blob: &[u8], key: &[u8]) -> Result<(String, Vec<u8>), S
 }
 
 /// Verify HMAC and return (module_id, payload, flags).
-pub fn unpack_and_verify_ex(
-    blob: &[u8],
-    key: &[u8],
-) -> Result<(String, Vec<u8>, u16), String> {
+pub fn unpack_and_verify_ex(blob: &[u8], key: &[u8]) -> Result<(String, Vec<u8>, u16), String> {
     if blob.len() < 4 + 2 + 2 + 2 + 4 + 32 {
         return Err("blob too short".into());
     }

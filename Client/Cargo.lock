@@ -313,7 +313,6 @@ dependencies = [
 name = "cupcake-mod-desktop"
 version = "0.1.0"
 dependencies = [
- "cupcake-core",
  "serde_json",
 ]
 
@@ -337,17 +336,6 @@ dependencies = [
  "cupcake-core",
  "log",
  "serde_json",
- "winapi",
-]
-
-[[package]]
-name = "cupcake-mod-shell"
-version = "0.1.0"
-dependencies = [
- "cupcake-core",
- "log",
- "serde_json",
- "tokio",
  "winapi",
 ]
 

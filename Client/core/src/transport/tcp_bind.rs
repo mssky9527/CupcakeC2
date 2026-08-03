@@ -5,9 +5,7 @@
 use crate::config::{get_aes_key, get_aes_key_base};
 use crate::crypto;
 use crate::error::{ClientError, Result};
-use crate::transport::session_crypto::{
-    seal_for_wire, traffic_key, FragReassembler, OpenResult,
-};
+use crate::transport::session_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -135,10 +133,10 @@ impl TcpBindTransport {
                                         }
                                         #[cfg(not(feature = "module-loader"))]
                                         {
-                                            crate::transport::desktop_reject::reject_desktop_stream(
-                                                stream,
-                                            )
-                                            .await;
+                                            use futures_util::AsyncWriteExt;
+                                            let mut s = stream;
+                                            let _ = s.write_all(&[0x00u8]).await;
+                                            let _ = s.close().await;
                                         }
                                     }
                                     _ => {}
@@ -151,26 +149,29 @@ impl TcpBindTransport {
             }
         });
 
-        let control_stream = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            control.open_stream(),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            _ => {
-                return Err(ClientError::ConnectionError(
-                    "yamux control open failed".to_string(),
-                ))
-            }
-        };
+        let control_stream =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), control.open_stream())
+                .await
+            {
+                Ok(Ok(s)) => s,
+                _ => {
+                    return Err(ClientError::ConnectionError(
+                        "yamux control open failed".to_string(),
+                    ))
+                }
+            };
 
         let mut control_stream = control_stream.compat();
 
         self.noise_session_key = None;
         self.reassembler.clear();
 
-        if !self.noise_psk.is_empty() {
+        if self.noise_psk.is_empty() {
+            return Err(ClientError::ConnectionError(
+                "Noise PSK missing — refusing to accept unauthenticated bind connection".into(),
+            ));
+        }
+        {
             let (ephemeral_key, handshake_msg) = crypto::noise_initiate(&self.noise_psk)
                 .map_err(|e| ClientError::ConnectionError(format!("Noise init: {e}")))?;
             let msg_len = handshake_msg.len() as u32;
@@ -266,7 +267,9 @@ impl Transport for TcpBindTransport {
                 .ok_or_else(|| ClientError::ConnectionError("Not connected".to_string()))?;
             let len = stream.read_u32().await? as usize;
             if len > 100 * 1024 * 1024 {
-                return Err(ClientError::ConnectionError("Message too large".to_string()));
+                return Err(ClientError::ConnectionError(
+                    "Message too large".to_string(),
+                ));
             }
             let mut buffer = vec![0u8; len];
             stream.read_exact(&mut buffer).await?;

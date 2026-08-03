@@ -2,7 +2,7 @@
 name = "cupcake-mod-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "L2 desktop module (C ABI packaging for mem-map; engine lives in cupcake-core feature desktop)"
+description = "L2 remote-desktop capability module — gates RDP (3389) port-forward; no GDI capture"
 
 [lib]
 name = "cupcake_mod_desktop"
@@ -10,5 +10,4 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
-cupcake-core = { path = "../../core", default-features = false, features = ["desktop"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

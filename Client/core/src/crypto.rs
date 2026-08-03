@@ -1,11 +1,11 @@
+use crate::config;
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
 use base64::Engine;
 use log::{debug, error};
-use sha2::{Sha256, Digest};
-use crate::config;
+use sha2::{Digest, Sha256};
 
 /// Nonce 长度（12 字节，AES-GCM 标准）
 const NONCE_LENGTH: usize = 12;
@@ -58,9 +58,11 @@ pub fn verify_register_proof(session_key: &[u8], uuid: &str, proof_b64: &str) ->
 }
 
 /// Phase 2: Traffic Camouflage Constants
-const HTTP_HEADER_TEMPLATE: &[u8] = b"POST /api/v1/sync HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ";
+const HTTP_HEADER_TEMPLATE: &[u8] =
+    b"POST /api/v1/sync HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: ";
 const HTTP_HEADER_END: &[u8] = b"\r\n\r\n";
-const HTTP_RESPONSE_TEMPLATE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+const HTTP_RESPONSE_TEMPLATE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
 const HTTP_RESPONSE_END: &[u8] = b"\r\n\r\n";
 
 /// 使用 PBKDF2 简化版（HMAC-SHA256 × 100000 迭代）派生 32 字节 AES 密钥
@@ -122,7 +124,9 @@ pub fn obfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
             // 格式: [Encrypted Data] + [Junk Bytes] + [Original Len (4 bytes)]
             let original_len = data.len() as u32;
             let mut junk_len = (crate::utils::next_u32() % 64) as usize;
-            if junk_len == 0 { junk_len = 8; }
+            if junk_len == 0 {
+                junk_len = 8;
+            }
 
             let mut junk = vec![0u8; junk_len];
             for i in 0..junk_len {
@@ -209,7 +213,15 @@ fn generate_http_padding(len: usize) -> Vec<u8> {
         }
 
         // Random field name
-        let field_names = ["status", "timestamp", "version", "token", "session", "request_id", "nonce"];
+        let field_names = [
+            "status",
+            "timestamp",
+            "version",
+            "token",
+            "session",
+            "request_id",
+            "nonce",
+        ];
         let field_idx = (crate::utils::next_u32() % field_names.len() as u32) as usize;
         let field = field_names[field_idx];
 
@@ -295,10 +307,12 @@ pub fn deobfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
         }
         "junk" => {
             // 识别并移除 Junk Padding (最后 4 字节固定是原始长度)
-            if data.len() < 4 { return data; }
+            if data.len() < 4 {
+                return data;
+            }
 
             let mut len_bytes = [0u8; 4];
-            len_bytes.copy_from_slice(&data[data.len()-4..]);
+            len_bytes.copy_from_slice(&data[data.len() - 4..]);
             let original_len = u32::from_be_bytes(len_bytes) as usize;
 
             if original_len <= data.len() - 4 {
@@ -320,10 +334,12 @@ pub fn deobfuscate_packet(mut data: Vec<u8>) -> Vec<u8> {
 
 /// Remove default padding
 fn remove_default_padding(mut data: Vec<u8>) -> Vec<u8> {
-    if data.len() < 2 { return data; }
+    if data.len() < 2 {
+        return data;
+    }
 
     // Read padding length marker (last 2 bytes)
-    let marker_len = u16::from_be_bytes([data[data.len()-2], data[data.len()-1]]) as usize;
+    let marker_len = u16::from_be_bytes([data[data.len() - 2], data[data.len() - 1]]) as usize;
 
     if data.len() >= 2 + marker_len {
         let original_len = data.len() - 2 - marker_len;
@@ -343,14 +359,18 @@ fn extract_from_http_wrapper(data: Vec<u8>) -> Vec<u8> {
     if let Some(pos) = find_sequence(&data, header_end_marker) {
         let body_start = pos + header_end_marker.len();
 
-        if body_start >= data.len() { return data; }
+        if body_start >= data.len() {
+            return data;
+        }
 
         // Extract body (Base64 encoded)
         let body = &data[body_start..];
 
         // Find and strip padding (JSON object after base64 data)
         // Base64 data ends at '{' or first non-base64 character
-        let b64_end = body.iter().position(|&b| b == b'{' || !is_base64_char(b))
+        let b64_end = body
+            .iter()
+            .position(|&b| b == b'{' || !is_base64_char(b))
             .unwrap_or(body.len());
 
         let b64_data = &body[..b64_end];
@@ -366,10 +386,12 @@ fn extract_from_http_wrapper(data: Vec<u8>) -> Vec<u8> {
 
 /// Find byte sequence in data
 fn find_sequence(data: &[u8], sequence: &[u8]) -> Option<usize> {
-    if sequence.len() > data.len() { return None; }
+    if sequence.len() > data.len() {
+        return None;
+    }
 
     for i in 0..=data.len() - sequence.len() {
-        if data[i..i+sequence.len()] == *sequence {
+        if data[i..i + sequence.len()] == *sequence {
             return Some(i);
         }
     }
@@ -378,19 +400,23 @@ fn find_sequence(data: &[u8], sequence: &[u8]) -> Option<usize> {
 
 /// Check if byte is valid base64 character
 fn is_base64_char(b: u8) -> bool {
-    (b >= b'A' && b <= b'Z') ||
-    (b >= b'a' && b <= b'z') ||
-    (b >= b'0' && b <= b'9') ||
-    b == b'+' || b == b'/' || b == b'='
+    (b >= b'A' && b <= b'Z')
+        || (b >= b'a' && b <= b'z')
+        || (b >= b'0' && b <= b'9')
+        || b == b'+'
+        || b == b'/'
+        || b == b'='
 }
 
 /// Remove tailored padding
 fn remove_tailored_padding(mut data: Vec<u8>) -> Vec<u8> {
-    if data.len() < 4 { return data; }
+    if data.len() < 4 {
+        return data;
+    }
 
     // Original length is stored in last 4 bytes
     let mut len_bytes = [0u8; 4];
-    len_bytes.copy_from_slice(&data[data.len()-4..]);
+    len_bytes.copy_from_slice(&data[data.len() - 4..]);
     let original_len = u32::from_be_bytes(len_bytes) as usize;
 
     if original_len <= data.len() - 4 && original_len > 0 {
@@ -401,28 +427,28 @@ fn remove_tailored_padding(mut data: Vec<u8>) -> Vec<u8> {
 }
 
 /// 加密数据
-/// 
+///
 /// 使用 AES-256-GCM 加密数据。每次加密都会生成一个新的随机 Nonce。
-/// 
+///
 /// # 参数
-/// 
+///
 /// * `data` - 要加密的明文数据
 /// * `key` - 32 字节的 AES-256 密钥
-/// 
+///
 /// # 返回值
-/// 
+///
 /// 返回加密后的数据，格式为：[Nonce (12 bytes) + Ciphertext]
-/// 
+///
 /// # Panics
-/// 
+///
 /// 如果密钥长度不是 32 字节，会 panic。
-/// 
+///
 /// # 示例
-/// 
+///
 /// ```no_run
 /// use c2_client_agent::crypto::encrypt;
 /// use c2_client_agent::config::get_aes_key;
-/// 
+///
 /// let key = get_aes_key();
 /// let plaintext = b"Hello, World!";
 /// let encrypted = encrypt(plaintext, &key);
@@ -432,13 +458,13 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
     if key.len() != 32 {
         return Vec::new();
     }
-    
+
     // 创建 AES-256-GCM 密码器
     let cipher = match Aes256Gcm::new_from_slice(key) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    
+
     // Nonce: OS CSPRNG only (fail-closed). Never timestamp/counter fallback —
     // predictable nonces break AES-GCM confidentiality under reuse.
     let mut nonce_bytes = [0u8; NONCE_LENGTH];
@@ -447,45 +473,45 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
     let nonce = Nonce::from_slice(&nonce_bytes);
-    
+
     // 加密数据
     let ciphertext = match cipher.encrypt(nonce, data) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
-    
+
     // 组合 Nonce 和 Ciphertext：[Nonce (12 bytes) + Ciphertext]
     let mut result = Vec::with_capacity(NONCE_LENGTH + ciphertext.len());
     result.extend_from_slice(&nonce_bytes);
     result.extend_from_slice(&ciphertext);
-    
+
     result
 }
 
 /// 解密数据
-/// 
+///
 /// 使用 AES-256-GCM 解密数据。从加密数据中提取 Nonce，然后解密。
-/// 
+///
 /// # 参数
-/// 
+///
 /// * `data` - 加密的数据，格式为：[Nonce (12 bytes) + Ciphertext]
 /// * `key` - 32 字节的 AES-256 密钥
-/// 
+///
 /// # 返回值
-/// 
+///
 /// 成功返回解密后的明文数据，失败返回错误信息。
-/// 
+///
 /// # 错误
-/// 
+///
 /// - 如果数据长度小于 12 字节（无法提取 Nonce），返回错误
 /// - 如果解密失败（密钥错误或数据损坏），返回错误
-/// 
+///
 /// # 示例
-/// 
+///
 /// ```no_run
 /// use c2_client_agent::crypto::{encrypt, decrypt};
 /// use c2_client_agent::config::get_aes_key;
-/// 
+///
 /// let key = get_aes_key();
 /// let plaintext = b"Hello, World!";
 /// let encrypted = encrypt(plaintext, &key);
@@ -494,14 +520,14 @@ pub fn encrypt(data: &[u8], key: &[u8]) -> Vec<u8> {
 /// ```
 pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
     debug!("Decrypting {} bytes of data", data.len());
-    
+
     // 验证密钥长度
     if key.len() != 32 {
         let err = format!("AES-256 requires a 32-byte key, got {} bytes", key.len());
         error!("{}", err);
         return Err(err);
     }
-    
+
     // 检查数据长度（至少需要 Nonce）
     if data.len() < NONCE_LENGTH {
         let err = format!(
@@ -512,37 +538,34 @@ pub fn decrypt(data: &[u8], key: &[u8]) -> Result<Vec<u8>, String> {
         error!("{}", err);
         return Err(err);
     }
-    
+
     // 提取 Nonce（前 12 字节）
     let nonce_bytes = &data[..NONCE_LENGTH];
     let nonce = Nonce::from_slice(nonce_bytes);
-    
+
     debug!("Extracted nonce: {} bytes", nonce_bytes.len());
-    
+
     // 提取 Ciphertext（剩余字节）
     let ciphertext = &data[NONCE_LENGTH..];
-    
+
     debug!("Extracted ciphertext: {} bytes", ciphertext.len());
-    
+
     // 创建 AES-256-GCM 密码器
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|e| format!("Invalid key: {}", e))?;
-    
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|e| format!("Invalid key: {}", e))?;
+
     // 解密数据
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| {
-            let err = format!("Decryption failed: {}", e);
-            error!("{}", err);
-            err
-        })?;
-    
+    let plaintext = cipher.decrypt(nonce, ciphertext).map_err(|e| {
+        let err = format!("Decryption failed: {}", e);
+        error!("{}", err);
+        err
+    })?;
+
     debug!(
         "Decryption successful: {} bytes ciphertext -> {} bytes plaintext",
         ciphertext.len(),
         plaintext.len()
     );
-    
+
     Ok(plaintext)
 }
 
@@ -607,17 +630,17 @@ mod tests {
     fn test_encrypt_decrypt_roundtrip() {
         let key = b"01234567890123456789012345678901"; // 32 bytes
         let plaintext = b"Hello, World! This is a test message.";
-        
+
         // 加密
         let encrypted = encrypt(plaintext, key);
-        
+
         // 验证加密后的数据长度
         assert!(encrypted.len() > plaintext.len());
         assert!(encrypted.len() >= NONCE_LENGTH);
-        
+
         // 解密
         let decrypted = decrypt(&encrypted, key).unwrap();
-        
+
         // 验证 round-trip
         assert_eq!(plaintext, &decrypted[..]);
     }
@@ -626,14 +649,14 @@ mod tests {
     fn test_encrypt_produces_different_ciphertext() {
         let key = b"01234567890123456789012345678901"; // 32 bytes
         let plaintext = b"Same message";
-        
+
         // 加密两次
         let encrypted1 = encrypt(plaintext, key);
         let encrypted2 = encrypt(plaintext, key);
-        
+
         // 由于 Nonce 是随机的，两次加密结果应该不同
         assert_ne!(encrypted1, encrypted2);
-        
+
         // 但解密后应该相同
         let decrypted1 = decrypt(&encrypted1, key).unwrap();
         let decrypted2 = decrypt(&encrypted2, key).unwrap();
@@ -646,10 +669,10 @@ mod tests {
         let key1 = b"01234567890123456789012345678901"; // 32 bytes
         let key2 = b"10987654321098765432109876543210"; // 32 bytes (different)
         let plaintext = b"Secret message";
-        
+
         // 使用 key1 加密
         let encrypted = encrypt(plaintext, key1);
-        
+
         // 使用 key2 解密应该失败
         let result = decrypt(&encrypted, key2);
         assert!(result.is_err());
@@ -659,15 +682,15 @@ mod tests {
     fn test_decrypt_with_corrupted_data() {
         let key = b"01234567890123456789012345678901"; // 32 bytes
         let plaintext = b"Test message";
-        
+
         // 加密
         let mut encrypted = encrypt(plaintext, key);
-        
+
         // 损坏数据（修改最后一个字节）
         if let Some(last) = encrypted.last_mut() {
             *last = last.wrapping_add(1);
         }
-        
+
         // 解密应该失败
         let result = decrypt(&encrypted, key);
         assert!(result.is_err());
@@ -677,7 +700,7 @@ mod tests {
     fn test_decrypt_with_short_data() {
         let key = b"01234567890123456789012345678901"; // 32 bytes
         let short_data = b"short"; // 少于 12 字节
-        
+
         // 解密应该失败
         let result = decrypt(short_data, key);
         assert!(result.is_err());
@@ -688,7 +711,7 @@ mod tests {
     fn test_decrypt_with_invalid_key_length() {
         let short_key = b"short_key"; // 少于 32 字节
         let data = vec![0u8; 20]; // 足够长的数据
-        
+
         // 解密应该失败
         let result = decrypt(&data, short_key);
         assert!(result.is_err());
@@ -699,13 +722,13 @@ mod tests {
     fn test_encrypt_empty_data() {
         let key = b"01234567890123456789012345678901"; // 32 bytes
         let plaintext = b"";
-        
+
         // 加密空数据
         let encrypted = encrypt(plaintext, key);
-        
+
         // 应该至少包含 Nonce
         assert!(encrypted.len() >= NONCE_LENGTH);
-        
+
         // 解密
         let decrypted = decrypt(&encrypted, key).unwrap();
         assert_eq!(plaintext, &decrypted[..]);
@@ -715,13 +738,13 @@ mod tests {
     fn test_encrypt_large_data() {
         let key = b"01234567890123456789012345678901"; // 32 bytes
         let plaintext = vec![0x42u8; 10000]; // 10KB 数据
-        
+
         // 加密
         let encrypted = encrypt(&plaintext, key);
-        
+
         // 解密
         let decrypted = decrypt(&encrypted, key).unwrap();
-        
+
         // 验证
         assert_eq!(plaintext, decrypted);
     }
@@ -730,13 +753,13 @@ mod tests {
     fn test_nonce_is_prepended() {
         let key = b"01234567890123456789012345678901"; // 32 bytes
         let plaintext = b"Test";
-        
+
         // 加密
         let encrypted = encrypt(plaintext, key);
-        
+
         // 前 12 字节应该是 Nonce
         assert!(encrypted.len() >= NONCE_LENGTH);
-        
+
         // 提取 Nonce 并验证可以解密
         let result = decrypt(&encrypted, key);
         assert!(result.is_ok());
@@ -788,7 +811,11 @@ mod tests {
         let proof = register_proof(key, uuid);
         assert!(verify_register_proof(key, uuid, &proof));
         assert!(!verify_register_proof(key, "other-uuid", &proof));
-        assert!(!verify_register_proof(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", uuid, &proof));
+        assert!(!verify_register_proof(
+            b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            uuid,
+            &proof
+        ));
         assert!(!verify_register_proof(key, uuid, "not-valid-base64!!!"));
         assert!(!verify_register_proof(key, uuid, ""));
     }
@@ -864,8 +891,7 @@ impl EphemeralKey {
     /// Generate a new X25519 ephemeral key pair using OS CSPRNG.
     pub fn generate() -> Result<Self, String> {
         let mut secret = [0u8; 32];
-        getrandom::getrandom(&mut secret)
-            .map_err(|e| format!("getrandom failed: {:?}", e))?;
+        getrandom::getrandom(&mut secret).map_err(|e| format!("getrandom failed: {:?}", e))?;
         // Clamp per RFC 7748
         secret[0] &= 248;
         secret[31] &= 127;
@@ -880,11 +906,7 @@ impl EphemeralKey {
 }
 
 /// ECDH + HKDF session key.
-pub fn derive_session_key(
-    local_secret: &[u8; 32],
-    peer_public: &[u8; 32],
-    psk: &[u8],
-) -> [u8; 32] {
+pub fn derive_session_key(local_secret: &[u8; 32], peer_public: &[u8; 32], psk: &[u8]) -> [u8; 32] {
     let shared = x25519_scalarmult(local_secret, peer_public);
     hkdf_sha256_32(&shared, psk, &crate::wire_ids::NOISE_INFO)
 }
@@ -892,7 +914,11 @@ pub fn derive_session_key(
 /// HKDF-Extract/Expand (SHA-256) → 32-byte OKM.
 fn hkdf_sha256_32(ikm: &[u8], salt: &[u8], info: &[u8]) -> [u8; 32] {
     // Extract: PRK = HMAC-SHA256(salt, IKM)
-    let salt = if salt.is_empty() { &[0u8; 32][..] } else { salt };
+    let salt = if salt.is_empty() {
+        &[0u8; 32][..]
+    } else {
+        salt
+    };
     let prk = hmac_sha256(salt, ikm);
     // Expand: T(1) = HMAC-SHA256(PRK, info || 0x01)
     let mut expand_in = Vec::with_capacity(info.len() + 1);
@@ -978,7 +1004,9 @@ fn x25519_scalarmult(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
 
 type Fe = [i64; 16];
 
-fn fe_zero() -> Fe { [0; 16] }
+fn fe_zero() -> Fe {
+    [0; 16]
+}
 fn fe_one() -> Fe {
     let mut f = fe_zero();
     f[0] = 1;
@@ -1210,8 +1238,7 @@ pub fn noise_encrypt(session_key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
 
 /// Decrypt data with the session key.
 pub fn noise_decrypt(session_key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
-    decrypt(ciphertext, session_key)
-        .map_err(|e| format!("noise decrypt failed: {:?}", e))
+    decrypt(ciphertext, session_key).map_err(|e| format!("noise decrypt failed: {:?}", e))
 }
 
 // =============================================================================
@@ -1222,7 +1249,9 @@ pub fn noise_decrypt(session_key: &[u8; 32], ciphertext: &[u8]) -> Result<Vec<u8
 /// This prevents the compiler from optimizing away the zeroization.
 pub fn zeroize(data: &mut [u8]) {
     for b in data.iter_mut() {
-        unsafe { std::ptr::write_volatile(b, 0); }
+        unsafe {
+            std::ptr::write_volatile(b, 0);
+        }
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }

@@ -12,13 +12,50 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// listenerView is the only listener shape exposed through the API. Listener
+// credentials stay server-side so payload generation can use listener_id
+// without pushing keys or private TLS material into browsers.
+type listenerView struct {
+	ID                string `json:"id"`
+	BindIP            string `json:"bind_ip"`
+	Port              int    `json:"port"`
+	Protocol          string `json:"protocol"`
+	PublicHost        string `json:"public_host"`
+	Note              string `json:"note"`
+	EncryptMode       string `json:"encrypt_mode"`
+	ObfuscateMode     string `json:"obfuscate_mode"`
+	CustomPath        string `json:"custom_path"`
+	Profile           string `json:"profile"`
+	ProfileStrict     bool   `json:"profile_strict"`
+	NSDomain          string `json:"ns_domain"`
+	PublicDNS         string `json:"public_dns"`
+	HeartbeatInterval int    `json:"heartbeat_interval"`
+	HeartbeatJitter   int    `json:"heartbeat_jitter"`
+	MaxRetry          int    `json:"max_retry"`
+	EnableTLS         bool   `json:"enable_tls"`
+	HasEncryptionKey  bool   `json:"has_encryption_key"`
+	HasTLSKey         bool   `json:"has_tls_key"`
+	Status            string `json:"status"`
+}
+
+func newListenerView(ln *globals.Listener) listenerView {
+	return listenerView{
+		ID: ln.ID, BindIP: ln.BindIP, Port: ln.Port, Protocol: ln.Protocol,
+		PublicHost: ln.PublicHost, Note: ln.Note, EncryptMode: ln.EncryptMode,
+		ObfuscateMode: ln.ObfuscateMode, CustomPath: ln.CustomPath, Profile: ln.Profile,
+		ProfileStrict: ln.ProfileStrict, NSDomain: ln.NSDomain, PublicDNS: ln.PublicDNS,
+		HeartbeatInterval: ln.HeartbeatInterval, HeartbeatJitter: ln.HeartbeatJitter,
+		MaxRetry: ln.MaxRetry, EnableTLS: ln.EnableTLS, HasEncryptionKey: ln.EncryptKey != "",
+		HasTLSKey: ln.TLSKeyPath != "" || ln.TLSKeyPEM != "", Status: ln.Status,
+	}
+}
+
 func ListListeners(c *gin.Context) {
-	var list []interface{}
+	list := make([]listenerView, 0)
 	globals.Listeners.Range(func(k, v interface{}) bool {
-		list = append(list, v)
+		list = append(list, newListenerView(v.(*globals.Listener)))
 		return true
 	})
-	if list == nil { list = []interface{}{} }
 	c.JSON(http.StatusOK, list)
 }
 
@@ -117,7 +154,7 @@ func CreateListener(c *gin.Context) {
 	}
 	store.SaveListener(lModel)
 
-	c.JSON(http.StatusOK, newListener)
+	c.JSON(http.StatusOK, newListenerView(newListener))
 }
 
 func StopListener(c *gin.Context) {

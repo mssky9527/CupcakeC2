@@ -13,14 +13,14 @@
 #[cfg(all(windows, target_arch = "x86_64"))]
 use std::collections::HashMap;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use std::sync::{Mutex, OnceLock};
-#[cfg(all(windows, target_arch = "x86_64"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(all(windows, target_arch = "x86_64"))]
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_SECTION_HEADER};
-#[cfg(all(windows, target_arch = "x86_64"))]
 use winapi::um::winnt::IMAGE_NT_HEADERS64 as IMAGE_NT_HEADERS;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_SECTION_HEADER};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // x86_64: Lazy SSN + gadget pool
@@ -45,9 +45,7 @@ fn syscall_state() -> &'static Mutex<SyscallState> {
     static STATE: OnceLock<Mutex<SyscallState>> = OnceLock::new();
     STATE.get_or_init(|| {
         // Acceptance signal: no eager Nt* SSN scan at startup.
-        crate::utils::db_print(
-            "[Cupcake] syscall layer: lazy resolved 0 on init (SSN on-demand)",
-        );
+        crate::utils::db_print("[Cupcake] syscall layer: lazy resolved 0 on init (SSN on-demand)");
         Mutex::new(SyscallState {
             ssn_cache: HashMap::new(),
             gadgets: Vec::with_capacity(MAX_GADGETS),
@@ -119,10 +117,9 @@ unsafe fn harvest_gadget_pool(state: &mut SyscallState) {
 
     let dos_header = ntdll_base as *const IMAGE_DOS_HEADER;
     let nt_headers = (ntdll_base + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS;
-    let section_header = (nt_headers as usize
-        + 24
-        + (*nt_headers).FileHeader.SizeOfOptionalHeader as usize)
-        as *const IMAGE_SECTION_HEADER;
+    let section_header =
+        (nt_headers as usize + 24 + (*nt_headers).FileHeader.SizeOfOptionalHeader as usize)
+            as *const IMAGE_SECTION_HEADER;
     let num_sections = (*nt_headers).FileHeader.NumberOfSections;
 
     for i in 0..num_sections {

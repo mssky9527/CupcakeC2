@@ -2,6 +2,7 @@ package hub
 
 import (
 	"sync"
+	"sync/atomic"
 )
 
 type WsPacket struct {
@@ -14,6 +15,8 @@ type TaskHub struct {
 	subscribers map[string][]chan WsPacket
 	history     map[string][]WsPacket
 	mu          sync.Mutex
+	// Dropped is readable for tests/metrics (packets not delivered to a subscriber).
+	Dropped atomic.Uint64
 }
 
 func NewTaskHub() *TaskHub {
@@ -21,6 +24,11 @@ func NewTaskHub() *TaskHub {
 		subscribers: make(map[string][]chan WsPacket),
 		history:     make(map[string][]WsPacket),
 	}
+}
+
+// DroppedCount returns hub-level dropped packet count.
+func (h *TaskHub) DroppedCount() uint64 {
+	return h.Dropped.Load()
 }
 
 func (h *TaskHub) Broadcast(taskID string, packet WsPacket) {
@@ -32,12 +40,22 @@ func (h *TaskHub) Broadcast(taskID string, packet WsPacket) {
 		h.history[taskID] = append(h.history[taskID], packet)
 	}
 
-	// 2. Broadcast to active listeners
+	// 2. Broadcast to active listeners (drop + count when full — never block hub)
 	if subs, ok := h.subscribers[taskID]; ok {
 		for _, ch := range subs {
 			select {
 			case ch <- packet:
 			default:
+				// Best-effort: drop oldest then retry once
+				select {
+				case <-ch:
+				default:
+				}
+				select {
+				case ch <- packet:
+				default:
+					h.Dropped.Add(1)
+				}
 			}
 		}
 	}

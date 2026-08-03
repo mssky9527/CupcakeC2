@@ -130,15 +130,15 @@ import api from '../api/index'
 const route = useRoute()
 const router = useRouter()
 
-const menuItems = [
+const allMenuItems = [
   { path: '/dashboard', label: '仪表盘', icon: Odometer },
   { path: '/clients', label: '受控端', icon: Monitor },
-  { path: '/listeners', label: '监听器', icon: Headset },
+  { path: '/listeners', label: '监听器', icon: Headset, adminOnly: true },
   { path: '/tunnels', label: '隧道', icon: Share },
-  { path: '/generator', label: '生成器', icon: Lightning },
+  { path: '/generator', label: '生成器', icon: Lightning, adminOnly: true },
   { path: '/modules', label: '模块', icon: Box },
   { path: '/domain', label: '插件', icon: Connection },
-  { path: '/settings', label: '设置', icon: Setting }
+  { path: '/settings', label: '设置', icon: Setting, adminOnly: true }
 ]
 
 const titleDisplayNames = {
@@ -164,8 +164,8 @@ const titleDescriptions = {
   '隧道': '内置 SOCKS5 及端口转发通道的建立、状态与数据桥接。',
   Generator: '跨平台 Shell & Stager 载荷构建、定制模板与能力参数配置。',
   '生成器': '跨平台 Shell & Stager 载荷构建、定制模板与能力参数配置。',
-  Modules: 'Stage0 L2 模块仓库：上传 shell 等模块并推送到在线主机。',
-  '模块': 'Stage0 L2 模块仓库：上传 shell 等模块并推送到在线主机。',
+  Modules: 'L2 模块仓库：desktop / iso_host / inject 三件套，分模块推送。',
+  '模块': 'L2 模块仓库：desktop / iso_host / inject 三件套，分模块推送。',
   Plugins: '扩展功能模块集中注入、内存载荷加载与平台兼容插件管理。',
   '插件': '扩展功能模块集中注入、内存载荷加载与平台兼容插件管理。',
   Settings: '多角色操作员鉴权配置、系统审计日志与控制平面安全设置。',
@@ -176,6 +176,11 @@ const titleDescriptions = {
 
 const userData = JSON.parse(localStorage.getItem('cupcake_user') || '{}')
 const username = ref(userData.username || 'Operator')
+const userRole = (userData.role || 'operator').toLowerCase()
+const isAdmin = computed(() => userRole === 'admin' || userRole === 'administrator')
+const menuItems = computed(() =>
+  allMenuItems.filter((m) => !m.adminOnly || isAdmin.value)
+)
 const userInitial = computed(() => username.value.charAt(0).toUpperCase())
 const activeMenu = computed(() => route.path.startsWith('/client/') ? '/clients' : route.path)
 
@@ -234,12 +239,15 @@ const submitChangePassword = async () => {
 
   pwdDialog.loading = true
   try {
-    const userId = userData.id
-    await api.put(`/api/settings/users/${userId}`, { password: pwdDialog.form.newPassword })
+    // Self-service password change (not admin user-management API)
+    await api.put('/api/auth/password', {
+      old_password: pwdDialog.form.oldPassword,
+      new_password: pwdDialog.form.newPassword
+    })
     ElMessage.success('密码已更新。')
     pwdDialog.visible = false
-  } catch {
-    ElMessage.error('密码更新失败。')
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.error || '密码更新失败。')
   } finally {
     pwdDialog.loading = false
   }

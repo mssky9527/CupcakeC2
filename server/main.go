@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -60,29 +61,39 @@ func main() {
 	go services.RestoreListeners()
 	go services.RestoreTunnels()
 	services.StartAgentHealthMonitor(time.Duration(cfg.AgentStaleSecs) * time.Second)
+	store.StartTaskLogRetentionWorker(time.Hour)
 
 	gin.SetMode(gin.ReleaseMode)
 	adminRouter := gin.New()
+	// Do not trust client supplied X-Forwarded-For by default. Deployments behind
+	// a reverse proxy should set trusted proxies explicitly at the edge.
+	_ = adminRouter.SetTrustedProxies(nil)
 	adminRouter.Use(gin.Recovery())
+
+	// 大文件上传：放宽 gin multipart 内存解析上限到 512MB。
+	// 默认 32MB 超出会落临时盘，慢链路下前端 axios 30s timeout 会在 FormFile 全量收完前就断。
+	// 512MB 与前端 FileManager.vue 的 500MB 预检上限对齐（留 12MB 余量给 FormData 的 uuid/path 字段）。
+	adminRouter.MaxMultipartMemory = 512 << 20 // 512 MB
 
 	// CORS: 仅允许来自同一主机的请求（C2平台无需跨域），防止 CSRF
 	corsConfig := cors.DefaultConfig()
 	corsConfig.AllowAllOrigins = false
-	corsConfig.AllowOriginFunc = func(origin string) bool {
-		// 允许同源（相同主机和端口）以及本地开发地址
-		allowedPrefixes := []string{
-			"http://127.0.0.1",
-			"https://127.0.0.1",
-			"http://localhost",
-			"https://localhost",
-		}
-		for _, prefix := range allowedPrefixes {
-			if strings.HasPrefix(origin, prefix) {
-				return true
+		corsConfig.AllowOriginFunc = func(origin string) bool {
+			u, err := url.Parse(origin)
+			if err != nil || u.User != nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+				return false
 			}
+			host := strings.ToLower(u.Hostname())
+			if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+				return false
+			}
+			port := u.Port()
+			if port == "" {
+				if u.Scheme == "http" { port = "80" }
+				if u.Scheme == "https" { port = "443" }
+			}
+			return port == fmt.Sprintf("%d", cfg.AdminPort)
 		}
-		return false
-	}
 	corsConfig.AllowHeaders = []string{"Origin", "Content-Length", "Content-Type", "Authorization"}
 	adminRouter.Use(cors.New(corsConfig))
 
@@ -115,10 +126,11 @@ func main() {
 		api.GET("/resp", controllers.GetResponse)
 
 		api.GET("/listeners", controllers.ListListeners)
-		api.POST("/listeners", controllers.CreateListener)
-		api.POST("/listeners/:id/stop", controllers.StopListener)
-		api.POST("/listeners/:id/start", controllers.StartListener)
-		api.DELETE("/listeners/:id", controllers.DeleteListener)
+		// Listener lifecycle is admin-only (keys / bind ports)
+		api.POST("/listeners", middleware.RequireAdmin(), controllers.CreateListener)
+		api.POST("/listeners/:id/stop", middleware.RequireAdmin(), controllers.StopListener)
+		api.POST("/listeners/:id/start", middleware.RequireAdmin(), controllers.StartListener)
+		api.DELETE("/listeners/:id", middleware.RequireAdmin(), controllers.DeleteListener)
 
 		api.POST("/tunnel/start", controllers.StartTunnel)
 		api.POST("/tunnel/stop", controllers.StopTunnel)
@@ -147,23 +159,26 @@ func main() {
 
 		api.GET("/shell/:uuid", controllers.HandleAdminShell)
 		api.GET("/pty/:uuid", controllers.StreamPTY)
+		// Remote desktop = RDP port-forward (agent → target:3389 via SOCKS yamux)
 		api.GET("/desktop/:uuid/status", controllers.DesktopStatus)
-		api.GET("/desktop/:uuid", controllers.StreamDesktop)
+		api.POST("/desktop/:uuid/start", controllers.StartDesktopRDP)
+		api.POST("/desktop/:uuid/stop", controllers.StopDesktopRDP)
 
 		plugins := api.Group("/plugins")
 		{
 			plugins.GET("", controllers.HandleListPlugins)
-			plugins.POST("/run", controllers.HandleRunPlugin)
-			plugins.POST("/upload", controllers.HandleUploadPlugin)
-			plugins.DELETE("/:id", controllers.HandleDeletePlugin)
+			plugins.POST("/run", middleware.RequireAdmin(), controllers.HandleRunPlugin)
+			plugins.POST("/upload", middleware.RequireAdmin(), controllers.HandleUploadPlugin)
+			plugins.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeletePlugin)
 			plugins.GET("/result/:task_id", controllers.HandleGetPluginResult)
 		}
 
-		// L2 modules for Stage0 beacon (CKMS pack + push)
+		// L2 product modules: desktop | iso_host | inject
 		modules := api.Group("/modules")
 		{
 			modules.GET("", controllers.HandleListModules)
 			modules.POST("/upload", controllers.HandleUploadModule)
+			modules.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeleteModule)
 			modules.POST("/push", controllers.HandlePushModule)
 			modules.POST("/query", controllers.HandleQueryAgentModules)
 			modules.GET("/pack/:id", controllers.HandlePackModule)
@@ -176,11 +191,12 @@ func main() {
 			services.InitTransfer()
 			transfer.POST("/upload", services.HandleAgentUpload)
 			transfer.GET("/download/:filename", services.HandleAgentDownload)
-			transfer.Static("/static", "./storage/public_tools")
+			transfer.Static("/static", paths.Join("public_tools"))
 		}
 
 		settings := api.Group("/settings")
 		{
+			settings.Use(middleware.RequireAdmin())
 			settings.GET("/users", controllers.HandleGetUsers)
 			settings.POST("/users", controllers.HandleAddUser)
 			settings.PUT("/users/:id", controllers.HandleUpdateUser)
@@ -191,21 +207,26 @@ func main() {
 			settings.GET("/webhooks", controllers.HandleGetWebhooks)
 			settings.POST("/webhooks", controllers.HandleSaveWebhook)
 			settings.DELETE("/webhooks/:id", controllers.HandleDeleteWebhook)
+			settings.GET("/mcp", controllers.HandleGetMCPSettings)
+			settings.PUT("/mcp", controllers.HandleUpdateMCPSettings)
+			settings.POST("/mcp/rotate-token", controllers.HandleRotateMCPToken)
 		}
 
 		api.POST("/agents/connect", controllers.HandleConnectBindAgent)
-		api.POST("/generate", controllers.HandleGenerate)
-		api.GET("/generate/stream", controllers.HandleGenerateStream)
-		api.GET("/stager", controllers.HandleGetStager)
+		// Payload generation / stager — admin (template rebuild, host keys)
+		api.POST("/generate", middleware.RequireAdmin(), controllers.HandleGenerate)
+		api.GET("/generate/stream", middleware.RequireAdmin(), controllers.HandleGenerateStream)
+		api.GET("/stager", middleware.RequireAdmin(), controllers.HandleGetStager)
 		// /api/s/:id is registered as public route above (no auth)
 		// 保护下载：不再致录暴露，改为通过控制器注入 AuthMiddleware 展中提供文件
 		api.GET("/payloads/:filename", controllers.HandleServeProtectedPayload)
 
 		api.POST("/auth/login", controllers.HandleLogin)
 		api.POST("/auth/logout", controllers.HandleLogout)
-		api.POST("/maintenance/reset", controllers.HandleMaintenanceReset)
-		api.GET("/maintenance/export", controllers.HandleMaintenanceExport)
-		api.POST("/maintenance/update_templates", controllers.HandleUpdateTemplates)
+		api.PUT("/auth/password", controllers.HandleChangeMyPassword)
+		api.POST("/maintenance/reset", middleware.RequireAdmin(), controllers.HandleMaintenanceReset)
+		api.GET("/maintenance/export", middleware.RequireAdmin(), controllers.HandleMaintenanceExport)
+		api.POST("/maintenance/update_templates", middleware.RequireAdmin(), controllers.HandleUpdateTemplates)
 	}
 
 	distFS, _ := fs.Sub(embeddedFiles, "dist")
@@ -274,9 +295,8 @@ func main() {
 	fmt.Println("-----------------------------------------")
 	fmt.Printf("\x1b[32m[+]\x1b[0m Panel form login (no Basic Auth popup); 5 fails → 5 min lock / IP\n")
 	fmt.Printf("\x1b[32m[+]\x1b[0m Wire seed: %s (agent builds must use same CUPCAKE_WIRE_SEED)\n", wireSeed)
-	mcpToken := store.GetSetting("system_api_token")
-	if mcpToken != "" {
-		fmt.Printf("\x1b[32m[+]\x1b[0m MCP API Key: %s\n", mcpToken)
+	if store.GetSetting("mcp_api_token") != "" {
+		fmt.Println("\x1b[32m[+]\x1b[0m MCP credential configured (manage it in Settings; token is never printed)")
 	}
 	fmt.Println("-----------------------------------------")
 	logx.Info("admin server starting", "bind", cfg.AdminBind, "port", cfg.AdminPort, "tls", cfg.AdminTLS)
@@ -303,7 +323,7 @@ func main() {
 	}()
 
 	addr := fmt.Sprintf("%s:%d", cfg.AdminBind, cfg.AdminPort)
-	srv := &http.Server{Addr: addr, Handler: adminRouter}
+	srv := newAdminHTTPServer(addr, adminRouter)
 
 	if cfg.AdminTLS {
 		var cert tls.Certificate
@@ -354,6 +374,20 @@ func main() {
 // bootstrapAdminPassword ensures an admin user exists.
 // Priority: config.AdminPass → existing DB hash → generate random (printed once).
 // Set CUPCAKE_FORCE_DEV_PASS=1 to force admin/cupcake123 for lab only.
+// newAdminHTTPServer applies production timeouts / header caps for the admin panel.
+// ReadHeaderTimeout and IdleTimeout limit slowloris; Read/Write bound request body lifetime.
+func newAdminHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MiB
+	}
+}
+
 func bootstrapAdminPassword(cfg *config.ServerConfig) {
 	const fixedUser = "admin"
 	pass := strings.TrimSpace(cfg.AdminPass)

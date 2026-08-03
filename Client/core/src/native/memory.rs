@@ -1,7 +1,7 @@
 // NtAllocateVirtualMemory / NtFreeVirtualMemory helpers (no HeapAlloc IAT).
 
-use crate::stealth;
 use super::process::CURRENT_PROCESS;
+use crate::stealth;
 
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RESERVE: u32 = 0x2000;
@@ -44,10 +44,15 @@ pub fn nt_alloc_rw(size: usize, zero: bool) -> Result<*mut u8, String> {
     // Win32 VirtualAlloc PEB fallback
     unsafe {
         let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
-        let addr = stealth::get_api_addr(k32, stealth::hash_api_name(b"VirtualAlloc"))
-            .ok_or_else(|| format!("NtAllocateVirtualMemory 0x{:08X}; VirtualAlloc unresolved", status as u32))?;
-        type VirtualAllocFn =
-            unsafe extern "system" fn(*mut u8, usize, u32, u32) -> *mut u8;
+        let addr = stealth::get_api_addr(k32, stealth::hash_api_name(b"VirtualAlloc")).ok_or_else(
+            || {
+                format!(
+                    "NtAllocateVirtualMemory 0x{:08X}; VirtualAlloc unresolved",
+                    status as u32
+                )
+            },
+        )?;
+        type VirtualAllocFn = unsafe extern "system" fn(*mut u8, usize, u32, u32) -> *mut u8;
         let va: VirtualAllocFn = std::mem::transmute(addr);
         let ptr = va(
             std::ptr::null_mut(),

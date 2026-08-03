@@ -141,10 +141,24 @@ unsafe fn list_adapters_win() -> Result<Vec<AdapterInfo>, String> {
 
     let mut size: u32 = 16 * 1024;
     let mut buf = vec![0u8; size as usize];
-    let mut ret = gaa(AF_UNSPEC, FLAGS, std::ptr::null_mut(), buf.as_mut_ptr(), &mut size);
-    if ret == 111 /* ERROR_BUFFER_OVERFLOW */ {
+    let mut ret = gaa(
+        AF_UNSPEC,
+        FLAGS,
+        std::ptr::null_mut(),
+        buf.as_mut_ptr(),
+        &mut size,
+    );
+    if ret == 111
+    /* ERROR_BUFFER_OVERFLOW */
+    {
         buf.resize(size as usize, 0);
-        ret = gaa(AF_UNSPEC, FLAGS, std::ptr::null_mut(), buf.as_mut_ptr(), &mut size);
+        ret = gaa(
+            AF_UNSPEC,
+            FLAGS,
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            &mut size,
+        );
     }
     if ret != 0 {
         return Err(format!("GetAdaptersAddresses failed: {}", ret));
@@ -162,11 +176,13 @@ unsafe fn parse_adapters_buffer(buf: &[u8]) -> Result<Vec<AdapterInfo>, String> 
     // x86: scaled for 32-bit pointers (approx half between pointer fields).
 
     #[cfg(target_arch = "x86_64")]
-    let (desc_off, friendly_off, phys_off, phys_len_off, if_type_off, oper_off) =
-        (0x40usize, 0x48usize, 0x50usize, 0x58usize, 0x64usize, 0x68usize);
+    let (desc_off, friendly_off, phys_off, phys_len_off, if_type_off, oper_off) = (
+        0x40usize, 0x48usize, 0x50usize, 0x58usize, 0x64usize, 0x68usize,
+    );
     #[cfg(target_arch = "x86")]
-    let (desc_off, friendly_off, phys_off, phys_len_off, if_type_off, oper_off) =
-        (0x24usize, 0x28usize, 0x2Cusize, 0x34usize, 0x3Cusize, 0x40usize);
+    let (desc_off, friendly_off, phys_off, phys_len_off, if_type_off, oper_off) = (
+        0x24usize, 0x28usize, 0x2Cusize, 0x34usize, 0x3Cusize, 0x40usize,
+    );
 
     let mut out = Vec::new();
     let mut cur = buf.as_ptr() as usize;

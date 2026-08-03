@@ -1,14 +1,19 @@
 package controllers
 
 import (
+	"errors"
+	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
 	"cupcake-server/pkg/globals"
 	"cupcake-server/services"
-	"github.com/gin-gonic/gin"
 )
 
 // HandleListModules GET /api/modules?uuid= optional agent for loaded_on_agent flags
@@ -24,14 +29,18 @@ func HandleListModules(c *gin.Context) {
 }
 
 // HandleUploadModule POST /api/modules/upload
-// form: id=iso_host, file=<exe/dll>
+// form: id=desktop|iso_host|inject, file=<exe/dll>
 func HandleUploadModule(c *gin.Context) {
 	id := c.PostForm("id")
 	if id == "" {
 		id = c.Query("id")
 	}
 	if id == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "missing module id"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing module id (desktop | iso_host | inject)"})
+		return
+	}
+	if !services.IsProductModule(id) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: desktop, iso_host, inject"})
 		return
 	}
 	file, err := c.FormFile("file")
@@ -39,14 +48,21 @@ func HandleUploadModule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "missing file"})
 		return
 	}
-	tmp := filepath.Join("storage", "modules", "_upload_"+filepath.Base(file.Filename))
+	dir := services.GetModuleService().Dir()
+	_ = os.MkdirAll(dir, 0o755)
+	tmp := filepath.Join(dir, fmt.Sprintf("_upload_%s_%s", uuid.NewString(), filepath.Base(file.Filename)))
 	if err := c.SaveUploadedFile(file, tmp); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	defer os.Remove(tmp)
 	ms := services.GetModuleService()
 	if err := ms.LoadFromFile(id, tmp); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		if errors.Is(err, services.ErrModuleForbidden) {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	name, desc, kind := services.ModuleDescribe(id)
@@ -57,6 +73,30 @@ func HandleUploadModule(c *gin.Context) {
 		"description": desc,
 		"kind":        kind,
 	})
+}
+
+// HandleDeleteModule DELETE /api/modules/:id
+// 403 non-product, 404 missing, 200 deleted. No policy-lock (any admin may delete).
+func HandleDeleteModule(c *gin.Context) {
+	id := c.Param("id")
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing module id"})
+		return
+	}
+	ms := services.GetModuleService()
+	if err := ms.Delete(id); err != nil {
+		if errors.Is(err, services.ErrModuleForbidden) {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error(), "code": "forbidden"})
+			return
+		}
+		if errors.Is(err, services.ErrModuleNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error(), "code": "not_found"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"msg": "module deleted", "id": id})
 }
 
 // HandlePushModule POST /api/modules/push
@@ -70,6 +110,10 @@ func HandlePushModule(c *gin.Context) {
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || req.UUID == "" || req.ID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "uuid and id required"})
+		return
+	}
+	if !services.IsProductModule(req.ID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: desktop, iso_host, inject", "code": "forbidden"})
 		return
 	}
 	ms := services.GetModuleService()
@@ -125,6 +169,10 @@ func HandlePushModule(c *gin.Context) {
 // Without uuid/listener_id packs with default/dev key (debug only).
 func HandlePackModule(c *gin.Context) {
 	id := c.Param("id")
+	if !services.IsProductModule(id) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "only product modules: desktop, iso_host, inject", "code": "forbidden"})
+		return
+	}
 	ms := services.GetModuleService()
 	name, desc, kind := services.ModuleDescribe(id)
 
@@ -153,6 +201,10 @@ func HandlePackModule(c *gin.Context) {
 		b64, err = ms.PackBase64(id)
 	}
 	if err != nil {
+		if errors.Is(err, services.ErrModuleForbidden) {
+			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}

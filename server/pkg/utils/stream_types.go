@@ -3,8 +3,10 @@
 // These are NOT SOCKS5 wire protocol bytes and NOT HTTP malleable profiles.
 // Only the single type byte written after yamux.Session.Open.
 //
-// Locked table: docs/DESKTOP_MODULE_DESIGN.md §1.
 // Keep numeric values identical to Client/core/src/transport/stream_types.rs.
+//
+// Remote desktop = RDP port-forward on Yamux DESKTOP (0x0D); agent requires
+// L2 module "desktop" Loaded. General SOCKS tunnels remain 0x02.
 package utils
 
 // Yamux stream type tags (first byte on a new multiplexed stream).
@@ -13,7 +15,7 @@ const (
 	YamuxStreamSOCKS    byte = 0x02 // SOCKS / tunnel data plane
 	YamuxStreamFS       byte = 0x03 // file manager
 	YamuxStreamProcess  byte = 0x04 // process list / kill
-	YamuxStreamDesktop  byte = 0x0D // remote desktop (opt-in agent feature only)
+	YamuxStreamDesktop  byte = 0x0D // RDP port-forward (L2 desktop module)
 	YamuxStreamReserved byte = 0xFF // reject / future extension
 )
 

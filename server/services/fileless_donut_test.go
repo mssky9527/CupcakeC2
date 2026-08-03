@@ -21,8 +21,10 @@ func TestBuildFilelessStage2FromTemplateOrSkip(t *testing.T) {
 		filepath.Join("assets", "client_template_windows_tcp_minimal.exe"),
 		filepath.Join("..", "assets", "client_template_windows_tcp_minimal.exe"),
 		filepath.Join("assets", "client_template_windows.exe"),
-		filepath.Join("storage", "modules", "shell.bin"),
-		filepath.Join("..", "storage", "modules", "shell.bin"),
+		filepath.Join("storage", "modules", "desktop.bin"),
+		filepath.Join("..", "storage", "modules", "desktop.bin"),
+		filepath.Join("storage", "modules", "inject.bin"),
+		filepath.Join("..", "storage", "modules", "inject.bin"),
 	}
 	var pe []byte
 	var used string

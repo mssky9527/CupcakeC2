@@ -43,14 +43,15 @@ func StartTCPListener(ln *globals.Listener) {
 			continue
 		}
 		
-		config := yamux.DefaultConfig()
-		config.EnableKeepAlive = true
-		config.KeepAliveInterval = 30 * time.Second
-		// 🚀 PERFORMANCE: Increase window size to 1MB to match client and minimize backpressure
-		config.MaxStreamWindowSize = 1024 * 1024
-		config.LogOutput = yamuxLogOutput()
+	config := yamux.DefaultConfig()
+	config.EnableKeepAlive = true
+	config.KeepAliveInterval = 30 * time.Second
+	// 🚀 对齐 agent 端 tcp.rs:95 的 16MB 接收窗口 — 原 1MB 会让单 ack 帧(~2.78MB base64)
+	// 跨窗口往返,大文件传输尾部延迟显著。16MB 让 Yamux 流控不被 server 端闷盖。
+	config.MaxStreamWindowSize = 16 * 1024 * 1024
+	config.LogOutput = yamuxLogOutput()
 
-		session, err := yamux.Server(conn, config)
+	session, err := yamux.Server(conn, config)
 		if err != nil {
 			log.Printf("[TCP] Yamux session failed: %v", err)
 			conn.Close()

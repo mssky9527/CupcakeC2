@@ -59,16 +59,17 @@ func TestModuleDescribeLoadMode(t *testing.T) {
 	if mode != "iso" {
 		t.Fatalf("iso_host load_mode=%s", mode)
 	}
-	_, _, _, mode = ModuleDescribeEx("shell")
-	if mode != "mem" {
-		t.Fatalf("shell load_mode=%s", mode)
-	}
-	_, _, _, mode = ModuleDescribeEx("bof")
-	if mode != "legacy" {
-		t.Fatalf("bof load_mode=%s", mode)
+	_, _, kind, mode := ModuleDescribeEx("desktop")
+	if mode != "mem" || kind != "runtime" {
+		t.Fatalf("desktop kind=%s mode=%s", kind, mode)
 	}
 	name, _, kind, mode := ModuleDescribeEx("inject")
 	if mode != "mem" || kind != "runtime" {
 		t.Fatalf("inject name=%s kind=%s mode=%s", name, kind, mode)
+	}
+	// Non-product ids are legacy/ignored
+	_, _, kind, _ = ModuleDescribeEx("shell")
+	if kind != "legacy" {
+		t.Fatalf("shell should be legacy kind, got %s", kind)
 	}
 }

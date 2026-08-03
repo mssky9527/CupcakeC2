@@ -4,9 +4,7 @@ use crate::backoff::ExponentialBackoff;
 use crate::config::{get_aes_key, get_aes_key_base};
 use crate::crypto;
 use crate::error::{ClientError, Result};
-use crate::transport::session_crypto::{
-    seal_for_wire, traffic_key, FragReassembler, OpenResult,
-};
+use crate::transport::session_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -73,8 +71,16 @@ impl Transport for WebSocketTransport {
     async fn connect(&mut self) -> Result<()> {
         use tokio_tungstenite::tungstenite::http::Request;
 
+        // Bounded retries so outer fallback / backoff can run (was infinite loop).
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempts = 0u32;
+
         loop {
-            debug!("Connecting to {}...", self.url);
+            attempts += 1;
+            debug!(
+                "Connecting to {}... (attempt {}/{})",
+                self.url, attempts, MAX_ATTEMPTS
+            );
             self.noise_session_key = None;
             self.reassembler.clear();
 
@@ -82,8 +88,7 @@ impl Transport for WebSocketTransport {
                 crate::transport::profile::get_profile(&crate::config::get_profile_name());
 
             // Path/query from malleable uri_template (scheme+host from configured URL)
-            let connect_url =
-                crate::transport::profile::url_with_profile_path(&self.url, &profile);
+            let connect_url = crate::transport::profile::url_with_profile_path(&self.url, &profile);
             debug!(
                 "profile={} connect_url={} ja3_hint={}",
                 profile.name,
@@ -113,10 +118,7 @@ impl Transport for WebSocketTransport {
                         headers.insert("sec-fetch-site", v);
                     }
                     if let Some(host) = crate::config::get_host_header() {
-                        let origin = format!(
-                            "https://{}",
-                            host.split(':').next().unwrap_or(&host)
-                        );
+                        let origin = format!("https://{}", host.split(':').next().unwrap_or(&host));
                         if let Ok(v) = origin.parse() {
                             headers.insert(tokio_tungstenite::tungstenite::http::header::ORIGIN, v);
                         }
@@ -140,16 +142,13 @@ impl Transport for WebSocketTransport {
                         use tokio_tungstenite::connect_async_tls_with_config;
                         match crate::transport::tls_ja3::connector_for_ja3_hint(ja3_hint) {
                             Ok(connector) => {
-                                connect_async_tls_with_config(
-                                    req,
-                                    None,
-                                    false,
-                                    Some(connector),
-                                )
-                                .await
+                                connect_async_tls_with_config(req, None, false, Some(connector))
+                                    .await
                             }
                             Err(e) => {
-                                debug!("tls_ja3 connector failed ({e}), falling back to connect_async");
+                                debug!(
+                                    "tls_ja3 connector failed ({e}), falling back to connect_async"
+                                );
                                 connect_async(req).await
                             }
                         }
@@ -176,8 +175,15 @@ impl Transport for WebSocketTransport {
                     self.stream = Some(ws_stream);
                     self.backoff.reset();
 
-                    // Noise X25519 handshake with BASE key as PSK (server-aligned)
-                    if !self.noise_psk.is_empty() {
+                    // Noise X25519 handshake with BASE key as PSK (server-aligned).
+                    // A missing PSK is a hard failure: production never continues
+                    // without an authenticated session key.
+                    if self.noise_psk.is_empty() {
+                        return Err(ClientError::ConnectionError(
+                            "Noise PSK missing — refusing to establish unauthenticated session".into(),
+                        ));
+                    }
+                    {
                         let (ephemeral_key, handshake_msg) =
                             crypto::noise_initiate(&self.noise_psk).map_err(|e| {
                                 ClientError::ConnectionError(format!("Noise init: {e}"))
@@ -234,19 +240,25 @@ impl Transport for WebSocketTransport {
                         })?;
                         self.noise_session_key = Some(session_key);
                         info!("Noise session key established — all traffic uses session key");
-                    } else {
-                        warn_no_psk();
                     }
 
                     return Ok(());
                 }
                 Err(e) => {
+                    if attempts >= MAX_ATTEMPTS {
+                        return Err(ClientError::ConnectionError(format!(
+                            "ws connect failed after {} attempts: {}",
+                            MAX_ATTEMPTS, e
+                        )));
+                    }
                     let delay = self.backoff.next_delay();
                     debug!(
-                        "connect failed {}: {}, retry in {}s",
+                        "connect failed {}: {}, retry in {}s ({}/{})",
                         self.url,
                         e,
-                        delay.as_secs()
+                        delay.as_secs(),
+                        attempts,
+                        MAX_ATTEMPTS
                     );
                     sleep(delay).await;
                 }
@@ -328,5 +340,5 @@ impl Transport for WebSocketTransport {
 }
 
 fn warn_no_psk() {
-    log::warn!("No AES base key — Noise skipped; traffic may be cleartext/static only");
+    log::warn!("No AES base key — connection refused (production requires authenticated transport)");
 }

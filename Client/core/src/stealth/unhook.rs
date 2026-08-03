@@ -3,16 +3,16 @@
 
 #[cfg(windows)]
 pub unsafe fn unhook_ntdll() -> bool {
-    use winapi::um::libloaderapi::GetModuleHandleA;
-    use winapi::um::memoryapi::{MapViewOfFile, UnmapViewOfFile, VirtualProtect};
     use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
     use winapi::um::handleapi::CloseHandle;
-    use winapi::um::winnt::{
-        FILE_SHARE_READ, GENERIC_READ, HANDLE, IMAGE_DOS_HEADER, IMAGE_SECTION_HEADER,
-        PAGE_EXECUTE_READWRITE, SEC_IMAGE, SECTION_MAP_READ,
-    };
+    use winapi::um::libloaderapi::GetModuleHandleA;
+    use winapi::um::memoryapi::{MapViewOfFile, UnmapViewOfFile, VirtualProtect};
     use winapi::um::winbase::CreateFileMappingA;
     use winapi::um::winnt::IMAGE_NT_HEADERS64;
+    use winapi::um::winnt::{
+        FILE_SHARE_READ, GENERIC_READ, HANDLE, IMAGE_DOS_HEADER, IMAGE_SECTION_HEADER,
+        PAGE_EXECUTE_READWRITE, SECTION_MAP_READ, SEC_IMAGE,
+    };
 
     let ntdll = GetModuleHandleA(b"ntdll.dll\0".as_ptr() as *const i8);
     if ntdll.is_null() {
@@ -123,10 +123,8 @@ pub fn unhook_ntdll() -> bool {
 /// Allocate sensitive buffer with PAGE_NOACCESS guard pages (Windows).
 #[cfg(windows)]
 pub unsafe fn alloc_guarded(size: usize) -> Option<*mut u8> {
-    use winapi::um::memoryapi::{VirtualAlloc, VirtualProtect, VirtualFree};
-    use winapi::um::winnt::{
-        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
-    };
+    use winapi::um::memoryapi::{VirtualAlloc, VirtualFree, VirtualProtect};
+    use winapi::um::winnt::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
     let page = 0x1000usize;
     let total = page + ((size + page - 1) / page) * page + page;
     let base = VirtualAlloc(

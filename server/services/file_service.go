@@ -78,7 +78,9 @@ func callFsAgent(agentID string, req FsRequest) (*FsResponse, error) {
 	}
 
 	// 2. Read Response - ROBUST MODE (Read all until EOF then unmarshal)
-	stream.SetReadDeadline(time.Now().Add(15 * time.Second))
+	// 与 websocket.go 单帧读超时 120s 对齐 — 大文件 / 慢链路下 15s 根本来不及传完。
+	// list/read 都走 Yamux FS 0x03 全量读整 JSON(含 base64 整文件),必须放宽。
+	stream.SetReadDeadline(time.Now().Add(120 * time.Second))
 	
 	data, err := io.ReadAll(stream)
 	if err != nil {
@@ -173,7 +175,7 @@ func callFsAgentFallback(agentID string, req FsRequest) (*FsResponse, error) {
 		}
 
 		return &fsResp, nil
-	case <-time.After(20 * time.Second):
+	case <-time.After(120 * time.Second):
 		return nil, fmt.Errorf("agent response timeout")
 	}
 }
@@ -227,7 +229,7 @@ func DownloadChunk(agentID, path string, offset uint64, size int) (string, bool,
 			}
 		}
 		return "", false, fmt.Errorf("invalid response format")
-	case <-time.After(30 * time.Second):
+	case <-time.After(120 * time.Second):
 		return "", false, fmt.Errorf("agent chunk response timeout")
 	}
 }
@@ -264,8 +266,9 @@ func UploadChunk(agentID, path, dataBase64 string, isAppend bool) error {
 		return fmt.Errorf("send encrypted command: %w", err)
 	}
 
-	// Larger chunks / slow agents need more than 30s
-	timeout := 90 * time.Second
+	// 与 websocket.go 单帧读超时对齐，给 Yamux 拥塞和 agent 落盘 IO 留余量。
+	// 30s 过短，250 片里任一片尾部抖动即整体失败；120s 覆盖慢链路 + 高负载。
+	timeout := 120 * time.Second
 	select {
 	case res := <-resChan:
 		pMap, ok := res.(map[string]interface{})

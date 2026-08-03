@@ -48,7 +48,9 @@ pub struct Fragment {
 /// * `max_size` — maximum size of each fragment body (excluding header)
 pub fn fragment_message(plaintext: &[u8], key: &[u8], max_size: usize) -> Result<Vec<Fragment>> {
     if key.len() != 32 {
-        return Err(ClientError::ConnectionError("Invalid key length for fragmentation".into()));
+        return Err(ClientError::ConnectionError(
+            "Invalid key length for fragmentation".into(),
+        ));
     }
 
     let max_body = if max_size > FRAG_HEADER_SIZE {
@@ -76,12 +78,18 @@ pub fn fragment_message(plaintext: &[u8], key: &[u8], max_size: usize) -> Result
         offset += chunk_size;
 
         let is_last = seq == total - 1;
-        let flags = if is_last { FRAG_FLAG_LAST } else { FRAG_FLAG_MORE };
+        let flags = if is_last {
+            FRAG_FLAG_LAST
+        } else {
+            FRAG_FLAG_MORE
+        };
 
         // Encrypt the chunk
         let ciphertext = crypto::encrypt(chunk, key);
         if ciphertext.is_empty() {
-            return Err(ClientError::ConnectionError("Fragment encryption failed".into()));
+            return Err(ClientError::ConnectionError(
+                "Fragment encryption failed".into(),
+            ));
         }
 
         // Build fragment: [seq || total || flags || ciphertext]
@@ -110,7 +118,9 @@ pub fn fragment_message(plaintext: &[u8], key: &[u8], max_size: usize) -> Result
 /// * `key` — 32-byte AES-256 key
 pub fn reassemble_message(fragments: &[Vec<u8>], key: &[u8]) -> Result<Vec<u8>> {
     if key.len() != 32 {
-        return Err(ClientError::ConnectionError("Invalid key length for reassembly".into()));
+        return Err(ClientError::ConnectionError(
+            "Invalid key length for reassembly".into(),
+        ));
     }
 
     if fragments.is_empty() {
@@ -122,9 +132,11 @@ pub fn reassemble_message(fragments: &[Vec<u8>], key: &[u8]) -> Result<Vec<u8>> 
 
     for (idx, frag) in fragments.iter().enumerate() {
         if frag.len() < FRAG_HEADER_SIZE {
-            return Err(ClientError::ConnectionError(
-                format!("Fragment {} too short: {} bytes", idx, frag.len())
-            ));
+            return Err(ClientError::ConnectionError(format!(
+                "Fragment {} too short: {} bytes",
+                idx,
+                frag.len()
+            )));
         }
 
         let seq = u32::from_be_bytes([frag[0], frag[1], frag[2], frag[3]]);
@@ -133,22 +145,24 @@ pub fn reassemble_message(fragments: &[Vec<u8>], key: &[u8]) -> Result<Vec<u8>> 
         let ciphertext = &frag[FRAG_HEADER_SIZE..];
 
         if seq != expected_seq {
-            return Err(ClientError::ConnectionError(
-                format!("Fragment out of order: expected seq {}, got {}", expected_seq, seq)
-            ));
+            return Err(ClientError::ConnectionError(format!(
+                "Fragment out of order: expected seq {}, got {}",
+                expected_seq, seq
+            )));
         }
 
         if total as usize != fragments.len() {
-            return Err(ClientError::ConnectionError(
-                format!("Fragment count mismatch: expected {}, got {}", total, fragments.len())
-            ));
+            return Err(ClientError::ConnectionError(format!(
+                "Fragment count mismatch: expected {}, got {}",
+                total,
+                fragments.len()
+            )));
         }
 
         // Decrypt this fragment's ciphertext
-        let decrypted = crypto::decrypt(ciphertext, key)
-            .map_err(|e| ClientError::ConnectionError(
-                format!("Fragment {} decryption failed: {}", seq, e)
-            ))?;
+        let decrypted = crypto::decrypt(ciphertext, key).map_err(|e| {
+            ClientError::ConnectionError(format!("Fragment {} decryption failed: {}", seq, e))
+        })?;
 
         plaintext.extend_from_slice(&decrypted);
         expected_seq += 1;
@@ -202,11 +216,17 @@ impl<'a> Fragmenter<'a> {
         self.offset += chunk_size;
 
         let is_last = self.seq == self.total - 1;
-        let flags = if is_last { FRAG_FLAG_LAST } else { FRAG_FLAG_MORE };
+        let flags = if is_last {
+            FRAG_FLAG_LAST
+        } else {
+            FRAG_FLAG_MORE
+        };
 
         let ciphertext = crypto::encrypt(chunk, self.key);
         if ciphertext.is_empty() {
-            return Err(ClientError::ConnectionError("Fragment encryption failed".into()));
+            return Err(ClientError::ConnectionError(
+                "Fragment encryption failed".into(),
+            ));
         }
 
         let mut data = Vec::with_capacity(FRAG_HEADER_SIZE + ciphertext.len());
@@ -237,13 +257,16 @@ mod tests {
     fn test_fragment_roundtrip() {
         let key = b"01234567890123456789012345678901";
         let plaintext = b"Hello, this is a test message that might need fragmentation if it's very long. Let's make it long enough to split into multiple fragments. We need at least a few kilobytes to trigger fragmentation, so let's repeat this text a few more times. Here is some more text to pad out the message. More padding. More padding. More padding.";
-        
+
         let fragments = fragment_message(plaintext, key, 128).unwrap();
-        assert!(fragments.len() > 1, "Should have split into multiple fragments");
-        
+        assert!(
+            fragments.len() > 1,
+            "Should have split into multiple fragments"
+        );
+
         // Collect raw fragment data
         let raw_frags: Vec<Vec<u8>> = fragments.iter().map(|f| f.data.clone()).collect();
-        
+
         let reassembled = reassemble_message(&raw_frags, key).unwrap();
         assert_eq!(&reassembled[..], plaintext);
     }
@@ -252,10 +275,10 @@ mod tests {
     fn test_single_fragment() {
         let key = b"01234567890123456789012345678901";
         let plaintext = b"Short message";
-        
+
         let fragments = fragment_message(plaintext, key, 4096).unwrap();
         assert_eq!(fragments.len(), 1);
-        
+
         let raw_frags: Vec<Vec<u8>> = fragments.iter().map(|f| f.data.clone()).collect();
         let reassembled = reassemble_message(&raw_frags, key).unwrap();
         assert_eq!(&reassembled[..], plaintext);
@@ -266,14 +289,14 @@ mod tests {
         let key = b"01234567890123456789012345678901";
         // Make plaintext larger than max_body to ensure multiple fragments
         let plaintext: Vec<u8> = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ".repeat(10);
-        
+
         let mut fragmenter = Fragmenter::new(&plaintext, key, 64);
         let mut all_data = Vec::new();
-        
+
         while let Some(frag) = fragmenter.next().unwrap() {
             all_data.push(frag.data);
         }
-        
+
         assert!(all_data.len() > 1);
         let reassembled = reassemble_message(&all_data, key).unwrap();
         assert_eq!(&reassembled[..], plaintext);

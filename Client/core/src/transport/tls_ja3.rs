@@ -6,7 +6,7 @@
 
 use crate::error::{ClientError, Result};
 use log::debug;
-use rustls::crypto::{CryptoProvider, ring as provider_ring};
+use rustls::crypto::{ring as provider_ring, CryptoProvider};
 use rustls::ClientConfig;
 use std::sync::Arc;
 use tokio_tungstenite::Connector;
@@ -20,9 +20,8 @@ pub fn connector_for_ja3_hint(ja3_hint: &str) -> Result<Connector> {
 
 fn client_config_for_hint(ja3_hint: &str) -> Result<Arc<ClientConfig>> {
     let mut root_store = rustls::RootCertStore::empty();
-    let certs = rustls_native_certs::load_native_certs().map_err(|e| {
-        ClientError::ConnectionError(format!("load native roots: {e}"))
-    })?;
+    let certs = rustls_native_certs::load_native_certs()
+        .map_err(|e| ClientError::ConnectionError(format!("load native roots: {e}")))?;
     for c in certs {
         let _ = root_store.add(c);
     }

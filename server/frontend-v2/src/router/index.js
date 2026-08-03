@@ -23,7 +23,7 @@ const routes = [
         path: 'listeners',
         name: 'Listeners',
         component: () => import('../views/ListenerManager.vue'),
-        meta: { title: 'Listeners' }
+        meta: { title: 'Listeners', requiresAdmin: true }
       },
       {
         path: 'tunnels',
@@ -35,7 +35,7 @@ const routes = [
         path: 'generator',
         name: 'Generator',
         component: () => import('../views/PayloadGenerator.vue'),
-        meta: { title: 'Generator' }
+        meta: { title: 'Generator', requiresAdmin: true }
       },
       {
         path: 'modules',
@@ -53,7 +53,7 @@ const routes = [
         path: 'settings',
         name: 'Settings',
         component: () => import('../views/Settings.vue'),
-        meta: { title: 'Settings' }
+        meta: { title: 'Settings', requiresAdmin: true }
       },
       {
         path: 'client/:id',
@@ -121,15 +121,34 @@ const router = createRouter({
   routes
 })
 
+function currentRole() {
+  try {
+    const u = JSON.parse(localStorage.getItem('cupcake_user') || '{}')
+    return (u.role || 'operator').toLowerCase()
+  } catch {
+    return 'operator'
+  }
+}
+
+function isAdminRole(role) {
+  return role === 'admin' || role === 'administrator'
+}
+
 router.beforeEach((to, from, next) => {
   const token = localStorage.getItem('cupcake_token')
   if (to.name !== 'Login' && !token) {
     next({ name: 'Login' })
-  } else if (to.name === 'Login' && token) {
-    next({ name: 'Dashboard' })
-  } else {
-    next()
+    return
   }
+  if (to.name === 'Login' && token) {
+    next({ name: 'Dashboard' })
+    return
+  }
+  if (to.matched.some((r) => r.meta?.requiresAdmin) && !isAdminRole(currentRole())) {
+    next({ name: 'Dashboard' })
+    return
+  }
+  next()
 })
 
 export default router

@@ -12,8 +12,8 @@ type Listener struct {
 	PublicHost        string    `json:"public_host"`
 	Note              string    `json:"note"`
 	EncryptMode       string    `json:"encrypt_mode"`
-	EncryptKey        string    `json:"encrypt_key"`
-	EncryptionSalt    string    `json:"encryption_salt"`
+	EncryptKey        string    `json:"-"`
+	EncryptionSalt    string    `json:"-"`
 	ObfuscateMode     string    `json:"obfuscate_mode"`
 	CustomPath        string    `json:"custom_path"`
 	// Profile: malleable profile name (gmail|outlook|aws|github|default). Empty = no check.
@@ -32,7 +32,7 @@ type Listener struct {
 	// 🔒 TLS Configuration (Phase 1 - Secure WebSocket)
 	EnableTLS       bool   `json:"enable_tls" gorm:"default:false"`           // Enable wss:// protocol
 	TLSCertPath     string `json:"tls_cert_path"`                             // Path to TLS certificate file
-	TLSKeyPath      string `json:"tls_key_path"`                              // Path to TLS private key file
-	TLSCertPEM      string `json:"tls_cert_pem"`                              // Inline PEM certificate (optional)
-	TLSKeyPEM       string `json:"tls_key_pem"`                               // Inline PEM private key (optional)
+	TLSKeyPath      string `json:"-"`                                         // Path to TLS private key file
+	TLSCertPEM      string `json:"-"`                                         // Inline PEM certificate (optional)
+	TLSKeyPEM       string `json:"-"`                                          // Inline PEM private key (optional)
 }

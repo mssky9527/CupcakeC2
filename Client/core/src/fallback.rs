@@ -6,16 +6,16 @@
 //
 // This prevents total loss of agent when network conditions change.
 
+use crate::config::get_server_url;
 use crate::error::{ClientError, Result};
 use crate::transport::Transport;
-use crate::config::get_server_url;
 use log::{debug, info, warn};
 
 /// Fallback channel state
 #[derive(Debug, Clone, PartialEq)]
 pub enum FallbackState {
-    Primary,        // Using primary channel (ws/wss/tcp)
-    DnsBackup,      // Using DNS tunnel as backup
+    Primary,         // Using primary channel (ws/wss/tcp)
+    DnsBackup,       // Using DNS tunnel as backup
     WaitingRecovery, // Waiting to reconnect to primary
 }
 
@@ -99,12 +99,14 @@ impl FallbackManager {
 
     /// Attempt to recover primary channel
     pub fn attempt_recovery(&mut self) -> Option<String> {
-        if self.state == FallbackState::WaitingRecovery ||
-           self.state == FallbackState::DnsBackup {
+        if self.state == FallbackState::WaitingRecovery || self.state == FallbackState::DnsBackup {
             self.recovery_attempts += 1;
 
             if self.recovery_attempts <= self.max_recovery_attempts {
-                info!("[Cupcake] Recovery attempt {} of {}", self.recovery_attempts, self.max_recovery_attempts);
+                info!(
+                    "[Cupcake] Recovery attempt {} of {}",
+                    self.recovery_attempts, self.max_recovery_attempts
+                );
                 Some(self.primary_url.clone())
             } else {
                 warn!("[Cupcake] Max recovery attempts reached, staying on backup");
@@ -133,8 +135,7 @@ impl FallbackManager {
 
     /// Check if we should attempt recovery
     pub fn should_attempt_recovery(&self) -> bool {
-        self.state != FallbackState::Primary &&
-        self.recovery_attempts < self.max_recovery_attempts
+        self.state != FallbackState::Primary && self.recovery_attempts < self.max_recovery_attempts
     }
 }
 
@@ -158,7 +159,7 @@ pub fn try_icmp_fallback(target: &str, data: &[u8]) -> Result<Vec<u8>> {
 
     // For now, return error indicating this needs implementation
     Err(ClientError::ConnectionError(
-        "ICMP fallback not implemented (requires raw socket access)".to_string()
+        "ICMP fallback not implemented (requires raw socket access)".to_string(),
     ))
 }
 
@@ -170,11 +171,13 @@ pub fn try_icmp_fallback(_target: &str, _data: &[u8]) -> Result<Vec<u8>> {
     // 3. Response parsing
 
     Err(ClientError::ConnectionError(
-        "ICMP fallback not implemented".to_string()
+        "ICMP fallback not implemented".to_string(),
     ))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
 pub fn try_icmp_fallback(_target: &str, _data: &[u8]) -> Result<Vec<u8>> {
-    Err(ClientError::ConnectionError("Platform not supported".to_string()))
+    Err(ClientError::ConnectionError(
+        "Platform not supported".to_string(),
+    ))
 }

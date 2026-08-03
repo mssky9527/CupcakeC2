@@ -3,9 +3,9 @@
 // 实现完整的 Cobalt Strike Beacon API，用于 BOF 插件调用
 // 参考: https://hstechdocs.helpsystems.com/manuals/cobaltstrike/current/userguide/content/topics/beacon-object-files_main.htm
 
+use log::warn;
 use std::cell::RefCell;
 use std::ffi::CStr;
-use log::warn;
 
 thread_local! {
     /// BOF 输出缓冲区
@@ -45,10 +45,7 @@ impl BeaconDataParser {
         }
 
         unsafe {
-            let value = i16::from_be_bytes([
-                *self.buffer,
-                *self.buffer.add(1),
-            ]);
+            let value = i16::from_be_bytes([*self.buffer, *self.buffer.add(1)]);
             self.buffer = self.buffer.add(2);
             self.length -= 2;
             value
@@ -107,7 +104,7 @@ impl BeaconDataParser {
         }
     }
 
-    /// 提取指定长度的字节数组
+    /// 提取指定长度的字节数组（length 为**输入**长度）
     pub fn extract_bytes(&mut self, length: i32) -> *const u8 {
         if length <= 0 || self.length < length {
             warn!("[!] BeaconDataParser: Invalid bytes length");
@@ -120,6 +117,26 @@ impl BeaconDataParser {
             self.length -= length;
             bytes_ptr
         }
+    }
+
+    /// CS-compatible extract: read 4-byte BE length, then that many bytes.
+    /// Writes the length into `out_size` when non-null (CS `BeaconDataExtract` contract).
+    pub fn extract_data(&mut self, out_size: *mut i32) -> *const u8 {
+        let length = self.extract_int();
+        if length <= 0 {
+            if !out_size.is_null() {
+                unsafe {
+                    *out_size = 0;
+                }
+            }
+            return std::ptr::null();
+        }
+        if !out_size.is_null() {
+            unsafe {
+                *out_size = length;
+            }
+        }
+        self.extract_bytes(length)
     }
 
     /// 获取剩余数据长度
@@ -145,8 +162,8 @@ impl BeaconFormatBuffer {
     /// 创建新的格式化缓冲区
     pub fn new(max_size: i32) -> Self {
         #[cfg(target_os = "windows")]
-        let buffer = crate::native::nt_alloc_rw(max_size as usize, true)
-            .unwrap_or(std::ptr::null_mut());
+        let buffer =
+            crate::native::nt_alloc_rw(max_size as usize, true).unwrap_or(std::ptr::null_mut());
 
         #[cfg(not(target_os = "windows"))]
         let buffer = unsafe {
@@ -194,7 +211,7 @@ impl BeaconFormatBuffer {
         }
     }
 
-    /// 追加一个字符串 (带长度前缀)
+    /// 追加一个字符串 (带长度前缀) — used by Data packing helpers
     pub fn append_string(&mut self, str_ptr: *const u8, length: i32) {
         if self.length + 4 + length > self.size {
             warn!("[!] BeaconFormatBuffer: Buffer overflow");
@@ -205,6 +222,22 @@ impl BeaconFormatBuffer {
 
         unsafe {
             std::ptr::copy_nonoverlapping(str_ptr, self.buffer, length as usize);
+            self.buffer = self.buffer.add(length as usize);
+            self.length += length;
+        }
+    }
+
+    /// CS `BeaconFormatAppend`: raw byte append **without** length prefix.
+    pub fn append_raw(&mut self, data: *const u8, length: i32) {
+        if length <= 0 || data.is_null() {
+            return;
+        }
+        if self.length + length > self.size {
+            warn!("[!] BeaconFormatBuffer: Buffer overflow");
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data, self.buffer, length as usize);
             self.buffer = self.buffer.add(length as usize);
             self.length += length;
         }
@@ -295,16 +328,15 @@ pub extern "C" fn BeaconDataLength(parser: *mut BeaconDataParser) -> i32 {
     unsafe { (*parser).length() }
 }
 
-/// BeaconDataExtract - 提取指定长度的字节
+/// BeaconDataExtract — CS contract: `char *BeaconDataExtract(datap *parser, int *size)`
+/// Reads a 4-byte big-endian length from the buffer, then that many bytes, and writes
+/// the length into `*size` when non-null.
 #[no_mangle]
-pub extern "C" fn BeaconDataExtract(parser: *mut BeaconDataParser, length: *mut i32) -> *const u8 {
-    if parser.is_null() || length.is_null() {
+pub extern "C" fn BeaconDataExtract(parser: *mut BeaconDataParser, size: *mut i32) -> *const u8 {
+    if parser.is_null() {
         return std::ptr::null();
     }
-    unsafe {
-        let len = *length;
-        (*parser).extract_bytes(len)
-    }
+    unsafe { (*parser).extract_data(size) }
 }
 
 /// BeaconFormatAlloc - 分配格式化缓冲区
@@ -343,34 +375,43 @@ pub extern "C" fn BeaconFormatFree(format: *mut BeaconFormatBuffer) {
     }
 }
 
-/// BeaconFormatAppend - 追加数据到格式化缓冲区
+/// BeaconFormatAppend - raw append (CS: no length prefix)
 #[no_mangle]
-pub extern "C" fn BeaconFormatAppend(format: *mut BeaconFormatBuffer, data: *const u8, length: i32) {
+pub extern "C" fn BeaconFormatAppend(
+    format: *mut BeaconFormatBuffer,
+    data: *const u8,
+    length: i32,
+) {
     if format.is_null() || data.is_null() {
         return;
     }
     unsafe {
-        (*format).append_string(data, length);
+        (*format).append_raw(data, length);
     }
 }
 
-/// BeaconFormatPrintf - 格式化打印到缓冲区
-/// 注意: Rust 不支持真正的可变参数，这是一个简化实现
+/// BeaconFormatPrintf — mini printf with up to 8 fixed trailing args (stable ABI).
+/// Supports %s %d %i %u %x %X %p %c %% (enough for most BOFs).
 #[no_mangle]
-pub extern "C" fn BeaconFormatPrintf(format: *mut BeaconFormatBuffer, fmt: *const i8) {
+pub unsafe extern "C" fn BeaconFormatPrintf(
+    format: *mut BeaconFormatBuffer,
+    fmt: *const i8,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+) {
     if format.is_null() || fmt.is_null() {
         return;
     }
-
-    // 简化实现：直接将格式字符串作为普通字符串追加
-    // 完整实现需要处理可变参数
-    unsafe {
-        let c_str = CStr::from_ptr(fmt);
-        if let Ok(s) = c_str.to_str() {
-            let bytes = s.as_bytes();
-            (*format).append_string(bytes.as_ptr(), bytes.len() as i32);
-        }
-    }
+    let args = [a1, a2, a3, a4, a5, a6, a7, a8];
+    let rendered = mini_printf(fmt, &args);
+    let bytes = rendered.as_bytes();
+    (*format).append_raw(bytes.as_ptr(), bytes.len() as i32);
 }
 
 /// BeaconFormatToString - 获取格式化缓冲区内容
@@ -398,22 +439,112 @@ pub extern "C" fn BeaconFormatInt(format: *mut BeaconFormatBuffer, value: i32) {
     }
 }
 
-/// BeaconPrintf - 打印输出 (支持格式化)
-/// 注意: Rust 不支持真正的可变参数，这是一个简化实现
+/// BeaconPrintf — mini printf with up to 8 fixed trailing args (stable ABI, no nightly c_variadic).
+/// Windows x64 / SysV: extra args after `fmt` land in the next registers/stack slots we capture.
 #[no_mangle]
-pub extern "C" fn BeaconPrintf(_typ: i32, fmt: *const i8) {
+pub unsafe extern "C" fn BeaconPrintf(
+    _typ: i32,
+    fmt: *const i8,
+    a1: usize,
+    a2: usize,
+    a3: usize,
+    a4: usize,
+    a5: usize,
+    a6: usize,
+    a7: usize,
+    a8: usize,
+) {
     if fmt.is_null() {
         return;
     }
+    let args = [a1, a2, a3, a4, a5, a6, a7, a8];
+    let msg = mini_printf(fmt, &args);
+    BOF_OUTPUT.with(|o| {
+        o.borrow_mut().push_str(&msg);
+    });
+}
 
-    unsafe {
-        let c_str = CStr::from_ptr(fmt);
-        if let Ok(msg) = c_str.to_str() {
-            BOF_OUTPUT.with(|o| {
-                o.borrow_mut().push_str(msg);
-            });
+/// Minimal printf for BOF output. `args` consumed left-to-right for each conversion.
+fn mini_printf(fmt: *const i8, args: &[usize]) -> String {
+    let c_str = unsafe { CStr::from_ptr(fmt) };
+    let s = match c_str.to_str() {
+        Ok(s) => s,
+        Err(_) => return String::from_utf8_lossy(c_str.to_bytes()).into_owned(),
+    };
+    let mut out = String::with_capacity(s.len() + 32);
+    let mut ai = 0usize;
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'%' {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= b.len() {
+            out.push('%');
+            break;
+        }
+        // skip simple flags/width: -+ #0 and digits
+        while i < b.len() && matches!(b[i], b'-' | b'+' | b'#' | b' ' | b'0'..=b'9') {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        let spec = b[i] as char;
+        i += 1;
+        match spec {
+            '%' => out.push('%'),
+            's' => {
+                let p = args.get(ai).copied().unwrap_or(0);
+                ai += 1;
+                if p == 0 {
+                    out.push_str("(null)");
+                } else {
+                    let cs = unsafe { CStr::from_ptr(p as *const i8) };
+                    out.push_str(&cs.to_string_lossy());
+                }
+            }
+            'c' => {
+                let v = args.get(ai).copied().unwrap_or(0) as u8 as char;
+                ai += 1;
+                out.push(v);
+            }
+            'd' | 'i' => {
+                let v = args.get(ai).copied().unwrap_or(0) as i32;
+                ai += 1;
+                out.push_str(&v.to_string());
+            }
+            'u' => {
+                let v = args.get(ai).copied().unwrap_or(0) as u32;
+                ai += 1;
+                out.push_str(&v.to_string());
+            }
+            'x' => {
+                let v = args.get(ai).copied().unwrap_or(0) as u32;
+                ai += 1;
+                out.push_str(&format!("{:x}", v));
+            }
+            'X' => {
+                let v = args.get(ai).copied().unwrap_or(0) as u32;
+                ai += 1;
+                out.push_str(&format!("{:X}", v));
+            }
+            'p' => {
+                let v = args.get(ai).copied().unwrap_or(0);
+                ai += 1;
+                out.push_str(&format!("0x{:X}", v));
+            }
+            other => {
+                // unknown: keep literal
+                out.push('%');
+                out.push(other);
+            }
         }
     }
+    out
 }
 
 /// BeaconOutput - 输出原始数据
@@ -443,12 +574,13 @@ pub fn clear_bof_output() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn test_data_parser() {
         let data: Vec<u8> = vec![
             0x00, 0x00, 0x00, 0x0A, // int: 10
-            0x00, 0x05,             // short: 5
+            0x00, 0x05, // short: 5
         ];
 
         let mut parser = BeaconDataParser::new(data.as_ptr(), data.len() as i32);
@@ -456,6 +588,41 @@ mod tests {
         assert_eq!(parser.extract_int(), 10);
         assert_eq!(parser.extract_short(), 5);
         assert_eq!(parser.length(), 0);
+    }
+
+    #[test]
+    fn test_beacon_data_extract_reads_length_prefix() {
+        // len=4 BE + "abcd"
+        let data: Vec<u8> = vec![0x00, 0x00, 0x00, 0x04, b'a', b'b', b'c', b'd'];
+        let mut parser = BeaconDataParser::new(data.as_ptr(), data.len() as i32);
+        let mut size = -1i32;
+        let p = parser.extract_data(&mut size);
+        assert_eq!(size, 4);
+        assert!(!p.is_null());
+        let got = unsafe { std::slice::from_raw_parts(p, 4) };
+        assert_eq!(got, b"abcd");
+    }
+
+    #[test]
+    fn test_mini_printf_percent_s_and_d() {
+        let hello = CString::new("hello").unwrap();
+        let fmt = CString::new("msg=%s n=%d").unwrap();
+        let out = mini_printf(
+            fmt.as_ptr(),
+            &[hello.as_ptr() as usize, 42usize, 0, 0, 0, 0, 0, 0],
+        );
+        assert_eq!(out, "msg=hello n=42");
+    }
+
+    #[test]
+    fn test_format_append_is_raw_no_length_prefix() {
+        let mut fmt = BeaconFormatBuffer::new(64);
+        let data = b"xy";
+        fmt.append_raw(data.as_ptr(), 2);
+        assert_eq!(fmt.get_length(), 2);
+        let buf = unsafe { std::slice::from_raw_parts(fmt.get_buffer(), 2) };
+        assert_eq!(buf, b"xy");
+        fmt.free();
     }
 
     #[test]

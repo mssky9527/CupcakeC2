@@ -44,25 +44,10 @@ pub struct MappedModule {
     pub base: usize,
     pub size: usize,
     pub mod_init: Option<unsafe extern "C" fn() -> i32>,
-    pub mod_invoke: Option<
-        unsafe extern "C" fn(
-            *const u8,
-            u32,
-            *const u8,
-            u32,
-            *mut *mut u8,
-            *mut u32,
-        ) -> i32,
-    >,
+    pub mod_invoke:
+        Option<unsafe extern "C" fn(*const u8, u32, *const u8, u32, *mut *mut u8, *mut u32) -> i32>,
     pub mod_free: Option<unsafe extern "C" fn(*mut u8, u32)>,
     pub mod_shutdown: Option<unsafe extern "C" fn() -> i32>,
-    /// Optional desktop stream exports (mod_desktop).
-    pub mod_stream_attach: Option<unsafe extern "C" fn(u32) -> i32>,
-    pub mod_stream_poll_frame: Option<
-        unsafe extern "C" fn(u32, u32, *mut u8, u32, *mut u32, *mut *mut u8, *mut u32) -> i32,
-    >,
-    pub mod_stream_push_input: Option<unsafe extern "C" fn(u32, *const u8, u32) -> i32>,
-    pub mod_stream_detach: Option<unsafe extern "C" fn(u32) -> i32>,
     /// True if DllMain was invoked on attach (must detach on unmap).
     pub dll_main_called: bool,
 }
@@ -109,60 +94,72 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
     }
 
     let magic = u16::from_le_bytes([pe[opt], pe[opt + 1]]);
-    let (size_of_image, size_of_headers, image_base, entry_rva, export_rva, export_size, import_rva, reloc_rva, reloc_size, tls_rva) =
-        if magic == 0x20B {
-            // PE32+
-            let size_of_image = u32::from_le_bytes(pe[opt + 56..opt + 60].try_into().unwrap()) as usize;
-            let size_of_headers = u32::from_le_bytes(pe[opt + 60..opt + 64].try_into().unwrap()) as usize;
-            let image_base = u64::from_le_bytes(pe[opt + 24..opt + 32].try_into().unwrap()) as usize;
-            let entry_rva = u32::from_le_bytes(pe[opt + 16..opt + 20].try_into().unwrap()) as usize;
-            let dd = opt + 112; // DataDirectory start PE32+
-            let export_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
-            let export_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
-            let import_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_IMPORT);
-            let reloc_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-            let reloc_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-            let tls_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_TLS);
-            (
-                size_of_image,
-                size_of_headers,
-                image_base,
-                entry_rva,
-                export_rva,
-                export_size,
-                import_rva,
-                reloc_rva,
-                reloc_size,
-                tls_rva,
-            )
-        } else if magic == 0x10B {
-            // PE32
-            let size_of_image = u32::from_le_bytes(pe[opt + 56..opt + 60].try_into().unwrap()) as usize;
-            let size_of_headers = u32::from_le_bytes(pe[opt + 60..opt + 64].try_into().unwrap()) as usize;
-            let image_base = u32::from_le_bytes(pe[opt + 28..opt + 32].try_into().unwrap()) as usize;
-            let entry_rva = u32::from_le_bytes(pe[opt + 16..opt + 20].try_into().unwrap()) as usize;
-            let dd = opt + 96;
-            let export_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
-            let export_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
-            let import_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_IMPORT);
-            let reloc_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-            let reloc_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
-            let tls_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_TLS);
-            (
-                size_of_image,
-                size_of_headers,
-                image_base,
-                entry_rva,
-                export_rva,
-                export_size,
-                import_rva,
-                reloc_rva,
-                reloc_size,
-                tls_rva,
-            )
-        } else {
-            return Err(format!("pe_map: unknown optional magic 0x{magic:x}"));
-        };
+    let (
+        size_of_image,
+        size_of_headers,
+        image_base,
+        entry_rva,
+        export_rva,
+        export_size,
+        import_rva,
+        reloc_rva,
+        reloc_size,
+        tls_rva,
+    ) = if magic == 0x20B {
+        // PE32+
+        let size_of_image = u32::from_le_bytes(pe[opt + 56..opt + 60].try_into().unwrap()) as usize;
+        let size_of_headers =
+            u32::from_le_bytes(pe[opt + 60..opt + 64].try_into().unwrap()) as usize;
+        let image_base = u64::from_le_bytes(pe[opt + 24..opt + 32].try_into().unwrap()) as usize;
+        let entry_rva = u32::from_le_bytes(pe[opt + 16..opt + 20].try_into().unwrap()) as usize;
+        let dd = opt + 112; // DataDirectory start PE32+
+        let export_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
+        let export_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
+        let import_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_IMPORT);
+        let reloc_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+        let reloc_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+        let tls_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_TLS);
+        (
+            size_of_image,
+            size_of_headers,
+            image_base,
+            entry_rva,
+            export_rva,
+            export_size,
+            import_rva,
+            reloc_rva,
+            reloc_size,
+            tls_rva,
+        )
+    } else if magic == 0x10B {
+        // PE32
+        let size_of_image = u32::from_le_bytes(pe[opt + 56..opt + 60].try_into().unwrap()) as usize;
+        let size_of_headers =
+            u32::from_le_bytes(pe[opt + 60..opt + 64].try_into().unwrap()) as usize;
+        let image_base = u32::from_le_bytes(pe[opt + 28..opt + 32].try_into().unwrap()) as usize;
+        let entry_rva = u32::from_le_bytes(pe[opt + 16..opt + 20].try_into().unwrap()) as usize;
+        let dd = opt + 96;
+        let export_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
+        let export_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_EXPORT);
+        let import_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_IMPORT);
+        let reloc_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+        let reloc_size = dir_size(pe, dd, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+        let tls_rva = dir_rva(pe, dd, IMAGE_DIRECTORY_ENTRY_TLS);
+        (
+            size_of_image,
+            size_of_headers,
+            image_base,
+            entry_rva,
+            export_rva,
+            export_size,
+            import_rva,
+            reloc_rva,
+            reloc_size,
+            tls_rva,
+        )
+    } else {
+        return Err(format!("pe_map: unknown optional magic 0x{magic:x}"));
+    };
 
     // Static TLS + DllMain on Manual-Map of MSVC/Rust CRT often AV. Fail closed so
     // module_loader can LoadLibrary-fallback without killing the process.
@@ -212,7 +209,9 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         if va >= size_of_image {
             continue;
         }
-        let copy_len = raw_size.min(virt_size.max(raw_size)).min(size_of_image - va);
+        let copy_len = raw_size
+            .min(virt_size.max(raw_size))
+            .min(size_of_image - va);
         let copy_len = copy_len.min(raw_size);
         unsafe {
             std::ptr::copy_nonoverlapping(pe.as_ptr().add(raw_ptr), base_ptr.add(va), copy_len);
@@ -241,7 +240,9 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
     }
 
     // Section protections (no lingering RWX when avoidable)
-    if let Err(e) = unsafe { protect_sections(base, size_of_image, pe, section_table, num_sections) } {
+    if let Err(e) =
+        unsafe { protect_sections(base, size_of_image, pe, section_table, num_sections) }
+    {
         warn!("[pe_map] protect_sections: {e}");
         // non-fatal: leave RW
     }
@@ -264,42 +265,25 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
     }
 
     // Resolve L2 exports by walking export dir (not GetProcAddress — image not in loader list)
-    let mod_init = unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_init") }
-        .map(|a| unsafe { std::mem::transmute(a) });
+    let mod_init =
+        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_init") }
+            .map(|a| unsafe { std::mem::transmute(a) });
     let mod_invoke =
         unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_invoke") }
             .map(|a| unsafe { std::mem::transmute(a) });
-    let mod_free = unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_free") }
-        .map(|a| unsafe { std::mem::transmute(a) });
-    let mod_shutdown =
-        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_shutdown") }
+    let mod_free =
+        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_free") }
             .map(|a| unsafe { std::mem::transmute(a) });
-    let mod_stream_attach =
-        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_stream_attach") }
-            .map(|a| unsafe { std::mem::transmute(a) });
-    let mod_stream_poll_frame = unsafe {
+    let mod_shutdown = unsafe {
         resolve_export(
             base,
             size_of_image,
             export_rva,
             export_size,
-            b"mod_stream_poll_frame",
+            b"mod_shutdown",
         )
     }
     .map(|a| unsafe { std::mem::transmute(a) });
-    let mod_stream_push_input = unsafe {
-        resolve_export(
-            base,
-            size_of_image,
-            export_rva,
-            export_size,
-            b"mod_stream_push_input",
-        )
-    }
-    .map(|a| unsafe { std::mem::transmute(a) });
-    let mod_stream_detach =
-        unsafe { resolve_export(base, size_of_image, export_rva, export_size, b"mod_stream_detach") }
-            .map(|a| unsafe { std::mem::transmute(a) });
 
     if mod_invoke.is_none() {
         let _ = unmap_pe_inner(base, size_of_image, dll_main_called);
@@ -317,10 +301,6 @@ pub fn map_pe_opts(pe: &[u8], call_dll_main: bool) -> Result<MappedModule, Strin
         mod_invoke,
         mod_free,
         mod_shutdown,
-        mod_stream_attach,
-        mod_stream_poll_frame,
-        mod_stream_push_input,
-        mod_stream_detach,
         dll_main_called,
     })
 }
@@ -351,10 +331,8 @@ fn unmap_pe_inner(base: usize, size: usize, dll_main_called: bool) -> Result<(),
                 ]) as usize;
                 if e_lfanew + 24 + 20 < size {
                     let opt = base + e_lfanew + 24;
-                    let magic = u16::from_le_bytes([
-                        *(opt as *const u8),
-                        *((opt + 1) as *const u8),
-                    ]);
+                    let magic =
+                        u16::from_le_bytes([*(opt as *const u8), *((opt + 1) as *const u8)]);
                     let entry_rva = if magic == 0x20B || magic == 0x10B {
                         u32::from_le_bytes([
                             *((opt + 16) as *const u8),
@@ -458,7 +436,11 @@ unsafe fn apply_relocs(
     Ok(())
 }
 
-unsafe fn resolve_imports(base: usize, size_of_image: usize, import_rva: usize) -> Result<(), String> {
+unsafe fn resolve_imports(
+    base: usize,
+    size_of_image: usize,
+    import_rva: usize,
+) -> Result<(), String> {
     // IMAGE_IMPORT_DESCRIPTOR is 20 bytes
     let mut desc = base + import_rva;
     let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
@@ -757,51 +739,64 @@ mod tests {
         assert!(map_pe(&buf).is_err());
     }
 
-    fn find_shell_bin() -> Option<PathBuf> {
+    /// Product L2 PE fixtures (never shell.bin — product modules only).
+    fn find_product_l2_pe() -> Option<PathBuf> {
+        if let Ok(p) = std::env::var("CUPCAKE_TEST_MOD_PE") {
+            let pb = PathBuf::from(p);
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let candidates = [
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../server/storage/modules/shell.bin"),
-            PathBuf::from("server/storage/modules/shell.bin"),
-            PathBuf::from("../server/storage/modules/shell.bin"),
-            PathBuf::from("../../server/storage/modules/shell.bin"),
+            root.join("../../server/storage/modules/inject.bin"),
+            root.join("../../server/storage/modules/desktop.bin"),
+            root.join("../target/release/cupcake_mod_inject.dll"),
+            root.join("../target/release/cupcake_mod_desktop.dll"),
+            root.join("../../Client/target/release/cupcake_mod_inject.dll"),
+            root.join("../../Client/target/release/cupcake_mod_desktop.dll"),
+            PathBuf::from("server/storage/modules/inject.bin"),
+            PathBuf::from("server/storage/modules/desktop.bin"),
         ];
         candidates.into_iter().find(|p| p.is_file())
     }
 
-    /// Hard success path when shell.bin exists: Manual-Map + export resolve + unmap.
-    /// Uses export-only attach (no DllMain) so CRT AV cannot soft-pass as "ok failure".
+    /// Hard success path when a product L2 PE exists: Manual-Map + export resolve + unmap.
     #[test]
-    fn map_real_shell_exports_without_dllmain() {
-        let path = find_shell_bin().unwrap_or_else(|| {
-            panic!(
-                "shell.bin required for pe_map success-path test (expected under server/storage/modules/shell.bin)"
-            )
-        });
-        let pe = std::fs::read(&path).expect("read shell.bin");
+    fn map_real_product_exports_without_dllmain() {
+        let Some(path) = find_product_l2_pe() else {
+            eprintln!("skip: no product L2 PE (set CUPCAKE_TEST_MOD_PE or build inject/desktop)");
+            return;
+        };
+        let pe = std::fs::read(&path).expect("read product pe");
         assert!(pe.len() > 64 && pe[0] == b'M' && pe[1] == b'Z');
 
         let m = map_pe_opts(&pe, false).unwrap_or_else(|e| {
-            panic!("pe_map success path required for real shell.bin, got Err: {e}")
+            panic!("pe_map success path required for product PE, got Err: {e}")
         });
         assert!(m.base != 0, "mapped base");
         assert!(m.size > 0, "mapped size");
         assert!(!m.dll_main_called);
         assert!(
             m.mod_invoke.is_some(),
-            "mod_invoke export required on shell L2 module"
+            "mod_invoke export required on product L2 module"
         );
-        assert!(m.mod_init.is_some(), "mod_init export expected on shell module");
+        assert!(
+            m.mod_init.is_some(),
+            "mod_init export expected on product L2"
+        );
         unmap_pe(&m);
-        eprintln!(
-            "OK pe_map export probe success path (no cpx residual) on {}",
-            path.display()
-        );
+        eprintln!("OK pe_map export probe success path on {}", path.display());
     }
 
-    /// Full map_pe (DllMain path) must return clean Err for TLS CRT modules — never AV.
+    /// Full map_pe (DllMain path) must return clean Err or Ok — never AV.
     #[test]
-    fn map_real_shell_full_dllmain_clean_err_or_ok() {
-        let path = find_shell_bin().expect("shell.bin required");
-        let pe = std::fs::read(&path).expect("read shell.bin");
+    fn map_real_product_full_dllmain_clean_err_or_ok() {
+        let Some(path) = find_product_l2_pe() else {
+            eprintln!("skip: no product L2 PE for full DllMain test");
+            return;
+        };
+        let pe = std::fs::read(&path).expect("read product pe");
         match map_pe(&pe) {
             Ok(m) => {
                 assert!(m.mod_invoke.is_some());

@@ -26,29 +26,29 @@ pub fn apply_delay_jitter(base: Duration, jitter_percent: u32) -> Duration {
 }
 
 /// 指数退避策略
-/// 
+///
 /// 用于控制重连间隔时间，实现指数增长的延迟策略。
-/// 
+///
 /// # 算法
-/// 
+///
 /// - 初始延迟：1 秒
 /// - 增长因子：2（每次失败后延迟时间翻倍）
 /// - 最大延迟：60 秒
-/// 
+///
 /// # 示例
-/// 
+///
 /// ```
 /// use c2_client_agent::ExponentialBackoff;
 /// use std::time::Duration;
-/// 
+///
 /// let mut backoff = ExponentialBackoff::new();
-/// 
+///
 /// // 第一次重连：等待 1 秒
 /// assert_eq!(backoff.next_delay(), Duration::from_secs(1));
-/// 
+///
 /// // 第二次重连：等待 2 秒
 /// assert_eq!(backoff.next_delay(), Duration::from_secs(2));
-/// 
+///
 /// // 连接成功后重置
 /// backoff.reset();
 /// assert_eq!(backoff.next_delay(), Duration::from_secs(1));
@@ -65,7 +65,7 @@ pub struct ExponentialBackoff {
 
 impl ExponentialBackoff {
     /// 创建新的指数退避策略
-    /// 
+    ///
     /// 初始延迟为 1 秒，最大延迟为 60 秒，增长因子为 2。
     pub fn new() -> Self {
         Self {
@@ -74,7 +74,7 @@ impl ExponentialBackoff {
             multiplier: 2,
         }
     }
-    
+
     /// 获取下一次重连的延迟时间（带 ±20% 抖动，避免同步 beacon）
     ///
     /// 该方法返回当前的延迟时间（加入抖动），并将内部状态更新为下一次的延迟时间。
@@ -104,17 +104,17 @@ impl ExponentialBackoff {
     pub fn next_delay_no_jitter_preview(&self) -> Duration {
         self.current_delay
     }
-    
+
     /// 重置延迟时间
-    /// 
+    ///
     /// 将延迟时间重置为初始值（1 秒）。
     /// 通常在连接成功后调用，以便下次连接失败时从初始延迟开始。
     pub fn reset(&mut self) {
         self.current_delay = Duration::from_secs(1);
     }
-    
+
     /// 获取当前延迟时间（不更新状态）
-    /// 
+    ///
     /// 该方法仅用于查看当前的延迟时间，不会修改内部状态。
     pub fn current(&self) -> Duration {
         self.current_delay
@@ -193,14 +193,14 @@ mod tests {
     #[test]
     fn test_reset_after_max() {
         let mut backoff = ExponentialBackoff::new();
-        
+
         // 增长到最大值
         for _ in 0..10 {
             backoff.next_delay();
         }
-        
+
         assert_eq!(backoff.current(), Duration::from_secs(60));
-        
+
         // 重置后应该回到初始值
         backoff.reset();
         assert_eq!(backoff.current(), Duration::from_secs(1));
@@ -277,7 +277,7 @@ mod tests {
         let mut backoff1 = ExponentialBackoff::new();
         backoff1.next_delay(); // 1
         backoff1.next_delay(); // 2
-        
+
         // 克隆应该保持相同的状态
         let backoff2 = backoff1.clone();
         assert_eq!(backoff1.current(), backoff2.current());

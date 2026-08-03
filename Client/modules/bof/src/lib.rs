@@ -65,7 +65,12 @@ pub unsafe extern "C" fn mod_invoke(
 
     let ct = slice_str(cmd_type, cmd_type_len).unwrap_or("bof_exec");
     if ct != "bof_exec" && ct != "bof" {
-        return write_json(out_ptr, out_len, "", &format!("mod_bof: unsupported '{ct}'"));
+        return write_json(
+            out_ptr,
+            out_len,
+            "",
+            &format!("mod_bof: unsupported '{ct}'"),
+        );
     }
 
     let body = match slice_bytes(payload, payload_len) {
@@ -82,9 +87,8 @@ pub unsafe extern "C" fn mod_invoke(
 
     #[cfg(all(windows))]
     {
-        let result = runtime().block_on(async {
-            cupcake_core::loader::bof::BofLoader::execute(&coff, &args).await
-        });
+        let result = runtime()
+            .block_on(async { cupcake_core::loader::bof::BofLoader::execute(&coff, &args).await });
         // 用完即焚：清零载荷缓冲（不落盘；堆上副本不保留明文）
         burn_bytes(&mut coff);
         burn_bytes(&mut args);

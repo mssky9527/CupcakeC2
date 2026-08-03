@@ -43,6 +43,8 @@ export const deleteClient = (uuid) => request.delete(`/api/clients/${uuid}`)
 export const fsDownload = (data, onDownloadProgress) => request.get('/api/files/download', {
     params: data,
     responseType: 'blob',
+    // 大文件分块下载，放宽 axios 全局 30s — 必须显式置 0，否则大文件必然在 30s 处断流
+    timeout: 0,
     onDownloadProgress
 })
 

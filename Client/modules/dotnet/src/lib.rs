@@ -74,7 +74,12 @@ pub unsafe extern "C" fn mod_invoke(
 
     let ct = slice_str(cmd_type, cmd_type_len).unwrap_or("execute_assembly");
     if ct != "execute_assembly" && ct != "dotnet" && ct != "execute-assembly" {
-        return write_json(out_ptr, out_len, "", &format!("mod_dotnet: unsupported '{ct}'"));
+        return write_json(
+            out_ptr,
+            out_len,
+            "",
+            &format!("mod_dotnet: unsupported '{ct}'"),
+        );
     }
 
     let body = match slice_bytes(payload, payload_len) {

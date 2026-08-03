@@ -10,8 +10,11 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [features]
-# Default product build: WebSocket + standard post-ex (NO stealth-adv / sleep-mask).
-default = ["ws", "standard"]
+# ── Product: ONLY one aggregate tier ──────────────────────────────────
+# Stage0 = transport + crypto + module-loader + isolated-exec + Layer-A stealth
+#        + daily ops (shell/fs/proc/pty/socks). Heavy caps → L2 modules.
+# No standard / full / beacon product tiers.
+default = ["ws", "minimal"]
 
 # --- Transports (Builder picks one) ---
 ws = ["dep:tokio-tungstenite", "dep:url"]
@@ -26,19 +29,19 @@ tcp = []
 tcp_bind = []
 dns = ["dep:trust-dns-resolver"]
 
-# --- Capability tiers ---
-# beacon defined below with mem-map
-# minimal: REVERSE product default — daily ops built-in + loader for heavy L2
-#   built-in: hybrid shell / PTY / fs / process
-#   NOT built-in: socks / plugin / bof / dotnet (module or forward/standard)
+# --- Sole product aggregate ---
+# built-in: shell / PTY / fs / process / socks
+# L2: desktop (RDP), inject, iso_host (BOF/.NET)
 # Web UI PTY uses Yamux stream 0x01 → requires `pty`.
-minimal = ["post-ex", "pty", "encoding-support", "module-loader", "isolated-exec", "mem-map"]
-# standard: FORWARD / full post-ex monolith — Stage0 still has NO inject (L2 only)
-standard = ["post-ex", "pty", "socks", "plugin", "bof", "dotnet", "encoding-support", "logging", "rt-multi", "module-loader", "isolated-exec", "mem-map"]
-# full: standard + high-signature stealth patches
-full = ["standard", "stealth-adv"]
-# beacon thin Stage0: loader + mem-map (no post-ex)
-beacon = ["module-loader", "mem-map"]
+minimal = [
+    "post-ex",
+    "pty",
+    "socks",
+    "encoding-support",
+    "module-loader",
+    "isolated-exec",
+    "mem-map",
+]
 
 # post-ex: fs / process / executor / hybrid shell (daily ops)
 post-ex = []
@@ -50,28 +53,27 @@ mem-map-strict = ["mem-map"]
 # PPID-spoofed sacrificial host for BOF/.NET (not same-process module)
 isolated-exec = []
 
-# Individual capability gates (true compile-time exclusion)
+# Individual gates (NOT product tiers — L2 crates / custom builds only)
 pty = []
 socks = []
 plugin = ["dep:lazy_static"]
-# inject: remote process shellcode — ONLY for L2 mod_inject crate, never Stage0 default
+# inject: remote process shellcode — ONLY for L2 mod_inject crate
 inject = []
+# In-process BOF/.NET for L2/iso_host crates only (not Stage0 product)
 bof = ["dep:lazy_static"]
 dotnet = []
 encoding-support = ["dep:encoding_rs"]
+# Opt-in diagnostics / runtime (never in product default)
 logging = ["dep:env_logger"]
 rt-multi = ["tokio/rt-multi-thread"]
 
-# Stealth options — OFF by default
+# Stealth options — OFF by default (custom: --features tcp,minimal,stealth-adv)
 stealth-adv = ["dep:lazy_static"]
-sleep-mask = []
-
-# Remote desktop Yamux 0x0D bridge — OPSEC hard line: NEVER in default/standard/beacon/full.
-# Opt-in only via custom / full-gui style feature sets. Capture lives in L2 mod_desktop.
-desktop = []
+# Sleep-mask AES stream (pulls `aes` crate only when enabled)
+sleep-mask = ["dep:aes"]
 
 [dependencies]
-# Single-thread runtime by default (smaller); standard enables rt-multi-thread
+# Single-thread runtime by default (smaller)
 tokio = { version = "1.35", default-features = false, features = ["rt", "macros", "io-util", "net", "time", "sync", "process"] }
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"], optional = true }
 tokio-util = { version = "0.7", default-features = false, features = ["codec", "compat"] }
@@ -94,7 +96,8 @@ encoding_rs = { version = "0.8", optional = true }
 base64 = { version = "0.21", default-features = false, features = ["std"] }
 async-trait = "0.1"
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-aes = { version = "0.8", default-features = false }
+# Block cipher only for sleep-mask keystream (not product default)
+aes = { version = "0.8", default-features = false, optional = true }
 socket2 = { version = "0.6", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["std"] }
 lazy_static = { version = "1.4", optional = true }
@@ -111,7 +114,7 @@ winapi = { version = "0.3", features = [
     "namedpipeapi", "ioapiset", "synchapi", "fileapi",
     "threadpoollegacyapiset", "psapi", "securitybaseapi",
     "wtypes", "winerror", "guiddef", "minwinbase", "heapapi",
-    "processenv", "ntdef", "tlhelp32", "processthreadsapi", "libloaderapi"
+    "processenv", "ntdef", "tlhelp32", "processthreadsapi", "libloaderapi",
 ] }
 widestring = "1.0"
 

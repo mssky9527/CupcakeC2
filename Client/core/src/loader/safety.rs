@@ -13,11 +13,13 @@ pub unsafe fn read_struct<T>(buffer: &[u8], offset: usize) -> BofResult<&T> {
     let struct_size = std::mem::size_of::<T>();
 
     // 检查是否会溢出
-    let end_offset = offset.checked_add(struct_size)
-        .ok_or_else(|| BofError::BoundsCheckFailed {
-            offset,
-            size: buffer.len(),
-        })?;
+    let end_offset =
+        offset
+            .checked_add(struct_size)
+            .ok_or_else(|| BofError::BoundsCheckFailed {
+                offset,
+                size: buffer.len(),
+            })?;
 
     // 检查边界
     if end_offset > buffer.len() {
@@ -30,9 +32,10 @@ pub unsafe fn read_struct<T>(buffer: &[u8], offset: usize) -> BofResult<&T> {
     // 检查对齐
     let ptr = buffer.as_ptr().add(offset);
     if (ptr as usize) % std::mem::align_of::<T>() != 0 {
-        return Err(BofError::InvalidCoffFormat(
-            format!("Misaligned structure at offset 0x{:X}", offset)
-        ));
+        return Err(BofError::InvalidCoffFormat(format!(
+            "Misaligned structure at offset 0x{:X}",
+            offset
+        )));
     }
 
     Ok(&*(ptr as *const T))
@@ -46,11 +49,13 @@ where
     let struct_size = std::mem::size_of::<T>();
 
     // 检查是否会溢出
-    let end_offset = offset.checked_add(struct_size)
-        .ok_or_else(|| BofError::BoundsCheckFailed {
-            offset,
-            size: buffer.len(),
-        })?;
+    let end_offset =
+        offset
+            .checked_add(struct_size)
+            .ok_or_else(|| BofError::BoundsCheckFailed {
+                offset,
+                size: buffer.len(),
+            })?;
 
     // 检查边界
     if end_offset > buffer.len() {
@@ -73,14 +78,17 @@ where
     let element_size = std::mem::size_of::<T>();
 
     // 检查 count * element_size 是否溢出
-    let total_size = count.checked_mul(element_size)
-        .ok_or_else(|| BofError::BoundsCheckFailed {
-            offset,
-            size: buffer.len(),
-        })?;
+    let total_size =
+        count
+            .checked_mul(element_size)
+            .ok_or_else(|| BofError::BoundsCheckFailed {
+                offset,
+                size: buffer.len(),
+            })?;
 
     // 检查 offset + total_size 是否溢出
-    let end_offset = offset.checked_add(total_size)
+    let end_offset = offset
+        .checked_add(total_size)
         .ok_or_else(|| BofError::BoundsCheckFailed {
             offset,
             size: buffer.len(),
@@ -113,23 +121,32 @@ pub unsafe fn validate_pointer(ptr: *const u8, base: usize, size: usize) -> BofR
 }
 
 /// 安全地计算指针偏移
-pub unsafe fn safe_ptr_offset<T>(ptr: *const T, offset: isize, base: usize, size: usize) -> BofResult<*const T> {
+pub unsafe fn safe_ptr_offset<T>(
+    ptr: *const T,
+    offset: isize,
+    base: usize,
+    size: usize,
+) -> BofResult<*const T> {
     let element_size = std::mem::size_of::<T>() as isize;
 
     // 计算字节偏移
-    let byte_offset = offset.checked_mul(element_size)
-        .ok_or_else(|| BofError::BoundsCheckFailed {
-            offset: offset as usize,
-            size,
-        })?;
+    let byte_offset =
+        offset
+            .checked_mul(element_size)
+            .ok_or_else(|| BofError::BoundsCheckFailed {
+                offset: offset as usize,
+                size,
+            })?;
 
     // 计算新地址
     let ptr_addr = ptr as isize;
-    let new_addr = ptr_addr.checked_add(byte_offset)
-        .ok_or_else(|| BofError::BoundsCheckFailed {
-            offset: byte_offset as usize,
-            size,
-        })?;
+    let new_addr =
+        ptr_addr
+            .checked_add(byte_offset)
+            .ok_or_else(|| BofError::BoundsCheckFailed {
+                offset: byte_offset as usize,
+                size,
+            })?;
 
     // 验证新地址在范围内
     if new_addr < base as isize || new_addr >= (base + size) as isize {
@@ -161,7 +178,8 @@ pub unsafe fn safe_copy_memory(
     }
 
     // 检查复制后不会溢出
-    let end_addr = dest_addr.checked_add(count)
+    let end_addr = dest_addr
+        .checked_add(count)
         .ok_or_else(|| BofError::BoundsCheckFailed {
             offset: dest_addr,
             size: dest_size,
@@ -182,8 +200,8 @@ pub unsafe fn safe_copy_memory(
 
 /// 验证 COFF 文件头
 pub fn validate_coff_header(buffer: &[u8]) -> BofResult<()> {
-    use std::mem::size_of;
     use super::bof::CoffFileHeader;
+    use std::mem::size_of;
 
     // 最小大小检查
     let min_size = size_of::<CoffFileHeader>();
@@ -200,24 +218,20 @@ pub fn validate_section_table(
     header_size: usize,
     section_count: u16,
 ) -> BofResult<()> {
-    use std::mem::size_of;
     use super::bof::CoffSectionHeader;
+    use std::mem::size_of;
 
     let section_header_size = size_of::<CoffSectionHeader>();
 
     // 计算段表总大小
     let table_size = (section_count as usize)
         .checked_mul(section_header_size)
-        .ok_or_else(|| BofError::InvalidCoffFormat(
-            "Section table size overflow".to_string()
-        ))?;
+        .ok_or_else(|| BofError::InvalidCoffFormat("Section table size overflow".to_string()))?;
 
     // 计算段表结束位置
     let table_end = header_size
         .checked_add(table_size)
-        .ok_or_else(|| BofError::InvalidCoffFormat(
-            "Section table offset overflow".to_string()
-        ))?;
+        .ok_or_else(|| BofError::InvalidCoffFormat("Section table offset overflow".to_string()))?;
 
     // 检查是否超出缓冲区
     if table_end > buffer.len() {
@@ -236,24 +250,20 @@ pub fn validate_symbol_table(
     symbol_table_offset: u32,
     symbol_count: u32,
 ) -> BofResult<()> {
-    use std::mem::size_of;
     use super::bof::CoffSymbol;
+    use std::mem::size_of;
 
     let symbol_size = size_of::<CoffSymbol>();
 
     // 计算符号表总大小
     let table_size = (symbol_count as usize)
         .checked_mul(symbol_size)
-        .ok_or_else(|| BofError::InvalidCoffFormat(
-            "Symbol table size overflow".to_string()
-        ))?;
+        .ok_or_else(|| BofError::InvalidCoffFormat("Symbol table size overflow".to_string()))?;
 
     // 计算符号表结束位置
     let table_end = (symbol_table_offset as usize)
         .checked_add(table_size)
-        .ok_or_else(|| BofError::InvalidCoffFormat(
-            "Symbol table offset overflow".to_string()
-        ))?;
+        .ok_or_else(|| BofError::InvalidCoffFormat("Symbol table offset overflow".to_string()))?;
 
     // 检查是否超出缓冲区
     if table_end > buffer.len() {
@@ -272,24 +282,22 @@ pub fn validate_relocation_table(
     reloc_offset: u32,
     reloc_count: u16,
 ) -> BofResult<()> {
-    use std::mem::size_of;
     use super::bof::CoffRelocation;
+    use std::mem::size_of;
 
     let reloc_size = size_of::<CoffRelocation>();
 
     // 计算重定位表总大小
     let table_size = (reloc_count as usize)
         .checked_mul(reloc_size)
-        .ok_or_else(|| BofError::InvalidCoffFormat(
-            "Relocation table size overflow".to_string()
-        ))?;
+        .ok_or_else(|| BofError::InvalidCoffFormat("Relocation table size overflow".to_string()))?;
 
     // 计算重定位表结束位置
     let table_end = (reloc_offset as usize)
         .checked_add(table_size)
-        .ok_or_else(|| BofError::InvalidCoffFormat(
-            "Relocation table offset overflow".to_string()
-        ))?;
+        .ok_or_else(|| {
+            BofError::InvalidCoffFormat("Relocation table offset overflow".to_string())
+        })?;
 
     // 检查是否超出缓冲区
     if table_end > buffer.len() {

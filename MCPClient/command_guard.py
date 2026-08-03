@@ -237,7 +237,7 @@ class CommandGuard:
     def __init__(self, config_path: Optional[str] = None):
         """
         初始化命令禁止模块。
-        
+
         Args:
             config_path: 可选的自定义规则配置文件路径 (JSON)。
                          如果提供，将合并自定义规则到默认规则中。
@@ -246,6 +246,8 @@ class CommandGuard:
         self.file_patterns = self._compile_patterns(FILE_BLOCKED_PATTERNS)
         self.file_delete_patterns = self._compile_patterns(FILE_DELETE_BLOCKED_PATTERNS)
         self.custom_patterns: list[tuple] = []
+        # Guard is mandatory for MCP. It cannot be disabled by config; a config
+        # that sets "enabled": false is rejected so the guard never fail-opens.
         self.enabled = True
         self.log_blocked: list[dict] = []  # 记录被拦截的命令
 
@@ -266,39 +268,42 @@ class CommandGuard:
         return compiled
 
     def _load_custom_config(self, config_path: str):
-        """加载自定义规则配置"""
+        """加载自定义规则配置。配置损坏或尝试禁用 Guard 时 fail-closed。"""
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            # 配置文件损坏时 fail-closed：保留默认规则，但记录错误。
+            # 不允许通过损坏配置让 Guard 失效。
+            self._config_error = f"guard config load failed: {e}; using built-in rules"
+            return
 
-            # 支持禁用整个模块
-            if config.get("enabled") is False:
-                self.enabled = False
-                return
+        # Guard is mandatory. A config that tries to disable it is rejected.
+        if config.get("enabled") is False:
+            self._config_error = "guard cannot be disabled via config; ignoring 'enabled: false'"
+            return
 
-            # 加载自定义 shell 黑名单
-            for rule in config.get("shell_blocked", []):
-                try:
-                    regex = re.compile(rule["pattern"], re.IGNORECASE)
-                    self.custom_patterns.append(
-                        (regex, rule.get("reason", "自定义规则拦截"), rule.get("category", "custom"))
-                    )
-                except (re.error, KeyError):
-                    continue
+        self._config_error = None
 
-            # 加载自定义文件路径黑名单
-            for rule in config.get("file_blocked", []):
-                try:
-                    regex = re.compile(rule["pattern"], re.IGNORECASE)
-                    self.file_patterns.append(
-                        (regex, rule.get("reason", "自定义路径规则拦截"), rule.get("category", "custom"))
-                    )
-                except (re.error, KeyError):
-                    continue
+        # 加载自定义 shell 黑名单
+        for rule in config.get("shell_blocked", []):
+            try:
+                regex = re.compile(rule["pattern"], re.IGNORECASE)
+                self.custom_patterns.append(
+                    (regex, rule.get("reason", "自定义规则拦截"), rule.get("category", "custom"))
+                )
+            except (re.error, KeyError):
+                continue
 
-        except (json.JSONDecodeError, IOError):
-            # 配置文件损坏时静默降级，使用默认规则
-            pass
+        # 加载自定义文件路径黑名单
+        for rule in config.get("file_blocked", []):
+            try:
+                regex = re.compile(rule["pattern"], re.IGNORECASE)
+                self.file_patterns.append(
+                    (regex, rule.get("reason", "自定义路径规则拦截"), rule.get("category", "custom"))
+                )
+            except (re.error, KeyError):
+                continue
 
     def check_shell_command(self, cmd: str) -> GuardResult:
         """

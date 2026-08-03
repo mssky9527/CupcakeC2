@@ -11,23 +11,23 @@ pub enum ClientError {
     /// 连接错误
     #[error("Connection error: {0}")]
     ConnectionError(String),
-    
+
     /// 消息序列化/反序列化错误
     #[error("Message serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
-    
+
     /// 命令执行错误
     #[error("Command execution error: {0}")]
     ExecutionError(String),
-    
+
     /// 系统信息收集错误
     #[error("System info collection error: {0}")]
     SystemInfoError(String),
-    
+
     /// I/O 错误
     #[error("IO error: {0}")]
     IoError(#[from] std::io::Error),
-    
+
     /// WebSocket 协议错误（仅在启用 ws 特性时可用）
     #[cfg(feature = "ws")]
     #[error("WebSocket protocol error: {0}")]

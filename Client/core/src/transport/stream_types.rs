@@ -4,18 +4,20 @@
 //! wire protocol bytes. Only the single type byte written/read after
 //! `yamux::Session::Open` / `next_stream`.
 //!
-//! Locked table: `docs/DESKTOP_MODULE_DESIGN.md` §1.
 //! Keep numeric values identical to `server/pkg/utils/stream_types.go`.
+//!
+//! Remote desktop: Yamux **DESKTOP (0x0D)** → L2 `desktop` module must be Loaded;
+//! Stage0 thin bridge dials agent-side RDP (default 127.0.0.1:3389).
 
 /// Interactive PTY / hybrid shell stream.
 pub const YAMUX_STREAM_PTY: u8 = 0x01;
-/// SOCKS / tunnel data plane stream.
+/// SOCKS / general tunnel data plane stream.
 pub const YAMUX_STREAM_SOCKS: u8 = 0x02;
 /// File manager stream.
 pub const YAMUX_STREAM_FS: u8 = 0x03;
 /// Process list / kill stream.
 pub const YAMUX_STREAM_PROCESS: u8 = 0x04;
-/// Remote desktop stream (opt-in `desktop` bridge only; never default product).
+/// Remote desktop RDP port-forward (requires L2 `desktop` module).
 pub const YAMUX_STREAM_DESKTOP: u8 = 0x0D;
 /// Reserved — reject / future extension; do not assign product streams.
 pub const YAMUX_STREAM_RESERVED: u8 = 0xFF;
@@ -57,7 +59,4 @@ mod tests {
         assert_eq!(map["DESKTOP"], YAMUX_STREAM_DESKTOP);
         assert_eq!(map["RESERVED"], YAMUX_STREAM_RESERVED);
     }
-
-    // Product-tier assertion lives in `feature_gates_test` (runs under ws,standard).
-    // Do not assert `!desktop` here — this module is also compiled with `--features desktop`.
 }

@@ -2,12 +2,13 @@
 members = [
     "core",
     "stager",
-    "modules/shell",
+    # Product L2: desktop / inject / iso_host (BOF·.NET via iso_host)
+    "modules/desktop",
+    "modules/inject",
+    "iso_host",
+    # Optional crates for iso_host / legacy builds (not product catalog modules)
     "modules/bof",
     "modules/dotnet",
-    "modules/inject",
-    "modules/desktop",
-    "iso_host",
 ]
 resolver = "2"
 
@@ -15,6 +16,8 @@ resolver = "2"
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
+# abort: smaller binary (no unwinding tables). Stage0 is zero-panic by design;
+# L2 faults should not rely on catch_unwind in the agent process.
 panic = "abort"
 strip = "symbols"
 

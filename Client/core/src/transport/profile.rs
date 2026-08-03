@@ -149,10 +149,7 @@ fn format_amz_date(secs: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mth = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if mth <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        year, mth, d, h, m, s
-    )
+    format!("{:04}{:02}{:02}T{:02}{:02}{:02}Z", year, mth, d, h, m, s)
 }
 
 fn random_u32() -> u32 {

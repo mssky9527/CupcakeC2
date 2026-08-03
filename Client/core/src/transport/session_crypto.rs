@@ -4,7 +4,7 @@
 use crate::crypto;
 use crate::error::{ClientError, Result};
 use crate::transport::fragment::{
-    fragment_message, reassemble_message, should_fragment, DEFAULT_MAX_FRAGMENT_SIZE, Fragment,
+    fragment_message, reassemble_message, should_fragment, Fragment, DEFAULT_MAX_FRAGMENT_SIZE,
 };
 
 /// Magic prefix for multi-fragment wire frames (build-seed derived).
@@ -13,6 +13,8 @@ pub fn frag_magic() -> &'static [u8; 4] {
 }
 
 /// Prefer Noise session key; only fall back to static when Noise was not established.
+/// An empty static key is never accepted as "cleartext mode" in production builds —
+/// callers must configure a 32-byte key or establish a Noise session.
 pub fn traffic_key<'a>(noise: Option<&'a [u8; 32]>, static_aes: &'a [u8]) -> Result<&'a [u8]> {
     if let Some(sk) = noise {
         return Ok(&sk[..]);
@@ -20,28 +22,24 @@ pub fn traffic_key<'a>(noise: Option<&'a [u8; 32]>, static_aes: &'a [u8]) -> Res
     if static_aes.len() == 32 {
         return Ok(static_aes);
     }
-    if static_aes.is_empty() {
-        // Cleartext mode (no key configured)
-        return Ok(static_aes);
-    }
     Err(ClientError::ConnectionError(
-        "no usable traffic key (need Noise session or 32-byte AES)".into(),
+        "no usable traffic key (need Noise session or 32-byte AES; empty key is not accepted)".into(),
     ))
 }
 
 /// Encrypt + obfuscate for the wire. Fragments large payloads into CKF1 frames.
 /// Returns one or more wire payloads to send in order.
-pub fn seal_for_wire(
-    plaintext: &[u8],
-    key: &[u8],
-    max_frag: usize,
-) -> Result<Vec<Vec<u8>>> {
+/// An empty key is rejected — production never sends cleartext.
+pub fn seal_for_wire(plaintext: &[u8], key: &[u8], max_frag: usize) -> Result<Vec<Vec<u8>>> {
     if key.is_empty() {
-        // no crypto
-        return Ok(vec![plaintext.to_vec()]);
+        return Err(ClientError::ConnectionError(
+            "cannot seal with empty key (no traffic key configured)".into(),
+        ));
     }
     if key.len() != 32 {
-        return Err(ClientError::ConnectionError("traffic key must be 32 bytes".into()));
+        return Err(ClientError::ConnectionError(
+            "traffic key must be 32 bytes".into(),
+        ));
     }
 
     let max_frag = if max_frag == 0 {
@@ -100,7 +98,9 @@ impl FragReassembler {
     /// Feed one deobfuscated wire buffer (after deobfuscate_packet).
     pub fn push(&mut self, frame: Vec<u8>, key: &[u8]) -> Result<OpenResult> {
         if key.is_empty() {
-            return Ok(OpenResult::Complete(frame));
+            return Err(ClientError::ConnectionError(
+                "cannot open frame with empty key (no traffic key configured)".into(),
+            ));
         }
 
         // Fragmented frame?
@@ -109,18 +109,18 @@ impl FragReassembler {
             if frag_body.len() < 9 {
                 return Err(ClientError::ConnectionError("short fragment".into()));
             }
-            let total = u32::from_be_bytes([
-                frag_body[4],
-                frag_body[5],
-                frag_body[6],
-                frag_body[7],
-            ]);
-            let seq = u32::from_be_bytes([
-                frag_body[0],
-                frag_body[1],
-                frag_body[2],
-                frag_body[3],
-            ]);
+            let total =
+                u32::from_be_bytes([frag_body[4], frag_body[5], frag_body[6], frag_body[7]]);
+            let seq = u32::from_be_bytes([frag_body[0], frag_body[1], frag_body[2], frag_body[3]]);
+
+            // Cap fragment count to avoid OOM from malicious total (e.g. u32::MAX)
+            const MAX_FRAGMENTS: u32 = 4096;
+            if total == 0 || total > MAX_FRAGMENTS {
+                self.clear();
+                return Err(ClientError::ConnectionError(format!(
+                    "fragment total {total} out of range (1..={MAX_FRAGMENTS})"
+                )));
+            }
 
             if self.expected_total.is_none() {
                 self.expected_total = Some(total);
@@ -128,7 +128,9 @@ impl FragReassembler {
             }
             if self.expected_total != Some(total) {
                 self.clear();
-                return Err(ClientError::ConnectionError("fragment total mismatch".into()));
+                return Err(ClientError::ConnectionError(
+                    "fragment total mismatch".into(),
+                ));
             }
             if seq as usize >= self.parts.len() {
                 self.clear();
@@ -151,9 +153,8 @@ impl FragReassembler {
                 "unexpected non-fragment during reassembly".into(),
             ));
         }
-        let plain = crypto::decrypt(&frame, key).map_err(|e| {
-            ClientError::ConnectionError(format!("decrypt failed: {e}"))
-        })?;
+        let plain = crypto::decrypt(&frame, key)
+            .map_err(|e| ClientError::ConnectionError(format!("decrypt failed: {e}")))?;
         Ok(OpenResult::Complete(plain))
     }
 }
@@ -161,7 +162,9 @@ impl FragReassembler {
 /// Helper: open a single obfuscated wire blob (handles non-fragment only; multi needs state).
 pub fn open_wire_frame(obfuscated: Vec<u8>, key: &[u8]) -> Result<Vec<u8>> {
     if key.is_empty() {
-        return Ok(obfuscated);
+        return Err(ClientError::ConnectionError(
+            "cannot open wire frame with empty key (no traffic key configured)".into(),
+        ));
     }
     let deobf = crypto::deobfuscate_packet(obfuscated);
     if deobf.len() >= 4 && &deobf[0..4] == frag_magic().as_slice() {
@@ -169,8 +172,7 @@ pub fn open_wire_frame(obfuscated: Vec<u8>, key: &[u8]) -> Result<Vec<u8>> {
             "fragment frame requires reassembler state".into(),
         ));
     }
-    crypto::decrypt(&deobf, key)
-        .map_err(|e| ClientError::ConnectionError(format!("decrypt: {e}")))
+    crypto::decrypt(&deobf, key).map_err(|e| ClientError::ConnectionError(format!("decrypt: {e}")))
 }
 
 #[cfg(test)]
@@ -258,5 +260,31 @@ mod tests {
             OpenResult::NeedMore => {}
             OpenResult::Complete(_) => panic!("must not complete with missing middle fragment"),
         }
+    }
+
+    #[test]
+    fn empty_key_rejected_for_seal() {
+        let pt = b"sensitive-data";
+        let result = seal_for_wire(pt, &[], 4096);
+        assert!(result.is_err(), "seal_for_wire must reject empty key");
+    }
+
+    #[test]
+    fn empty_key_rejected_for_traffic_key() {
+        let result = traffic_key(None, &[]);
+        assert!(result.is_err(), "traffic_key must reject empty static key");
+    }
+
+    #[test]
+    fn empty_key_rejected_for_open_wire_frame() {
+        let result = open_wire_frame(vec![0u8; 16], &[]);
+        assert!(result.is_err(), "open_wire_frame must reject empty key");
+    }
+
+    #[test]
+    fn empty_key_rejected_for_reassembler_push() {
+        let mut ra = FragReassembler::new();
+        let result = ra.push(vec![0u8; 16], &[]);
+        assert!(result.is_err(), "FragReassembler::push must reject empty key");
     }
 }

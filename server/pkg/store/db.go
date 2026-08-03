@@ -109,27 +109,30 @@ func initDefaultAdmin() {
 	// Do NOT seed a weak default password here.
 	// Admin user is created by main.bootstrapAdminPassword (config / random / CUPCAKE_FORCE_DEV_PASS).
 
-	// Initialize API Token
-	var tokenCount int64
-	DB.Model(&model.GlobalSetting{}).Where("key = ?", "system_api_token").Count(&tokenCount)
-	if tokenCount == 0 {
-		token := GenerateSecureToken(32)
-		DB.Create(&model.GlobalSetting{
-			Key:   "system_api_token",
-			Value: token,
-			Group: "security",
-		})
+	// MCP gets a dedicated credential and a fail-closed default policy.
+	// Legacy system_api_token is never reused as MCP token: a fresh random
+	// token is generated on upgrade so old shared credentials stop working.
+	var mcpTokenCount int64
+	DB.Model(&model.GlobalSetting{}).Where("key = ?", "mcp_api_token").Count(&mcpTokenCount)
+	if mcpTokenCount == 0 {
+		newToken := GenerateSecureToken(32)
+		_ = SetSetting("mcp_api_token", newToken, "mcp")
+		if legacy := GetSetting("system_api_token"); legacy != "" {
+			// Mark the legacy token unusable so it cannot be reused later.
+			_ = SetSetting("system_api_token", "", "mcp")
+			log.Printf("[mcp] generated new dedicated token; legacy system_api_token cleared")
+		}
 	}
+	ensureSetting("system_mcp_enabled", "false", "mcp")
+	ensureSetting("mcp_allowed_cidrs", "127.0.0.1/32,::1/128", "mcp")
+	ensureSetting("mcp_read_only", "true", "mcp")
+}
 
-	// Initialize MCP Status
-	var mcpCount int64
-	DB.Model(&model.GlobalSetting{}).Where("key = ?", "system_mcp_enabled").Count(&mcpCount)
-	if mcpCount == 0 {
-		DB.Create(&model.GlobalSetting{
-			Key:   "system_mcp_enabled",
-			Value: "true",
-			Group: "security",
-		})
+func ensureSetting(key, value, group string) {
+	var count int64
+	DB.Model(&model.GlobalSetting{}).Where("key = ?", key).Count(&count)
+	if count == 0 {
+		_ = SetSetting(key, value, group)
 	}
 }
 

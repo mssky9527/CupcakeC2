@@ -119,10 +119,8 @@ unsafe fn version_from_rtl_get_version() -> Option<WindowsVersion> {
     if ntdll == 0 {
         return None;
     }
-    let addr = crate::stealth::get_api_addr(
-        ntdll,
-        crate::stealth::hash_api_name(b"RtlGetVersion"),
-    )?;
+    let addr =
+        crate::stealth::get_api_addr(ntdll, crate::stealth::hash_api_name(b"RtlGetVersion"))?;
     type RtlGetVersionFn = unsafe extern "system" fn(*mut OsVersionInfoW) -> i32;
     let rtl: RtlGetVersionFn = std::mem::transmute(addr);
 
@@ -146,50 +144,40 @@ mod tests {
     #[test]
     fn gate_rejects_unknown_and_legacy() {
         assert!(!WindowsVersion::UNKNOWN.supports_nt_create_user_process());
-        assert!(
-            !WindowsVersion {
-                major: 6,
-                minor: 3,
-                build: 9600
-            }
-            .supports_nt_create_user_process()
-        );
-        assert!(
-            !WindowsVersion {
-                major: 10,
-                minor: 0,
-                build: 17134
-            }
-            .supports_nt_create_user_process()
-        ); // 1803
+        assert!(!WindowsVersion {
+            major: 6,
+            minor: 3,
+            build: 9600
+        }
+        .supports_nt_create_user_process());
+        assert!(!WindowsVersion {
+            major: 10,
+            minor: 0,
+            build: 17134
+        }
+        .supports_nt_create_user_process()); // 1803
     }
 
     #[test]
     fn gate_accepts_1809_and_win11() {
-        assert!(
-            WindowsVersion {
-                major: 10,
-                minor: 0,
-                build: 17763
-            }
-            .supports_nt_create_user_process()
-        );
-        assert!(
-            WindowsVersion {
-                major: 10,
-                minor: 0,
-                build: 19045
-            }
-            .supports_nt_create_user_process()
-        );
-        assert!(
-            WindowsVersion {
-                major: 10,
-                minor: 0,
-                build: 22631
-            }
-            .supports_nt_create_user_process()
-        );
+        assert!(WindowsVersion {
+            major: 10,
+            minor: 0,
+            build: 17763
+        }
+        .supports_nt_create_user_process());
+        assert!(WindowsVersion {
+            major: 10,
+            minor: 0,
+            build: 19045
+        }
+        .supports_nt_create_user_process());
+        assert!(WindowsVersion {
+            major: 10,
+            minor: 0,
+            build: 22631
+        }
+        .supports_nt_create_user_process());
     }
 
     #[test]

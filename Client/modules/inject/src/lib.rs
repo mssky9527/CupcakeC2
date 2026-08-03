@@ -111,8 +111,7 @@ struct InjectReq {
 }
 
 fn parse_inject_payload(body: &[u8]) -> Result<InjectReq, String> {
-    let v: serde_json::Value =
-        serde_json::from_slice(body).map_err(|e| format!("json: {e}"))?;
+    let v: serde_json::Value = serde_json::from_slice(body).map_err(|e| format!("json: {e}"))?;
     let pid = v
         .get("pid")
         .and_then(|x| x.as_u64())

@@ -36,7 +36,12 @@ from command_guard import CommandGuard, get_guard, GuardResult
 # ============================================================
 
 C2_SERVER = os.environ.get("C2_SERVER", "http://127.0.0.1:9999/").rstrip("/") + "/"
-API_TOKEN = os.environ.get("C2_API_TOKEN", "lSYJZK-.5K.MCrgvOe0PDjY9ryWRJNX3")
+# MCP token is write-only on the server (revealed once by /api/settings/mcp/rotate-token).
+# A missing token is a hard startup failure — never ship a default credential.
+API_TOKEN = os.environ.get("C2_API_TOKEN", "")
+if not API_TOKEN:
+    logging.error("C2_API_TOKEN is required. Rotate it from /api/settings/mcp/rotate-token and export it before starting MCP.")
+    sys.exit(1)
 REQUEST_TIMEOUT = int(os.environ.get("C2_TIMEOUT", "30"))
 
 # 自定义规则配置文件路径 (可选)
@@ -73,35 +78,68 @@ def c2_request(method: str, endpoint: str, params: dict = None,
                json_data: dict = None, timeout: int = None) -> str:
     """
     向 C2 Server 发送 API 请求。
-    
+
     Returns:
-        str: 响应文本 (JSON 或错误信息)
+        str: JSON 文本。成功时包含 data；失败时包含 ok=false、status、error_code、message。
     """
     url = f"{C2_SERVER}{endpoint.lstrip('/')}"
     headers = {
         "Authorization": f"Bearer {API_TOKEN}",
         "Content-Type": "application/json",
     }
+    used_timeout = timeout or REQUEST_TIMEOUT
     try:
         resp = requests.request(
             method, url,
             headers=headers,
             params=params,
             json=json_data,
-            timeout=timeout or REQUEST_TIMEOUT,
+            timeout=used_timeout,
         )
-        # 尝试格式化 JSON 响应
-        try:
-            data = resp.json()
-            return json.dumps(data, ensure_ascii=False, indent=2)
-        except (json.JSONDecodeError, ValueError):
-            return resp.text
     except requests.exceptions.Timeout:
-        return json.dumps({"error": f"请求超时 ({REQUEST_TIMEOUT}s)", "endpoint": endpoint})
-    except requests.exceptions.ConnectionError:
-        return json.dumps({"error": "无法连接到 C2 Server", "server": C2_SERVER})
+        return json.dumps({"ok": False, "status": None, "error_code": "timeout",
+                           "message": f"request timeout ({used_timeout}s)", "endpoint": endpoint},
+                          ensure_ascii=False)
+    except requests.exceptions.ConnectionError as e:
+        return json.dumps({"ok": False, "status": None, "error_code": "connection_error",
+                           "message": "cannot connect to C2 server", "endpoint": endpoint},
+                          ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"ok": False, "status": None, "error_code": "client_error",
+                           "message": "unexpected client error", "endpoint": endpoint},
+                          ensure_ascii=False)
+
+    if resp.status_code == 401:
+        return json.dumps({"ok": False, "status": 401, "error_code": "unauthorized",
+                           "message": "MCP token rejected (rotate and update C2_API_TOKEN)",
+                           "endpoint": endpoint}, ensure_ascii=False)
+    if resp.status_code == 403:
+        try:
+            payload = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            payload = {}
+        code = payload.get("error_code") if isinstance(payload, dict) else None
+        if not code:
+            code = "mcp_policy_denied"
+        return json.dumps({"ok": False, "status": 403, "error_code": code,
+                           "message": payload.get("error", "mcp policy denied") if isinstance(payload, dict) else "mcp policy denied",
+                           "endpoint": endpoint}, ensure_ascii=False)
+    if resp.status_code == 404:
+        return json.dumps({"ok": False, "status": 404, "error_code": "not_found",
+                           "message": "endpoint or resource not found", "endpoint": endpoint},
+                          ensure_ascii=False)
+    if resp.status_code >= 500:
+        return json.dumps({"ok": False, "status": resp.status_code, "error_code": "server_error",
+                           "message": "C2 server error", "endpoint": endpoint},
+                          ensure_ascii=False)
+
+    try:
+        data = resp.json()
+        return json.dumps({"ok": True, "status": resp.status_code, "data": data},
+                          ensure_ascii=False, indent=2)
+    except (json.JSONDecodeError, ValueError):
+        return json.dumps({"ok": True, "status": resp.status_code, "data": resp.text},
+                          ensure_ascii=False)
 
 
 # ============================================================

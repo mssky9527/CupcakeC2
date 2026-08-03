@@ -374,7 +374,7 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 				NoiseSessionKey: noiseSessionKey,
 				SessionKey:      append([]byte(nil), staticSessionKey...),
 				CommandChannel:  make(chan string, 10),
-				OutputChannel:   make(chan string, 10),
+				OutputChannel:   make(chan string, 256),
 				ListenerID:      ln.ID,
 				ListenerPort:    ln.Port,
 				CachedPlugins:   make(map[string]bool),
@@ -463,10 +463,7 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 					}
 					
 					jsonOut, _ := json.Marshal(internalMsg)
-					select {
-					case client.OutputChannel <- string(jsonOut):
-					default:
-					}
+					trySendOutput(client, string(jsonOut))
 				}
 				if ptyDone {
 					doneMsg := struct {
@@ -479,10 +476,7 @@ func ProcessWebSocket(conn *websocket.Conn, remoteAddr string, ln *globals.Liste
 						Content: "",
 					}
 					jsonOut, _ := json.Marshal(doneMsg)
-					select {
-					case client.OutputChannel <- string(jsonOut):
-					default:
-					}
+					trySendOutput(client, string(jsonOut))
 				}
 			}
 
@@ -784,7 +778,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 				NoiseSessionKey: noiseSessionKey,
 				SessionKey:      append([]byte(nil), staticSessionKey...),
 				CommandChannel:  make(chan string, 10),
-				OutputChannel:   make(chan string, 10),
+				OutputChannel:   make(chan string, 256),
 				ListenerID:      ln.ID,
 				ListenerPort:    ln.Port,
 				CachedPlugins:   make(map[string]bool),
@@ -854,10 +848,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 					output = "[ERR] " + resp.Stderr
 				}
 				if output != "" {
-					select {
-					case client.OutputChannel <- output:
-					default:
-					}
+					trySendOutput(client, output)
 				}
 			}
 
@@ -874,6 +865,22 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 				appendAgentLog(clientUUID, so, se)
 			}
 		}
+	}
+}
+
+// trySendOutput non-blocking send; race-safe with CloseOutputChannel; counts drops.
+func trySendOutput(client *globals.Client, msg string) {
+	if client == nil {
+		return
+	}
+	if client.TrySendOutput(msg) {
+		return
+	}
+	// rate-limit noise: log only every 64th drop per agent
+	n := client.DroppedOutputs.Load()
+	if n > 0 && n%64 == 0 {
+		log.Printf("[Output] dropped_outputs agent=%s n=%d global=%d",
+			client.UUID, n, globals.GlobalDroppedOutputs.Load())
 	}
 }
 

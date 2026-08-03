@@ -714,8 +714,8 @@ const previewUrl = computed(() => {
 
 const modeDescription = computed(() => (
   form.value.mode === 'build'
-    ? '源码构建：正向/反向均为 minimal 同能力，仅协议方向不同（bind vs 回连）。'
-    : '模板补丁：秒级生成；建议源码构建以对齐 minimal 体积与能力。'
+    ? '源码构建：唯一产品档 minimal（shell/fs/pty/socks 内置；BOF/.NET/desktop/inject 按需 L2 模块）。'
+    : '模板补丁：秒级生成；模板均为 minimal。'
 ))
 
 const profileLabel = computed(() => {
@@ -1006,8 +1006,6 @@ const fetchListenersData = async () => {
 const onListenerChange = (id) => {
   const listener = activeListeners.value.find((item) => item.id === id)
   if (!listener) return
-  form.value.aesKey = listener.encrypt_key || ''
-  form.value.encryption_salt = listener.encryption_salt || ''
   form.value.obfuscation_mode = listener.obfuscate_mode || 'none'
 }
 

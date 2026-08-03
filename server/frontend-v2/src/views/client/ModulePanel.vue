@@ -2,10 +2,12 @@
   <div class="module-panel">
     <div class="panel-head">
       <div>
-        <h3>重能力 / 隔离宿主</h3>
+        <h3>L2 模块（三件套）</h3>
         <p class="hint">
-          终端 / 文件 / 进程已内置。日常只需推送 <code>iso_host</code>（隔离执行 BOF/.NET）。
-          推送成功且仍存活时，「推送到本机」会置灰。
+          终端/文件/进程已内置。本页推送三个独立模块：
+          <code>desktop</code> 远程桌面、
+          <code>iso_host</code> BOF/.NET、
+          <code>inject</code> 注入。已存活则按钮置灰。
         </p>
       </div>
       <div class="head-actions">
@@ -19,7 +21,7 @@
       type="warning"
       show-icon
       :closable="false"
-      title="仓库为空：请先在「模块」页上传 iso_host（cupcake-iso-host.exe）"
+      title="仓库为空：请在「模块」页上传 desktop / iso_host / inject"
       class="mb"
     />
 
@@ -36,7 +38,7 @@
       type="info"
       show-icon
       :closable="false"
-      title="当前主机未检测到已加载模块（可推送 iso_host）"
+      title="当前主机未检测到已加载模块（可推送 desktop / iso_host / inject）"
       class="mb"
     />
 
@@ -69,8 +71,7 @@
     </el-table>
 
     <p class="foot-note">
-      推荐只关注 <code>iso_host</code>。bof / dotnet / shell 为遗留或实验项，可折叠隐藏。
-      <el-switch v-model="showLegacy" active-text="显示遗留模块" style="margin-left: 12px" />
+      产品模块仅三项：desktop · iso_host · inject。同进程 bof/dotnet/shell 已退出产品仓库。
     </p>
   </div>
 </template>
@@ -91,13 +92,12 @@ const pushing = ref('')
 const listing = ref(false)
 const modules = ref([])
 const listedOnce = ref(false)
-const showLegacy = ref(false)
+const PRODUCT_IDS = new Set(['desktop', 'iso_host', 'inject'])
 
 const displayModules = computed(() => {
-  if (showLegacy.value) return modules.value
-  // Default: only show host (iso_host) + anything already alive
+  // Product three modules only (+ any already alive for edge cases)
   return modules.value.filter(
-    (m) => m.kind === 'host' || m.id === 'iso_host' || isAlive(m)
+    (m) => PRODUCT_IDS.has(m.id) || isAlive(m)
   )
 })
 

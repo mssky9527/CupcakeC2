@@ -25,17 +25,11 @@ pub enum BofError {
 
     /// 符号解析失败
     #[error("Failed to resolve symbol '{symbol}': {reason}")]
-    SymbolResolutionFailed {
-        symbol: String,
-        reason: String,
-    },
+    SymbolResolutionFailed { symbol: String, reason: String },
 
     /// 重定位失败
     #[error("Relocation failed at offset 0x{offset:X}: {reason}")]
-    RelocationFailed {
-        offset: u32,
-        reason: String,
-    },
+    RelocationFailed { offset: u32, reason: String },
 
     /// 未知的重定位类型
     #[error("Unknown relocation type: {0} for architecture {1}")]
@@ -51,10 +45,7 @@ pub enum BofError {
 
     /// Module Overloading 失败
     #[error("Module overloading failed for '{dll}': {reason}")]
-    ModuleOverloadingFailed {
-        dll: String,
-        reason: String,
-    },
+    ModuleOverloadingFailed { dll: String, reason: String },
 
     /// 段未找到
     #[error("Section '{0}' not found in carrier DLL")]
@@ -70,17 +61,11 @@ pub enum BofError {
 
     /// 系统调用失败
     #[error("Syscall failed: {syscall} returned 0x{status:X}")]
-    SyscallFailed {
-        syscall: String,
-        status: i32,
-    },
+    SyscallFailed { syscall: String, status: i32 },
 
     /// 边界检查失败
     #[error("Bounds check failed: attempted to access offset {offset} in buffer of size {size}")]
-    BoundsCheckFailed {
-        offset: usize,
-        size: usize,
-    },
+    BoundsCheckFailed { offset: usize, size: usize },
 
     /// 架构不匹配
     #[error("Architecture mismatch: cannot execute {bof_arch} BOF in {process_arch} process")]
@@ -91,10 +76,7 @@ pub enum BofError {
 
     /// Beacon API 调用失败
     #[error("Beacon API call failed: {api} - {reason}")]
-    BeaconApiError {
-        api: String,
-        reason: String,
-    },
+    BeaconApiError { api: String, reason: String },
 
     /// 参数解析失败
     #[error("Failed to parse BOF arguments: {0}")]
@@ -140,7 +122,10 @@ impl BofError {
     }
 
     /// 创建架构不匹配错误
-    pub fn architecture_mismatch(bof_arch: impl Into<String>, process_arch: impl Into<String>) -> Self {
+    pub fn architecture_mismatch(
+        bof_arch: impl Into<String>,
+        process_arch: impl Into<String>,
+    ) -> Self {
         Self::ArchitectureMismatch {
             bof_arch: bof_arch.into(),
             process_arch: process_arch.into(),

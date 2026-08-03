@@ -4,6 +4,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,6 +60,11 @@ type Client struct {
 	OutputChannel  chan string     `json:"-"`
 	// outputCloseOnce ensures OutputChannel is closed at most once (reconnect races).
 	outputCloseOnce sync.Once `json:"-"`
+	// outputMu serializes trySend vs close (prevent send-on-closed panic).
+	outputMu     sync.Mutex `json:"-"`
+	outputClosed atomic.Bool `json:"-"`
+	// DroppedOutputs: per-agent count of messages dropped under backpressure.
+	DroppedOutputs atomic.Uint64 `json:"-"`
 	// Protect concurrent WebSocket writes (admin shell, multi-subscriber)
 	WSWriteMu      sync.Mutex      `json:"-"`
 	ListenerID     string          `json:"listener_id"`
@@ -67,16 +73,53 @@ type Client struct {
 	PluginMutex    sync.RWMutex    `json:"-"`
 }
 
+// GlobalDroppedOutputs aggregates drops across all agents (metrics).
+var GlobalDroppedOutputs atomic.Uint64
+
 // CloseOutputChannel closes OutputChannel at most once (safe under reconnect/offline races).
 func (c *Client) CloseOutputChannel() {
 	if c == nil {
 		return
 	}
 	c.outputCloseOnce.Do(func() {
+		c.outputMu.Lock()
+		defer c.outputMu.Unlock()
+		c.outputClosed.Store(true)
 		if c.OutputChannel != nil {
 			close(c.OutputChannel)
 		}
 	})
+}
+
+// TrySendOutput non-blocking send; race-safe with CloseOutputChannel.
+// Returns false if closed or dropped.
+func (c *Client) TrySendOutput(msg string) bool {
+	if c == nil {
+		return false
+	}
+	c.outputMu.Lock()
+	defer c.outputMu.Unlock()
+	if c.outputClosed.Load() || c.OutputChannel == nil {
+		return false
+	}
+	select {
+	case c.OutputChannel <- msg:
+		return true
+	default:
+	}
+	// drain one stale then retry
+	select {
+	case <-c.OutputChannel:
+	default:
+	}
+	select {
+	case c.OutputChannel <- msg:
+		return true
+	default:
+		c.DroppedOutputs.Add(1)
+		GlobalDroppedOutputs.Add(1)
+		return false
+	}
 }
 
 // PTYSession 代表一个底层的异步 PTY 会话状态（支持断线重连与多端复用，类似 Tmux/CobaltStrike）
@@ -95,8 +138,8 @@ type Listener struct {
 	PublicHost        string       `json:"public_host"`
 	Note              string       `json:"note"`
 	EncryptMode       string       `json:"encrypt_mode"`
-	EncryptKey        string       `json:"encrypt_key"`
-	EncryptionSalt    string       `json:"encryption_salt"`
+	EncryptKey        string       `json:"-"`
+	EncryptionSalt    string       `json:"-"`
 	ObfuscateMode     string       `json:"obfuscate_mode"`
 	CustomPath        string       `json:"custom_path"` // e.g. /ws or /api/updates
 	// Profile: expected malleable profile (gmail|outlook|aws|github|default); empty = any
@@ -113,9 +156,9 @@ type Listener struct {
 	// 🔒 TLS Configuration (Phase 1 - Secure WebSocket)
 	EnableTLS         bool         `json:"enable_tls"`
 	TLSCertPath       string       `json:"tls_cert_path"`
-	TLSKeyPath        string       `json:"tls_key_path"`
-	TLSCertPEM        string       `json:"tls_cert_pem"`
-	TLSKeyPEM         string       `json:"tls_key_pem"`
+	TLSKeyPath        string       `json:"-"`
+	TLSCertPEM        string       `json:"-"`
+	TLSKeyPEM         string       `json:"-"`
 	// Status and server instances
 	Status            string       `json:"status"`
 	HTTPServer        *http.Server `json:"-"`
@@ -160,14 +203,53 @@ func AdminCheckOrigin(r *http.Request) bool {
 	return originAllowed(origin, r.Host)
 }
 
+// OriginAllowed applies the same strict origin policy to CORS and WebSockets.
+func OriginAllowed(origin, host string) bool {
+	return originAllowed(origin, host)
+}
+
 func originAllowed(origin, host string) bool {
-	if strings.Contains(origin, "localhost") || strings.Contains(origin, "127.0.0.1") {
-		return true
+	u, err := url.Parse(origin)
+	if err != nil || u.Scheme == "" || u.Hostname() == "" || u.User != nil {
+		return false
 	}
-	if host != "" && (strings.Contains(origin, host) || strings.HasSuffix(origin, "://"+host)) {
-		return true
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return false
 	}
-	return false
+
+	originHost := strings.ToLower(u.Hostname())
+	originPort := u.Port()
+	requestHost, requestPort, err := net.SplitHostPort(host)
+	if err != nil {
+		requestHost = strings.Trim(host, "[]")
+		requestPort = ""
+	}
+	requestHost = strings.ToLower(strings.Trim(requestHost, "[]"))
+	if originHost != requestHost && !(requestHost == "" && isLocalHost(originHost)) {
+		return false
+	}
+	if originPort == "" {
+		originPort = defaultPort(u.Scheme)
+	}
+	if requestPort == "" {
+		requestPort = defaultPort(u.Scheme)
+	}
+	return originPort != "" && originPort == requestPort
+}
+
+func isLocalHost(host string) bool {
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+func defaultPort(scheme string) string {
+	switch strings.ToLower(scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 // reqCounter is lock-free monotonic IDs for command correlation.

@@ -3,8 +3,10 @@ package services
 import (
 	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/store"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -121,14 +123,40 @@ func bytesContains(hay, needle []byte) bool {
 
 // PluginMetadata matches the manifest.json structure
 type PluginMetadata struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	FileName    string `json:"file_name"`
-	Type        string `json:"type"`       // "execute-assembly", "native-exec", "powershell", "memfd-exec", etc.
-	Category    string `json:"category"`
-	RequiredOS  string `json:"required_os"`
-	Params      []interface{} `json:"params"`
+	ID          string        `json:"id"`
+	Name        string        `json:"name"`
+	Description string        `json:"description"`
+	FileName    string        `json:"file_name"`
+	Type        string        `json:"type"` // "execute-assembly", "native-exec", "powershell", "memfd-exec", etc.
+	Category    string        `json:"category"`
+	RequiredOS  string        `json:"required_os"`
+	// Hash is lowercase hex SHA-256 of the plugin file bytes (trust chain).
+	Hash   string        `json:"hash,omitempty"`
+	Params []interface{} `json:"params"`
+}
+
+// PluginFileSHA256 returns lowercase hex SHA-256 of data.
+func PluginFileSHA256(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+// VerifyPluginHash checks that fileBytes match the manifest Hash when set.
+// Empty Hash is accepted for legacy plugins (no fail-open on new uploads).
+func VerifyPluginHash(meta *PluginMetadata, fileBytes []byte) error {
+	if meta == nil {
+		return fmt.Errorf("nil plugin metadata")
+	}
+	want := strings.ToLower(strings.TrimSpace(meta.Hash))
+	if want == "" {
+		// Legacy entry without hash — allow but log; new uploads always set Hash.
+		return nil
+	}
+	got := PluginFileSHA256(fileBytes)
+	if got != want {
+		return fmt.Errorf("plugin hash mismatch: expected %s got %s", want, got)
+	}
+	return nil
 }
 
 // loadPluginManifestNoLock reads from disk without locking - internal use only
@@ -203,6 +231,15 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 		manifestMutex.Lock()
 		pluginCache[pluginID] = binData
 		manifestMutex.Unlock()
+	}
+
+	// Trust chain: refuse deploy when on-disk/cache bytes diverge from manifest hash.
+	if err := VerifyPluginHash(meta, binData); err != nil {
+		// Drop poisoned cache entry
+		manifestMutex.Lock()
+		delete(pluginCache, pluginID)
+		manifestMutex.Unlock()
+		return "", fmt.Errorf("plugin integrity check failed: %w", err)
 	}
 
 	// Always re-detect from file content (ignore wrong manual type in manifest)

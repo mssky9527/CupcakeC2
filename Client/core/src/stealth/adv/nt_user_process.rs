@@ -102,10 +102,7 @@ impl PsCreateInfo {
 /// `cmd` should preferably include a full image path as the first token so that
 /// RtlCreateProcessParametersEx does not need PATH search (layer A CreateProcessW
 /// remains better at PATH resolution).
-pub fn try_nt_create_user_process_ppid(
-    cmd: &str,
-    parent_handle: usize,
-) -> Result<u32, String> {
+pub fn try_nt_create_user_process_ppid(cmd: &str, parent_handle: usize) -> Result<u32, String> {
     if parent_handle == 0 {
         return Err("null parent handle".into());
     }
@@ -159,9 +156,7 @@ unsafe fn try_nt_create_user_process_ppid_inner(
     // Image path = first token if it looks like a path; else fail (fallback to CreateProcessW).
     let image_path = first_token(cmd);
     if !image_path.contains('\\') && !image_path.contains('/') {
-        return Err(
-            "NtCreateUserProcess MVP requires absolute image path as first token".into(),
-        );
+        return Err("NtCreateUserProcess MVP requires absolute image path as first token".into());
     }
 
     let mut image_w: Vec<u16> = std::ffi::OsStr::new(image_path)
