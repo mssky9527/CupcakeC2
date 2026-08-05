@@ -296,7 +296,12 @@ pub fn download(path: &str) -> Result<String> {
     Ok(encoded)
 }
 
-/// 分块上传文件
+
+// Control-plane chunk transfer (WS/DNS fallback only). TCP/Yamux agents use the
+// FILE (0x0E) binary stream via file_stream; these commands exist so agents
+// without a Yamux session (WebSocket / DNS) can still put/get files.
+
+/// 分块上传文件(控制面回退,无 Yamux 会话的 agent 使用)
 pub fn upload_chunk(path: &str, data_base64: &str, is_append: bool) -> Result<()> {
     info!("Uploading file chunk: {} (append: {})", path, is_append);
     if path.trim().is_empty() {
@@ -353,8 +358,8 @@ pub fn upload_chunk(path: &str, data_base64: &str, is_append: bool) -> Result<()
     Ok(())
 }
 
-/// 分块下载文件
-pub fn download_chunk(path: &str, offset: u64, size: usize) -> Result<(String, bool)> {
+/// 分块下载文件(控制面回退,无 Yamux 会话的 agent 使用)
+pub fn download_chunk(path: &str, offset: u64, size: usize) -> Result<(String, bool, u64)> {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
     let path_obj = Path::new(path);
@@ -370,7 +375,7 @@ pub fn download_chunk(path: &str, offset: u64, size: usize) -> Result<(String, b
     let file_size = metadata.len();
 
     if offset >= file_size {
-        return Ok(("".to_string(), true)); // EOF
+        return Ok(("".to_string(), true, file_size)); // EOF
     }
 
     file.seek(SeekFrom::Start(offset))
@@ -383,7 +388,7 @@ pub fn download_chunk(path: &str, offset: u64, size: usize) -> Result<(String, b
     let is_eof = offset + (n as u64) >= file_size;
     let encoded = BASE64.encode(&buffer);
 
-    Ok((encoded, is_eof))
+    Ok((encoded, is_eof, file_size))
 }
 
 /// 删除文件或目录（递归）

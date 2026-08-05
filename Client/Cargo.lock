@@ -288,6 +288,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cupcake-desktop-worker"
+version = "0.1.0"
+
+[[package]]
 name = "cupcake-iso-host"
 version = "0.1.0"
 dependencies = [
@@ -295,6 +299,7 @@ dependencies = [
  "cupcake-core",
  "serde_json",
  "tokio",
+ "winapi",
 ]
 
 [[package]]

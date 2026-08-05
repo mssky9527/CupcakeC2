@@ -282,8 +282,9 @@ fn run_job_blocking(
         Ok((out, err))
     });
 
-    let wait_ms = deadline_ms.clamp(1_000, 300_000) as u32;
-    if !crate::native::wait_for_single_object_timeout(child.h_process, wait_ms) {
+    let wait_ms = crate::module_supervisor::clamp_worker_deadline_ms(deadline_ms);
+    let signaled = crate::native::wait_for_single_object_timeout(child.h_process, wait_ms);
+    if crate::module_supervisor::should_force_kill_on_wait(signaled) {
         let _ = job.terminate(1);
         let _ = crate::native::terminate_process_handle(child.h_process);
         let _ = crate::native::close_handle(child.h_process);

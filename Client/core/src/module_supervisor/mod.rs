@@ -3,11 +3,21 @@
 //! Product modules (desktop / iso_host / inject) are registered as staged PE bytes
 //! and executed only in child processes under a Windows Job Object when possible.
 //! See docs/MODULE_WORKER_ISOLATION.md.
+//!
+//! Desktop RDP: default remains in-process `transport::desktop_bridge`. Long-lived
+//! worker path lives in [`desktop_worker`] (`CUPCAKE_DESKTOP_WORKER=1` → Job Object child).
 
+mod desktop_worker;
 mod ipc;
 pub(crate) mod job_object;
 mod state;
 
+pub use desktop_worker::{
+    decide_desktop_relay, desktop_lifecycle, parse_worker_status_line, pipe_desktop_worker_relay,
+    resolve_worker_binary, run_desktop_worker_relay, spawn_desktop_worker_ready,
+    DesktopRelayDecision, DesktopSession, DesktopWorkerChild, DesktopWorkerLifecycle,
+    ENV_DESKTOP_WORKER, ENV_DESKTOP_WORKER_BIN,
+};
 pub use ipc::{WorkerRequest, WorkerResponse, MAX_OUTPUT_BYTES, MAX_PAYLOAD_BYTES};
 pub use state::{WorkerState, WorkerStatus};
 
@@ -214,6 +224,23 @@ impl ModuleSupervisor {
             }
             g.inflight = 0;
         }
+        // Desktop long-lived session bookkeeping (active Job child killed by its Drop/job close).
+        desktop_worker::desktop_lifecycle().stop_all();
+    }
+
+    /// Desktop worker lifecycle status (not the Yamux bridge itself).
+    pub fn desktop_worker_status(&self) -> WorkerStatus {
+        desktop_worker::desktop_lifecycle().status()
+    }
+
+    /// Start desktop session bookkeeping (spawn is via `spawn_desktop_worker_ready`).
+    pub fn desktop_worker_start(&self, host: &str, port: u16) -> Result<u64, String> {
+        desktop_worker::desktop_lifecycle().start_session(host, port)
+    }
+
+    /// Stop desktop session bookkeeping / Job Object child session.
+    pub fn desktop_worker_stop(&self, request_id: Option<u64>) -> Result<(), String> {
+        desktop_worker::desktop_lifecycle().stop_session(request_id)
     }
 }
 
@@ -306,9 +333,10 @@ fn run_inject_via_iso_host(json_body: &[u8], deadline_ms: u64) -> CommandResult 
         Ok((out, err))
     });
 
-    let wait_ms = deadline_ms.max(1000).min(300_000) as u32;
+    let wait_ms = clamp_worker_deadline_ms(deadline_ms);
     let ok = crate::native::wait_for_single_object_timeout(child.h_process, wait_ms);
-    if !ok {
+    if should_force_kill_on_wait(ok) {
+        // !ok → deadline elapsed: kill Job Object + process (fail-closed timeout).
         WORKER_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
         force_kill(child.h_process, &job);
         let _ = crate::native::close_handle(child.h_process);
@@ -388,6 +416,18 @@ fn force_kill(h_process: usize, job: &Option<job_object::JobObject>) {
         let _ = j.terminate(1);
     }
     let _ = crate::native::terminate_process_handle(h_process);
+}
+
+/// Clamp worker wait deadline to [1s, 300s]. Pure helper for unit tests + wait paths.
+#[inline]
+pub fn clamp_worker_deadline_ms(deadline_ms: u64) -> u32 {
+    deadline_ms.clamp(1_000, 300_000) as u32
+}
+
+/// After WaitForSingleObject: force-kill when the wait did not signal (timeout).
+#[inline]
+pub fn should_force_kill_on_wait(signaled: bool) -> bool {
+    !signaled
 }
 
 pub fn worker_timeouts() -> u32 {
@@ -562,5 +602,48 @@ mod tests {
     fn max_output_bytes_is_two_mib() {
         // Contract used by inject reader + native bounded read (not 32 MiB pipe cap).
         assert_eq!(MAX_OUTPUT_BYTES, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn clamp_worker_deadline_ms_bounds() {
+        assert_eq!(clamp_worker_deadline_ms(0), 1_000);
+        assert_eq!(clamp_worker_deadline_ms(500), 1_000);
+        assert_eq!(clamp_worker_deadline_ms(1_000), 1_000);
+        assert_eq!(clamp_worker_deadline_ms(30_000), 30_000);
+        assert_eq!(clamp_worker_deadline_ms(300_000), 300_000);
+        assert_eq!(clamp_worker_deadline_ms(1_000_000), 300_000);
+        assert_eq!(clamp_worker_deadline_ms(u64::MAX), 300_000);
+    }
+
+    #[test]
+    fn should_force_kill_on_wait_deadline_logic() {
+        assert!(should_force_kill_on_wait(false), "timeout → kill");
+        assert!(!should_force_kill_on_wait(true), "signaled → keep");
+    }
+
+    #[test]
+    fn desktop_worker_lifecycle_api_on_supervisor() {
+        let s = ModuleSupervisor {
+            inner: Mutex::new(SupervisorInner {
+                pe: HashMap::new(),
+                status: HashMap::new(),
+                fail_streak: HashMap::new(),
+                inflight: 0,
+            }),
+            max_concurrent: 4,
+            circuit_open_after: 5,
+        };
+        // Default relay decision is always bridge (skeleton).
+        assert_eq!(
+            decide_desktop_relay(),
+            DesktopRelayDecision::UseBridge
+        );
+        let id = s.desktop_worker_start("127.0.0.1", 3389).unwrap();
+        assert!(matches!(
+            s.desktop_worker_status().state,
+            WorkerState::Ready
+        ));
+        s.desktop_worker_stop(Some(id)).unwrap();
+        assert_eq!(s.desktop_worker_status().state, WorkerState::Stopped);
     }
 }

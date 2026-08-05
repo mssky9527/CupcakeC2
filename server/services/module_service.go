@@ -40,6 +40,7 @@ func IsProductModule(id string) bool {
 // NewModuleServiceForTest builds an isolated service (TempDir) — not the process singleton.
 func NewModuleServiceForTest(dir string) *ModuleService {
 	_ = os.MkdirAll(dir, 0o755)
+	SetModuleTrustKeyDir(dir)
 	return &ModuleService{
 		raw:         make(map[string][]byte),
 		dir:         dir,
@@ -88,12 +89,15 @@ func GetModuleService() *ModuleService {
 	moduleOnce.Do(func() {
 		dir := paths.Join("modules")
 		_ = os.MkdirAll(dir, 0o755)
+		SetModuleTrustKeyDir(dir)
 		defaultModuleService = &ModuleService{
 			raw:         make(map[string][]byte),
 			dir:         dir,
 			agentLoaded: make(map[string]map[string]bool),
 		}
 		defaultModuleService.scanDisk()
+		// Auto-sign product modules that lack {id}.trust.json (lab / first boot).
+		defaultModuleService.signProductModulesOnDisk()
 	})
 	return defaultModuleService
 }

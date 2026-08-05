@@ -3,6 +3,7 @@ import { onMounted, onUnmounted, ref, nextTick } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
+import { request } from '@/api'
 
 const props = defineProps({
     socket: Object, 
@@ -288,13 +289,24 @@ const handleFallbackInput = (data) => {
   }
 }
 
-const initPTY = () => {
-  const token = localStorage.getItem('cupcake_token')
+const initPTY = async () => {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
-  const wsUrl = `${protocol}://${window.location.host}/api/pty/${props.clientId}?token=${encodeURIComponent(token)}`
-  
+  let ticket = ''
+  try {
+    // Short-lived upgrade ticket (session bearer stays in Authorization header only)
+    const res = await request.post('/api/auth/ws-ticket', { purpose: 'pty' })
+    ticket = res?.data?.ticket || ''
+  } catch (_) {
+    ticket = ''
+  }
+  if (!ticket) {
+    term.writeln('\r\n\x1b[31m[!] Failed to mint PTY upgrade ticket (login required).\x1b[0m')
+    return
+  }
+  const wsUrl = `${protocol}://${window.location.host}/api/pty/${props.clientId}?ticket=${encodeURIComponent(ticket)}`
+
   ptySocket = new WebSocket(wsUrl)
-  ptySocket.binaryType = 'arraybuffer' 
+  ptySocket.binaryType = 'arraybuffer'
 
   ptySocket.onopen = () => {
     term.writeln('\x1b[32m[+] Interactive PTY Connected.\x1b[0m')

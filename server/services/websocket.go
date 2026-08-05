@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"cupcake-server/pkg/globals"
@@ -21,6 +22,39 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/hashicorp/yamux"
 )
+
+// agentLastMigrate tracks last successful session replace per UUID (thrash guard).
+var agentLastMigrate sync.Map // uuid -> time.Time
+
+// suppressAgentReconnectThrash is true when a second process is fighting for the
+// same agent UUID (Migrating every ~5s). Keep the existing live session.
+func suppressAgentReconnectThrash(id string, old *globals.Client) bool {
+	if old == nil {
+		return false
+	}
+	last, ok := agentLastMigrate.Load(id)
+	if !ok {
+		return false
+	}
+	t, _ := last.(time.Time)
+	// Within this window after a migrate, another register is almost always a
+	// duplicate agent binary (same UUID seed), not a real host migration.
+	if time.Since(t) > 15*time.Second {
+		return false
+	}
+	// Prefer keeping old if Yamux still open (healthy control plane).
+	if old.YamuxSession != nil && !old.YamuxSession.IsClosed() {
+		return true
+	}
+	if old.TCPConn != nil {
+		return true
+	}
+	return false
+}
+
+func markAgentMigrated(id string) {
+	agentLastMigrate.Store(id, time.Now())
+}
 
 // resolveAgentSalt prefers per-build kdf_salt from register payload (base64 raw bytes).
 func resolveAgentSalt(p map[string]interface{}, fallback string) string {
@@ -749,7 +783,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			// 🚨 V3.0.1 Robustness: Close old connection if this agent is re-registering
 			// ⚡ FIX: Store new client BEFORE closing old connection to prevent race condition
 			// where old connection's defer marks the agent offline after new one registers.
-			
+
 			// Save reference to old client before overwriting
 			var oldClient *globals.Client
 			if oldVal, ok := globals.Clients.Load(id); ok {
@@ -759,6 +793,25 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 			var ySession *yamux.Session
 			if s, ok := session.(*yamux.Session); ok {
 				ySession = s
+			}
+
+			// Thrash guard: two agent processes with the same UUID will reconnect
+			// every few seconds (Migrating A→B→A…). That aborts file_upload_chunk
+			// and freezes the UI progress bar. If we just migrated and the previous
+			// session still looks alive, drop the NEW connection instead.
+			if oldClient != nil {
+				if suppressAgentReconnectThrash(id, oldClient) {
+					log.Printf("\x1b[33m[~] Agent thrash suppressed\x1b[0m %s: dropping new conn %s (keep existing session — kill duplicate agent process on target)",
+						id, remoteAddr)
+					if ySession != nil {
+						_ = ySession.Close()
+					}
+					_ = conn.Close()
+					// Do not bind this handler to the agent UUID (defer must not offline the real one).
+					clientUUID = ""
+					client = nil
+					return
+				}
 			}
 
 			client = &globals.Client{
@@ -777,7 +830,7 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 				ObfuscateMode:   ln.ObfuscateMode,
 				NoiseSessionKey: noiseSessionKey,
 				SessionKey:      append([]byte(nil), staticSessionKey...),
-				CommandChannel:  make(chan string, 10),
+				CommandChannel:  make(chan string, 64),
 				OutputChannel:   make(chan string, 256),
 				ListenerID:      ln.ID,
 				ListenerPort:    ln.Port,
@@ -790,9 +843,14 @@ func ProcessTCPConnection(conn net.Conn, remoteAddr string, ln *globals.Listener
 
 			// NOW close old connection safely
 			if oldClient != nil && oldClient != client {
+				markAgentMigrated(id)
 				log.Printf("\x1b[33m[~] Agent Migrating\x1b[0m %s → %s", id, remoteAddr)
-				if oldClient.TCPConn != nil { oldClient.TCPConn.Close() }
-				if oldClient.YamuxSession != nil { oldClient.YamuxSession.Close() }
+				if oldClient.TCPConn != nil {
+					oldClient.TCPConn.Close()
+				}
+				if oldClient.YamuxSession != nil {
+					oldClient.YamuxSession.Close()
+				}
 				oldClient.CloseOutputChannel()
 			}
 

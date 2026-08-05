@@ -36,6 +36,37 @@ func TestStage2CacheRoundTrip(t *testing.T) {
 	if _, _, err := LoadStage2("missing-id"); err == nil {
 		t.Fatal("expected missing error")
 	}
+	if !Stage2Exists("test-stage2-id") {
+		t.Fatal("expected Stage2Exists true")
+	}
+	if Stage2Exists("missing-id") {
+		t.Fatal("expected Stage2Exists false for missing")
+	}
+}
+
+func TestConsumeStage2MaxHits(t *testing.T) {
+	id := "test-stage2-max-hits"
+	body := []byte{0x41, 0x42, 0x43, 0x44}
+	// Override process-wide counter max by re-storing and consuming up to stage2Hits.Max().
+	StoreStage2(id, body, "x64", "ln1", "tcp://1.2.3.4:443")
+	max := stage2Hits.Max()
+	for i := 0; i < max; i++ {
+		got, _, status, err := ConsumeStage2(id)
+		if err != nil || status != "ok" {
+			t.Fatalf("consume %d: err=%v status=%s", i+1, err, status)
+		}
+		if len(got) != len(body) {
+			t.Fatalf("consume %d: bad len", i+1)
+		}
+	}
+	_, _, status, err := ConsumeStage2(id)
+	if err == nil || status != "max_hits" {
+		t.Fatalf("expected max_hits, got status=%s err=%v", status, err)
+	}
+	// Entry removed after max
+	if Stage2Exists(id) {
+		t.Fatal("cache entry should be gone after max hits")
+	}
 }
 
 // Donut-linked conversion tests live in fileless_donut_test.go (!nodonut).

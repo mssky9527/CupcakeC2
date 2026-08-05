@@ -608,4 +608,33 @@ mod bound_tests {
         assert_eq!(take4, 50);
         assert!(hit4);
     }
+
+    /// Truncation behavior at the worker 2 MiB output ceiling (MAX_OUTPUT_BYTES).
+    #[test]
+    fn apply_output_bound_two_mib_cap() {
+        // Keep independent of module-loader feature so spawn unit tests always build.
+        let max = 2 * 1024 * 1024usize;
+        let (take, hit) = apply_output_bound(max - 10, 100, max);
+        assert_eq!(take, 10);
+        assert!(hit);
+        let (take2, hit2) = apply_output_bound(max, 1, max);
+        assert_eq!(take2, 0);
+        assert!(hit2);
+        let (take3, hit3) = apply_output_bound(0, max, max);
+        assert_eq!(take3, max);
+        assert!(hit3);
+        let (take4, hit4) = apply_output_bound(0, max - 1, max);
+        assert_eq!(take4, max - 1);
+        assert!(!hit4);
+    }
+
+    #[cfg(feature = "module-loader")]
+    #[test]
+    fn apply_output_bound_matches_max_output_bytes_const() {
+        use crate::module_supervisor::MAX_OUTPUT_BYTES;
+        assert_eq!(MAX_OUTPUT_BYTES, 2 * 1024 * 1024);
+        let (take, hit) = apply_output_bound(MAX_OUTPUT_BYTES - 1, 8, MAX_OUTPUT_BYTES);
+        assert_eq!(take, 1);
+        assert!(hit);
+    }
 }

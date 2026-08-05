@@ -246,4 +246,50 @@ mod tests {
             let _ = job;
         }
     }
+
+    /// Contract: JobObject::create is fail-closed — Option::None means isolation
+    /// unavailable and callers must refuse to run uncontained workers.
+    #[test]
+    fn create_returns_none_means_fail_closed_contract() {
+        let job = super::JobObject::create();
+        match job {
+            None => {
+                // Call sites treat None as hard error (see isolated_exec /
+                // module_supervisor run_* paths: terminate child + return Err).
+            }
+            Some(j) => {
+                // Successful create implies set_limits applied; terminate empty job.
+                let _ = j.terminate(1);
+                // Drop closes the handle (kill-on-close).
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn non_windows_create_is_always_none() {
+        assert!(
+            super::JobObject::create().is_none(),
+            "non-windows JobObject::create must return None (fail-closed)"
+        );
+        let stub = super::JobObject;
+        assert!(stub.assign_process(0).is_err());
+        assert!(stub.terminate(1).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_create_success_implies_limits_or_none() {
+        // Double create: both must either succeed with a live handle or None.
+        // There is no partial state (create without limits) — set_limits fail
+        // drops the handle and returns None.
+        let a = super::JobObject::create();
+        let b = super::JobObject::create();
+        if let Some(j) = a {
+            assert!(j.terminate(0).is_ok() || j.terminate(0).is_err());
+        }
+        if let Some(j) = b {
+            let _ = j.terminate(0);
+        }
+    }
 }

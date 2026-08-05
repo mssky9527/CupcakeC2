@@ -34,3 +34,24 @@ func GetLoginLogs(limit int) ([]model.LoginLog, error) {
     err := DB.Order("created_at desc").Limit(limit).Find(&logs).Error
     return logs, err
 }
+
+// SaveAuditLog persists an MCP/panel audit entry. Best-effort: never panics;
+// returns nil when DB is not initialized (e.g. unit tests without InitDB).
+func SaveAuditLog(entry *model.AuditLog) error {
+    if DB == nil || entry == nil {
+        return nil
+    }
+    return DB.Create(entry).Error
+}
+
+func GetAuditLogs(limit int) ([]model.AuditLog, error) {
+    var logs []model.AuditLog
+    if DB == nil {
+        return logs, nil
+    }
+    if limit <= 0 {
+        limit = 100
+    }
+    err := DB.Order("created_at desc").Limit(limit).Find(&logs).Error
+    return logs, err
+}

@@ -6,6 +6,8 @@ members = [
     "modules/desktop",
     "modules/inject",
     "iso_host",
+    # Long-lived RDP relay worker (opt-in CUPCAKE_DESKTOP_WORKER=1; default = desktop_bridge)
+    "desktop_worker",
     # Optional crates for iso_host / legacy builds (not product catalog modules)
     "modules/bof",
     "modules/dotnet",

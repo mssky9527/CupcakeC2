@@ -99,6 +99,14 @@ func HandleUploadPlugin(c *gin.Context) {
 	}
 
 	os.MkdirAll("assets/plugins", 0755)
+	// Disk/quota gate before write (same reserve as agent transfer uploads).
+	if err := services.CheckDiskForWrite("assets/plugins", file.Size); err != nil {
+		c.JSON(http.StatusInsufficientStorage, gin.H{
+			"error":          "insufficient disk space",
+			"min_free_bytes": services.MinFreeDiskBytes(),
+		})
+		return
+	}
 	safeFileName := sanitizeFileName(file.Filename)
 	if safeFileName == "" || safeFileName == "." {
 		c.JSON(400, gin.H{"error": "Invalid file name"})
@@ -148,6 +156,8 @@ func HandleUploadPlugin(c *gin.Context) {
 		category = "general"
 	}
 
+	version := strings.TrimSpace(c.PostForm("version"))
+	signer := strings.TrimSpace(c.PostForm("signer"))
 	manifest := services.PluginMetadata{
 		ID:          pluginID,
 		Name:        name,
@@ -157,6 +167,13 @@ func HandleUploadPlugin(c *gin.Context) {
 		RequiredOS:  osReq,
 		Category:    category,
 		Hash:        fileHash,
+		Version:     version,
+		Signer:      signer,
+	}
+	// Auto-sign when trust HMAC key is configured (dev keys or CUPCAKE_TRUST_HMAC_KEY).
+	if err := services.SignPluginMetadata(&manifest, raw); err != nil {
+		c.JSON(500, gin.H{"error": "Failed to sign plugin: " + err.Error()})
+		return
 	}
 
 	if err := services.AddPluginToManifest(manifest); err != nil {

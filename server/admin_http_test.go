@@ -9,17 +9,18 @@ import (
 func TestNewAdminHTTPServerTimeouts(t *testing.T) {
 	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
 	srv := newAdminHTTPServer("127.0.0.1:0", h)
-	if srv.ReadHeaderTimeout != 10*time.Second {
-		t.Fatalf("ReadHeaderTimeout: got %v want 10s", srv.ReadHeaderTimeout)
+	if srv.ReadHeaderTimeout != 15*time.Second {
+		t.Fatalf("ReadHeaderTimeout: got %v want 15s", srv.ReadHeaderTimeout)
 	}
-	if srv.ReadTimeout != 60*time.Second {
-		t.Fatalf("ReadTimeout: got %v want 60s", srv.ReadTimeout)
+	// Body may stream for a long time (upload → agent chunks); must not hard-cap.
+	if srv.ReadTimeout != 0 {
+		t.Fatalf("ReadTimeout: got %v want 0 (no whole-request deadline)", srv.ReadTimeout)
 	}
-	if srv.WriteTimeout != 300*time.Second {
-		t.Fatalf("WriteTimeout: got %v want 300s", srv.WriteTimeout)
+	if srv.WriteTimeout != 0 {
+		t.Fatalf("WriteTimeout: got %v want 0", srv.WriteTimeout)
 	}
-	if srv.IdleTimeout != 120*time.Second {
-		t.Fatalf("IdleTimeout: got %v want 120s", srv.IdleTimeout)
+	if srv.IdleTimeout != 180*time.Second {
+		t.Fatalf("IdleTimeout: got %v want 180s", srv.IdleTimeout)
 	}
 	if srv.MaxHeaderBytes != 1<<20 {
 		t.Fatalf("MaxHeaderBytes: got %d want %d", srv.MaxHeaderBytes, 1<<20)

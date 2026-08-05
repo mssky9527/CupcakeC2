@@ -88,11 +88,13 @@ func InitDB() {
 
 	// Auto Migrate
 	err = DB.AutoMigrate(
-		&model.Agent{}, 
-		&model.CommandLog{}, 
+		&model.Agent{},
+		&model.CommandLog{},
 		&model.Listener{},
 		&model.User{},
+		&model.Session{},
 		&model.LoginLog{},
+		&model.AuditLog{},
 		&model.GlobalSetting{},
 		&model.NotificationWebhook{},
 		&model.Tunnel{},

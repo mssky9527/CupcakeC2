@@ -158,9 +158,9 @@ impl Transport for TcpTransport {
                                                 stream_id, type_buf[0]
                                             ));
                                             use crate::transport::stream_types::{
-                                                YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FS,
-                                                YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY,
-                                                YAMUX_STREAM_SOCKS,
+                                                YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FILE,
+                                                YAMUX_STREAM_FS, YAMUX_STREAM_PROCESS,
+                                                YAMUX_STREAM_PTY, YAMUX_STREAM_SOCKS,
                                             };
                                             match type_buf[0] {
                                                 YAMUX_STREAM_PTY => {
@@ -227,6 +227,29 @@ impl Transport for TcpTransport {
                                                         use futures_util::AsyncWriteExt;
                                                         let mut s = stream;
                                                         let _ = s.write_all(&[0x00u8]).await;
+                                                        let _ = s.close().await;
+                                                    }
+                                                }
+                                                YAMUX_STREAM_FILE => {
+                                                    // Binary put/get — same feature gate as FS (0x03)
+                                                    #[cfg(feature = "post-ex")]
+                                                    {
+                                                        crate::utils::db_print(&format!(
+                                                            "[Yamux] Routing to FILE handler (Stream {})",
+                                                            stream_id
+                                                        ));
+                                                        crate::file_stream::handle_stream(stream)
+                                                            .await;
+                                                    }
+                                                    #[cfg(not(feature = "post-ex"))]
+                                                    {
+                                                        use futures_util::AsyncWriteExt;
+                                                        let mut s = stream;
+                                                        let _ = s
+                                                            .write_all(
+                                                                b"\r\n[!] FILE stream not in Stage0 (beacon)\r\n",
+                                                            )
+                                                            .await;
                                                         let _ = s.close().await;
                                                     }
                                                 }

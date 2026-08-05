@@ -18,6 +18,9 @@ func TestYamuxStreamTypeLockedValues(t *testing.T) {
 	if YamuxStreamDesktop != 0x0D {
 		t.Fatalf("DESKTOP: got 0x%02x want 0x0D", YamuxStreamDesktop)
 	}
+	if YamuxStreamFILE != 0x0E {
+		t.Fatalf("FILE: got 0x%02x want 0x0E", YamuxStreamFILE)
+	}
 	if YamuxStreamReserved != 0xFF {
 		t.Fatalf("RESERVED: got 0x%02x want 0xFF", YamuxStreamReserved)
 	}
@@ -30,6 +33,7 @@ func TestYamuxStreamTypeTableMatchesConsts(t *testing.T) {
 		"FS":       YamuxStreamFS,
 		"PROCESS":  YamuxStreamProcess,
 		"DESKTOP":  YamuxStreamDesktop,
+		"FILE":     YamuxStreamFILE,
 		"RESERVED": YamuxStreamReserved,
 	}
 	if len(YamuxStreamTypeTable) != len(want) {

@@ -44,10 +44,23 @@ func TestVerifyPluginHashMismatch(t *testing.T) {
 	}
 }
 
-func TestVerifyPluginHashLegacyEmptyAllowed(t *testing.T) {
+func TestVerifyPluginHashEmptyFailsClosed(t *testing.T) {
+	t.Setenv("CUPCAKE_ALLOW_LEGACY_PLUGIN_HASH", "")
+	meta := &PluginMetadata{ID: "legacy", Hash: ""}
+	err := VerifyPluginHash(meta, []byte("any"))
+	if err == nil {
+		t.Fatal("empty hash must fail closed without CUPCAKE_ALLOW_LEGACY_PLUGIN_HASH")
+	}
+	if !contains(err.Error(), "hash missing") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestVerifyPluginHashLegacyEmptyAllowedWithEnv(t *testing.T) {
+	t.Setenv("CUPCAKE_ALLOW_LEGACY_PLUGIN_HASH", "1")
 	meta := &PluginMetadata{ID: "legacy", Hash: ""}
 	if err := VerifyPluginHash(meta, []byte("any")); err != nil {
-		t.Fatalf("legacy empty hash should allow: %v", err)
+		t.Fatalf("legacy empty hash should allow with env: %v", err)
 	}
 }
 

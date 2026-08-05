@@ -105,15 +105,31 @@ func GetDashboard(c *gin.Context) {
 	})
 }
 
+// sanitizeAgentForAPI trims NUL-padded / whitespace fields before JSON export.
+func sanitizeAgentForAPI(a model.Agent) model.Agent {
+	a.EncryptionSalt = strings.TrimRight(a.EncryptionSalt, "\x00")
+	a.EncryptionSalt = strings.TrimSpace(a.EncryptionSalt)
+	return a
+}
+
+func sanitizeAgentsForAPI(agents []model.Agent) []model.Agent {
+	if agents == nil {
+		return []model.Agent{}
+	}
+	out := make([]model.Agent, len(agents))
+	for i := range agents {
+		out[i] = sanitizeAgentForAPI(agents[i])
+	}
+	return out
+}
+
 func GetClients(c *gin.Context) {
 	agents, err := store.GetAllAgents()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	if agents == nil {
-		agents = []model.Agent{}
-	}
+	agents = sanitizeAgentsForAPI(agents)
 	// Optional pagination: ?page=1&page_size=50 (0/missing page_size = full list for compatibility)
 	page := 0
 	pageSize := 0

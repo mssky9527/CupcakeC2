@@ -23,7 +23,7 @@ import logging
 from typing import Optional
 
 import requests
-from mcp.server import Server
+from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 import mcp.types as types
 from mcp.server.stdio import stdio_server
@@ -542,7 +542,7 @@ async def main():
             server_name="cupcake-c2",
             server_version="2.0.0",
             capabilities=server.get_capabilities(
-                notification_options=None,
+                notification_options=NotificationOptions(tools_changed=True),
                 experimental_capabilities={},
             ),
         )

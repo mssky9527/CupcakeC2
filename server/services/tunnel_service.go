@@ -35,6 +35,35 @@ var (
     tunnelMutex   sync.RWMutex
 )
 
+// ValidateTunnelPort normalizes and validates a TCP port for tunnels.
+// Empty port is rejected (would bind a random ephemeral port and orphan the map key).
+func ValidateTunnelPort(port string) (string, error) {
+	port = strings.TrimSpace(port)
+	if port == "" {
+		return "", fmt.Errorf("port is required")
+	}
+	// Reject non-numeric junk (strconv.Atoi accepts leading spaces only after TrimSpace).
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return "", fmt.Errorf("invalid port %q", port)
+	}
+	if n < 1 || n > 65535 {
+		return "", fmt.Errorf("port out of range (1-65535): %d", n)
+	}
+	// Normalize to decimal string without leading zeros confusion for map keys.
+	return strconv.Itoa(n), nil
+}
+
+// AgentIsOnline reports whether the agent currently has a live control session.
+func AgentIsOnline(agentID string) bool {
+	agentID = strings.TrimSpace(agentID)
+	if agentID == "" {
+		return false
+	}
+	_, ok := globals.Clients.Load(agentID)
+	return ok
+}
+
 // storeTunnelPassword returns bcrypt hash for DB/memory. Empty stays empty.
 // Already-hashed values (restore path) are returned as-is.
 func storeTunnelPassword(password string) (string, error) {
@@ -66,6 +95,16 @@ func verifyTunnelAuth(gotUser, gotPass, wantUser, storedPass string) bool {
 // StartTunnel starts a TCP listener on the VPS for either SOCKS5 or HTTP Proxy.
 // password may be plaintext (API create) or bcrypt hash (DB restore).
 func StartTunnel(agentID, port, tType, username, password string) error {
+    var err error
+    port, err = ValidateTunnelPort(port)
+    if err != nil {
+        return err
+    }
+    agentID = strings.TrimSpace(agentID)
+    if agentID == "" {
+        return fmt.Errorf("agent uuid is required")
+    }
+
     tunnelMutex.Lock()
     defer tunnelMutex.Unlock()
 
@@ -144,6 +183,11 @@ func StartTunnel(agentID, port, tType, username, password string) error {
 
 // StopTunnel stops but keeps record
 func StopTunnel(port string) error {
+    var err error
+    port, err = ValidateTunnelPort(port)
+    if err != nil {
+        return err
+    }
     tunnelMutex.Lock()
     defer tunnelMutex.Unlock()
 
@@ -167,6 +211,11 @@ func StopTunnel(port string) error {
 
 // DeleteTunnel stops and removes the tunnel record from DB
 func DeleteTunnel(port string) error {
+    var err error
+    port, err = ValidateTunnelPort(port)
+    if err != nil {
+        return err
+    }
     tunnelMutex.Lock()
     defer tunnelMutex.Unlock()
 
@@ -193,6 +242,11 @@ func RestoreTunnels() {
     store.DB.Where("status = ?", "running").Find(&tunnels)
     
     for _, t := range tunnels {
+        if _, err := ValidateTunnelPort(t.Port); err != nil {
+            log.Printf("[TUNNEL] Skip restore: invalid port %q for agent %s: %v", t.Port, t.AgentID, err)
+            _ = store.UpdateTunnelStatus(t.Port, "stopped")
+            continue
+        }
         log.Printf("[TUNNEL] Restoring %s tunnel on port %s for Agent %s", t.Mode, t.Port, t.AgentID)
         err := StartTunnel(t.AgentID, t.Port, strings.ToLower(t.Mode), t.Username, t.Password)
         if err != nil {

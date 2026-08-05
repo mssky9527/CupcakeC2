@@ -51,4 +51,7 @@ export const fsDownload = (data, onDownloadProgress) => request.get('/api/files/
 // 终端历史日志
 export const getShellLogs = (uuid) => request.get(`/api/shell/${uuid}`)
 
+// Short-lived WebSocket upgrade ticket (purpose: pty | shell | build_logs)
+export const mintWsTicket = (purpose) => request.post('/api/auth/ws-ticket', { purpose })
+
 export default request

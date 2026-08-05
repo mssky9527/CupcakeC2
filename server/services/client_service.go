@@ -111,6 +111,11 @@ func SendModuleStageWait(uuid, moduleID string, timeout time.Duration) (string, 
 	// Ensure runtime bins from disk if not registered yet
 	_ = ms.TryLoadDefaultRuntime(moduleID)
 
+	// Cryptographic package trust (HMAC + anti-rollback) before stage/push.
+	if err := ms.VerifyModuleBeforePush(moduleID); err != nil {
+		return "", fmt.Errorf("module trust check failed: %w", err)
+	}
+
 	b64, err := ms.PackBase64WithKey(moduleID, moduleHMAC)
 	if err != nil {
 		return "", err

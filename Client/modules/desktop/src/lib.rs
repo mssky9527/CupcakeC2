@@ -1,8 +1,9 @@
 //! L2 `mod_desktop` — capability package for remote desktop (RDP port-forward).
 //!
-//! **Not in Stage0.** Operator stages this DLL (`desktop.bin`) from Module panel,
-//! then opens 远程桌面. Stage0 `desktop_bridge` only runs the Yamux DESKTOP (0x0D)
-//! RDP relay while this module is Loaded.
+//! **Not in Stage0.** Operator stages this package (`desktop.bin`) from Module panel,
+//! then opens 远程桌面. Stage0 registers it as a product worker (not mapped); on load,
+//! Stage0 auto-enables local RDP (3389) — see `cupcake_core::rdp_enable`.
+//! `desktop_bridge` then runs the Yamux DESKTOP (0x0D) relay while this module is Loaded.
 //!
 //! No GDI/JPEG capture — product path is agent-side dial to target:3389.
 

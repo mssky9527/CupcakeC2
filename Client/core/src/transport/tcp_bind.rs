@@ -82,8 +82,8 @@ impl TcpBindTransport {
                             let mut type_buf = [0u8; 1];
                             if stream.read_exact(&mut type_buf).await.is_ok() {
                                 use crate::transport::stream_types::{
-                                    YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FS, YAMUX_STREAM_PROCESS,
-                                    YAMUX_STREAM_PTY, YAMUX_STREAM_SOCKS,
+                                    YAMUX_STREAM_DESKTOP, YAMUX_STREAM_FILE, YAMUX_STREAM_FS,
+                                    YAMUX_STREAM_PROCESS, YAMUX_STREAM_PTY, YAMUX_STREAM_SOCKS,
                                 };
                                 match type_buf[0] {
                                     YAMUX_STREAM_PTY => {
@@ -137,6 +137,14 @@ impl TcpBindTransport {
                                             let mut s = stream;
                                             let _ = s.write_all(&[0x00u8]).await;
                                             let _ = s.close().await;
+                                        }
+                                    }
+                                    YAMUX_STREAM_FILE => {
+                                        #[cfg(feature = "post-ex")]
+                                        crate::file_stream::handle_stream(stream).await;
+                                        #[cfg(not(feature = "post-ex"))]
+                                        {
+                                            let _ = stream;
                                         }
                                     }
                                     _ => {}

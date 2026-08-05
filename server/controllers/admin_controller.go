@@ -14,6 +14,7 @@ import (
 	"cupcake-server/pkg/middleware"
 	"cupcake-server/pkg/model"
 	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/wsticket"
 	"cupcake-server/services"
 )
 
@@ -143,10 +144,17 @@ func HandleLogin(c *gin.Context) {
 		Status:    "success",
 	})
 
-	// Generate a unique session token for this user login
+	// Issue a panel session (store only sha256 hash; return raw token once).
 	sessionToken := store.GenerateSecureToken(32)
-	user.Token = sessionToken
-	store.SaveUser(user)
+	if _, err := store.CreateSession(user.ID, sessionToken, ip, c.GetHeader("User-Agent"), store.SessionTTL()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to create session"})
+		return
+	}
+	// Stop using legacy User.Token for auth (column may remain for migration).
+	if user.Token != "" {
+		user.Token = ""
+		_ = store.SaveUser(user)
+	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"token": sessionToken,
@@ -197,7 +205,7 @@ func HandleChangeMyPassword(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "new_password required"})
 		return
 	}
-	// Resolve current user from bearer token (AuthMiddleware already validated)
+	// Resolve current user from bearer session (AuthMiddleware already validated)
 	token := ""
 	if authHeader := c.GetHeader("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 		token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
@@ -206,8 +214,8 @@ func HandleChangeMyPassword(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
-	var user model.User
-	if err := store.DB.Where("token = ?", token).First(&user).Error; err != nil {
+	_, user, err := store.LookupSession(token)
+	if err != nil || user == nil {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
@@ -222,12 +230,16 @@ func HandleChangeMyPassword(c *gin.Context) {
 		return
 	}
 	user.Password = hashed
-	// Invalidate the existing session so a leaked bearer token stops working
-	// immediately after the password is changed.
-	newToken := store.GenerateSecureToken(32)
-	user.Token = newToken
-	if err := store.SaveUser(&user); err != nil {
+	user.Token = "" // legacy column unused
+	if err := store.SaveUser(user); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	// Password change invalidates all existing sessions; issue a fresh one.
+	_ = store.RevokeAllUserSessions(user.ID)
+	newToken := store.GenerateSecureToken(32)
+	if _, err := store.CreateSession(user.ID, newToken, c.ClientIP(), c.GetHeader("User-Agent"), store.SessionTTL()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "password updated but session create failed"})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"msg": "password updated", "token": newToken})
@@ -263,6 +275,14 @@ func HandleUpdateUser(c *gin.Context) {
 	}
 
 	store.SaveUser(&user)
+
+	// Admin password reset or disable: drop all active sessions for that user.
+	if req.Password != "" || (req.IsActive != nil && !*req.IsActive) {
+		_ = store.RevokeAllUserSessions(user.ID)
+		user.Token = ""
+		_ = store.SaveUser(&user)
+	}
+
 	c.JSON(http.StatusOK, gin.H{"msg": "User updated"})
 }
 
@@ -271,6 +291,7 @@ func HandleDeleteUser(c *gin.Context) {
 	idStr := c.Param("id")
 	var id uint
 	fmt.Sscanf(idStr, "%d", &id)
+	_ = store.RevokeAllUserSessions(id)
 	if err := store.DeleteUser(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -435,21 +456,13 @@ func HandleMaintenanceReset(c *gin.Context) {
 		return
 	}
 
-	// Prefer admin role from bearer user session
-	authHeader := c.GetHeader("Authorization")
-	token := ""
-	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
-		token = authHeader[7:]
-	}
-	if token != "" {
-		var user model.User
-		if err := store.DB.Where("token = ?", token).First(&user).Error; err == nil {
-			if user.Role != "admin" && user.Role != "Admin" && user.Role != "administrator" {
-				c.JSON(http.StatusForbidden, gin.H{"error": "admin role required for maintenance reset"})
-				return
-			}
+	// RequireAdmin already gates this route; keep a belt-and-suspenders
+	// principal check without depending on legacy User.Token.
+	if p, ok := middleware.CurrentPrincipal(c); ok {
+		if p.Kind != "user" || !middleware.IsAdminRole(p.Role) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "admin role required for maintenance reset"})
+			return
 		}
-		// Master API token (MCP) is treated as admin
 	}
 
 	store.DB.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.Agent{})
@@ -469,14 +482,82 @@ func HandleMaintenanceReset(c *gin.Context) {
 func HandleLogout(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if len(authHeader) > 7 && authHeader[:7] == "Bearer " {
-		token := authHeader[7:]
-		var user model.User
-		if err := store.DB.Where("token = ?", token).First(&user).Error; err == nil {
-			user.Token = ""
-			_ = store.SaveUser(&user)
-		}
+		token := strings.TrimSpace(authHeader[7:])
+		_ = store.RevokeSession(token)
 	}
 	c.JSON(http.StatusOK, gin.H{"msg": "logged out"})
+}
+
+// HandleMintWSTicket issues a short-lived, single-use WebSocket upgrade ticket.
+// Requires an authenticated panel user (session bearer via Authorization).
+// purpose "pty" / "shell" need operator+; "build_logs" is any authenticated user.
+func HandleMintWSTicket(c *gin.Context) {
+	principal, ok := middleware.CurrentPrincipal(c)
+	if !ok || principal.Kind != "user" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var req struct {
+		Purpose string `json:"purpose"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
+		return
+	}
+	purpose := strings.ToLower(strings.TrimSpace(req.Purpose))
+	if !wsticket.ValidPurpose(purpose) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid purpose", "allowed": []string{
+			wsticket.PurposePTY, wsticket.PurposeShell, wsticket.PurposeBuildLogs,
+		}})
+		return
+	}
+	switch purpose {
+	case wsticket.PurposePTY, wsticket.PurposeShell:
+		if !middleware.IsOperatorOrAbove(principal.Role) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "operator role required"})
+			return
+		}
+	case wsticket.PurposeBuildLogs:
+		// Any authenticated panel user (viewer+).
+		if !middleware.IsViewerOrAbove(principal.Role) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient role"})
+			return
+		}
+	}
+
+	// Resolve user id from session (principal carries username/role only).
+	token := ""
+	if authHeader := c.GetHeader("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	}
+	var userID uint
+	if token != "" {
+		if sess, user, err := store.LookupSession(token); err == nil && user != nil {
+			userID = user.ID
+			_ = sess
+		}
+	}
+	if userID == 0 {
+		if user, err := store.GetUserByUsername(principal.Username); err == nil && user != nil {
+			userID = user.ID
+		}
+	}
+	if userID == 0 {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	raw, err := wsticket.Mint(userID, principal.Username, principal.Role, purpose, wsticket.DefaultTTL)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to mint ticket"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"ticket":     raw,
+		"expires_in": int(wsticket.DefaultTTL.Seconds()),
+		"purpose":    purpose,
+	})
 }
 
 // HandleMaintenanceExport exports all data
@@ -485,6 +566,7 @@ func HandleMaintenanceExport(c *gin.Context) {
 	var logs []model.CommandLog
 	store.DB.Find(&agents)
 	store.DB.Find(&logs)
+	agents = sanitizeAgentsForAPI(agents)
 
 	exportData := gin.H{
 		"agents":      agents,

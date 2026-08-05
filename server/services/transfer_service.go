@@ -59,6 +59,23 @@ func ValidateAgentUpload(uuidStr string, size int64) (status int, msg string) {
 	return 0, ""
 }
 
+// ValidateAgentUploadWithDisk extends ValidateAgentUpload with a free-space gate.
+// freeBytes is the caller's measured free space (for tests inject a fake value;
+// production uses FreeDiskBytes / CheckDiskForWrite).
+// Returns HTTP status and error message; status 0 means OK.
+func ValidateAgentUploadWithDisk(uuidStr string, size int64, freeBytes int64) (status int, msg string) {
+	if status, msg := ValidateAgentUpload(uuidStr, size); status != 0 {
+		return status, msg
+	}
+	if size < 0 {
+		size = 0
+	}
+	if err := RejectIfInsufficient(freeBytes, size, MinFreeDiskBytes()); err != nil {
+		return http.StatusInsufficientStorage, "insufficient disk space"
+	}
+	return 0, ""
+}
+
 // Handler: Agent Uploads File (Exfiltration)
 // POST /api/transfer/upload
 func HandleAgentUpload(c *gin.Context) {
@@ -76,6 +93,15 @@ func HandleAgentUpload(c *gin.Context) {
 			body["max_bytes"] = MaxAgentUploadBytes
 		}
 		c.JSON(status, body)
+		return
+	}
+
+	// Disk/quota gate before any write (size already capped by MaxAgentUploadBytes).
+	if err := CheckDiskForWrite(transferRoot(), file.Size); err != nil {
+		c.JSON(http.StatusInsufficientStorage, gin.H{
+			"error":         "insufficient disk space",
+			"min_free_bytes": MinFreeDiskBytes(),
+		})
 		return
 	}
 

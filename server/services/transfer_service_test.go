@@ -41,6 +41,10 @@ func TestValidateAgentUploadGates(t *testing.T) {
 	if st, msg := ValidateAgentUpload(good, MaxAgentUploadBytes+1); st != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversize: status=%d msg=%s", st, msg)
 	}
+	// Exactly at max is allowed by size gate (disk checked separately).
+	if st, _ := ValidateAgentUpload(good, MaxAgentUploadBytes); st != 0 {
+		t.Fatalf("exact max should pass size gate, status=%d", st)
+	}
 	if st, msg := ValidateAgentUpload("", 10); st != http.StatusBadRequest || !strings.Contains(msg, "UUID") {
 		t.Fatalf("empty uuid: %d %s", st, msg)
 	}
@@ -49,6 +53,10 @@ func TestValidateAgentUploadGates(t *testing.T) {
 	}
 	if MaxAgentUploadBytes != 256<<20 {
 		t.Fatalf("MaxAgentUploadBytes = %d", MaxAgentUploadBytes)
+	}
+	// Size gate does not consult disk; oversized still 413 even if free is huge.
+	if st, _ := ValidateAgentUpload(good, MaxAgentUploadBytes+1); st != http.StatusRequestEntityTooLarge {
+		t.Fatalf("MaxAgentUploadBytes must still be enforced")
 	}
 }
 

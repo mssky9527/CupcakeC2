@@ -12,8 +12,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"cupcake-server/pkg/metrics"
 	"cupcake-server/pkg/model"
 	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/wsticket"
 )
 
 const (
@@ -164,11 +166,27 @@ func tokenEqual(a, b string) bool {
 	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
 }
 
-// allowQueryToken is intentionally restricted to browser WebSocket upgrades.
-func allowQueryToken(path string) bool {
+// isWSUpgradePath is true for panel interactive WebSocket endpoints that must
+// not accept a durable session bearer via the query string alone.
+func isWSUpgradePath(path string) bool {
 	return strings.HasPrefix(path, "/api/build/logs/") ||
 		strings.HasPrefix(path, "/api/pty/") ||
 		strings.HasPrefix(path, "/api/shell/")
+}
+
+// purposeFromPath maps a WS upgrade URL path to a wsticket purpose.
+// Returns empty string when the path is not a known upgrade endpoint.
+func purposeFromPath(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/api/pty/"):
+		return wsticket.PurposePTY
+	case strings.HasPrefix(path, "/api/shell/"):
+		return wsticket.PurposeShell
+	case strings.HasPrefix(path, "/api/build/logs/"):
+		return wsticket.PurposeBuildLogs
+	default:
+		return ""
+	}
 }
 
 // mcpEndpointPolicy is an explicit allowlist. MCP never falls through to
@@ -180,6 +198,9 @@ type mcpEndpoint struct {
 	write      bool
 }
 
+// mcpAllowlist is intentionally narrow. High-risk writes (kill, delete, plugins,
+// modules push/upload, tunnel/socks mutate) are never MCP-accessible — even when
+// read-only mode is off. The sole write when read-only is disabled is POST /api/cmd.
 var mcpAllowlist = []mcpEndpoint{
 	{method: http.MethodGet, prefix: "/api/dashboard", write: false},
 	{method: http.MethodGet, prefix: "/api/clients", write: false},
@@ -196,21 +217,8 @@ var mcpAllowlist = []mcpEndpoint{
 	{method: http.MethodGet, prefix: "/api/modules", write: false},
 	{method: http.MethodGet, prefix: "/api/modules/pack/", write: false},
 	{method: http.MethodGet, prefix: "/api/resp", write: false},
+	// Sole MCP write capability (requires mcp_read_only=false).
 	{method: http.MethodPost, prefix: "/api/cmd", write: true},
-	{method: http.MethodPost, prefix: "/api/files/delete", write: true},
-	{method: http.MethodPost, prefix: "/api/files/upload", write: true},
-	{method: http.MethodPost, prefix: "/api/processes/kill", write: true},
-	{method: http.MethodPost, prefix: "/api/tunnel/start", write: true},
-	{method: http.MethodPost, prefix: "/api/tunnel/stop", write: true},
-	{method: http.MethodPost, prefix: "/api/tunnel/delete", write: true},
-	{method: http.MethodPost, prefix: "/api/socks/start", write: true},
-	{method: http.MethodPost, prefix: "/api/socks/stop", write: true},
-	{method: http.MethodPost, prefix: "/api/socks/delete", write: true},
-	{method: http.MethodPost, prefix: "/api/plugins/run", write: true},
-	{method: http.MethodPost, prefix: "/api/plugins/upload", write: true},
-	{method: http.MethodPost, prefix: "/api/modules/push", write: true},
-	{method: http.MethodPost, prefix: "/api/modules/query", write: true},
-	{method: http.MethodPost, prefix: "/api/modules/upload", write: true},
 }
 
 // mcpEndpointAllowed returns (allowed, writeRequested). Unknown endpoints are
@@ -231,7 +239,19 @@ func mcpEndpointAllowed(method, path string, readOnly bool) (bool, bool) {
 }
 
 func denyMCP(c *gin.Context, code string) {
+	metrics.IncMCPDeny()
 	log.Printf("[Security] MCP %s denied %s %s — %s", c.ClientIP(), c.Request.Method, c.Request.URL.Path, code)
+	store.SaveAuditLog(&model.AuditLog{
+		Principal: "mcp",
+		Username:  "mcp",
+		Role:      "mcp",
+		Method:    c.Request.Method,
+		Path:      c.Request.URL.Path,
+		ClientIP:  c.ClientIP(),
+		Status:    "denied",
+		ErrorCode: code,
+		Message:   "mcp policy denied",
+	})
 	c.JSON(http.StatusForbidden, gin.H{"error": "mcp policy denied", "error_code": code})
 	c.Abort()
 }
@@ -254,12 +274,92 @@ func currentPrincipal(c *gin.Context) (Principal, bool) {
 	return p, ok
 }
 
-func isAdminRole(role string) bool {
-	switch strings.ToLower(strings.TrimSpace(role)) {
-	case "admin", "administrator":
+// CurrentPrincipal returns the authenticated principal set by AuthMiddleware.
+func CurrentPrincipal(c *gin.Context) (Principal, bool) {
+	return currentPrincipal(c)
+}
+
+// normalizeRole lowercases and trims role strings for comparison.
+func normalizeRole(role string) string {
+	return strings.ToLower(strings.TrimSpace(role))
+}
+
+// IsAdminRole reports whether role is an administrator (including aliases).
+// Accepted: admin, administrator, break-glass-admin.
+func IsAdminRole(role string) bool {
+	switch normalizeRole(role) {
+	case "admin", "administrator", "break-glass-admin":
 		return true
 	default:
 		return false
+	}
+}
+
+// IsOperatorOrAbove is true for operator and all admin aliases.
+func IsOperatorOrAbove(role string) bool {
+	if IsAdminRole(role) {
+		return true
+	}
+	return normalizeRole(role) == "operator"
+}
+
+// IsViewerOrAbove is true for any recognized panel role (viewer, operator, admin*).
+// Unknown / empty roles fail closed.
+func IsViewerOrAbove(role string) bool {
+	if IsOperatorOrAbove(role) {
+		return true
+	}
+	return normalizeRole(role) == "viewer"
+}
+
+// RequireRole allows any of the listed roles (plus admin aliases when "admin" is listed).
+// MCP principals are always rejected — role gates apply to panel users only.
+func RequireRole(roles ...string) gin.HandlerFunc {
+	allowed := make(map[string]struct{}, len(roles))
+	wantAdmin := false
+	wantOperator := false
+	wantViewer := false
+	for _, r := range roles {
+		switch normalizeRole(r) {
+		case "admin", "administrator", "break-glass-admin":
+			wantAdmin = true
+		case "operator":
+			wantOperator = true
+		case "viewer":
+			wantViewer = true
+		default:
+			allowed[normalizeRole(r)] = struct{}{}
+		}
+	}
+	return func(c *gin.Context) {
+		principal, ok := currentPrincipal(c)
+		if !ok || principal.Kind != "user" {
+			metrics.IncRBACDeny()
+			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient role"})
+			c.Abort()
+			return
+		}
+		role := normalizeRole(principal.Role)
+		okRole := false
+		if wantAdmin && IsAdminRole(role) {
+			okRole = true
+		}
+		if wantOperator && IsOperatorOrAbove(role) {
+			okRole = true
+		}
+		if wantViewer && IsViewerOrAbove(role) {
+			okRole = true
+		}
+		if _, hit := allowed[role]; hit {
+			okRole = true
+		}
+		if !okRole {
+			metrics.IncRBACDeny()
+			c.JSON(http.StatusForbidden, gin.H{"error": "insufficient role"})
+			c.Abort()
+			return
+		}
+		c.Next()
 	}
 }
 
@@ -268,8 +368,51 @@ func isAdminRole(role string) bool {
 func RequireAdmin() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		principal, ok := currentPrincipal(c)
-		if !ok || principal.Kind != "user" || !isAdminRole(principal.Role) {
+		if !ok || principal.Kind != "user" || !IsAdminRole(principal.Role) {
+			metrics.IncRBACDeny()
 			c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// RequireOperator allows operator and admin panel users.
+// MCP principals are also admitted: AuthMiddleware's mcpAllowlist is the MCP
+// capability gate (high-risk operator writes are not allowlisted). This keeps
+// POST /api/cmd reachable for MCP when read-only is off.
+func RequireOperator() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := currentPrincipal(c)
+		if !ok {
+			metrics.IncRBACDeny()
+			c.JSON(http.StatusForbidden, gin.H{"error": "operator role required"})
+			c.Abort()
+			return
+		}
+		if principal.Kind == "mcp" {
+			c.Next()
+			return
+		}
+		if principal.Kind != "user" || !IsOperatorOrAbove(principal.Role) {
+			metrics.IncRBACDeny()
+			c.JSON(http.StatusForbidden, gin.H{"error": "operator role required"})
+			c.Abort()
+			return
+		}
+		c.Next()
+	}
+}
+
+// RequireViewer allows any authenticated panel user with a recognized role.
+// (Viewer routes normally rely on AuthMiddleware alone; this is an explicit gate.)
+func RequireViewer() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := currentPrincipal(c)
+		if !ok || principal.Kind != "user" || !IsViewerOrAbove(principal.Role) {
+			metrics.IncRBACDeny()
+			c.JSON(http.StatusForbidden, gin.H{"error": "viewer role required"})
 			c.Abort()
 			return
 		}
@@ -280,7 +423,13 @@ func RequireAdmin() gin.HandlerFunc {
 func AuthMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
-		if path == "/api/auth/login" || strings.HasPrefix(path, "/api/s/") || !strings.HasPrefix(path, "/api") {
+		// Public / unauthenticated: login, stager delivery (/api/s/* and /api/stage2/*),
+		// health probes (non-/api or explicit /api/healthz), and static UI.
+		if path == "/api/auth/login" ||
+			path == "/api/healthz" || path == "/api/readyz" ||
+			strings.HasPrefix(path, "/api/s/") ||
+			strings.HasPrefix(path, "/api/stage2/") ||
+			!strings.HasPrefix(path, "/api") {
 			c.Next()
 			return
 		}
@@ -298,49 +447,105 @@ func AuthMiddleware() gin.HandlerFunc {
 		if authHeader := c.GetHeader("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
 			token = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 		}
-		if token == "" && allowQueryToken(path) {
-			token = strings.TrimSpace(c.Query("token"))
-		}
-		if token == "" {
-			c.Status(http.StatusUnauthorized)
-			c.Abort()
-			return
-		}
 
-		policy := loadMCPPolicy(now)
-		if tokenEqual(token, policy.Token) {
-			if !policy.Enabled {
-				denyMCP(c, "mcp_disabled")
+		// Durable session (or MCP) bearer via Authorization header — existing path.
+		// WS upgrade paths intentionally do NOT fall through to session LookupSession
+		// for query ?token=; browsers mint a short-lived ?ticket= instead.
+		if token != "" {
+			policy := loadMCPPolicy(now)
+			if tokenEqual(token, policy.Token) {
+				if !policy.Enabled {
+					denyMCP(c, "mcp_disabled")
+					return
+				}
+				if !ipAllowed(clientIP, policy.CIDRs, false) {
+					metrics.IncMCPDeny()
+					log.Printf("[Security] MCP access denied for IP %s", clientIP)
+					store.SaveAuditLog(&model.AuditLog{
+						Principal: "mcp",
+						Username:  "mcp",
+						Role:      "mcp",
+						Method:    c.Request.Method,
+						Path:      path,
+						ClientIP:  clientIP,
+						Status:    "denied",
+						ErrorCode: "mcp_ip_denied",
+						Message:   "mcp IP not in allowlist",
+					})
+					c.Status(http.StatusForbidden)
+					c.Abort()
+					return
+				}
+				allowed, writeRequested := mcpEndpointAllowed(c.Request.Method, path, policy.ReadOnly)
+				if !allowed {
+					if writeRequested {
+						denyMCP(c, "mcp_read_only")
+					} else {
+						denyMCP(c, "mcp_endpoint_denied")
+					}
+					return
+				}
+				setPrincipal(c, Principal{Kind: "mcp", Username: "mcp", Role: "mcp"})
+				// Audit successful MCP auth (method/path); status filled after handler.
+				c.Next()
+				store.SaveAuditLog(&model.AuditLog{
+					Principal: "mcp",
+					Username:  "mcp",
+					Role:      "mcp",
+					Method:    c.Request.Method,
+					Path:      path,
+					ClientIP:  clientIP,
+					Status:    fmt.Sprintf("%d", c.Writer.Status()),
+					Message:   "mcp allowed",
+				})
 				return
 			}
-			if !ipAllowed(clientIP, policy.CIDRs, false) {
-				log.Printf("[Security] MCP access denied for IP %s", clientIP)
-				c.Status(http.StatusForbidden)
+
+			// Panel users: look up hashed session (User.Token is no longer used for auth).
+			sess, user, err := store.LookupSession(token)
+			if err != nil || user == nil || !user.IsActive {
+				log.Printf("[Security] invalid panel token from IP %s", clientIP)
+				c.Status(http.StatusUnauthorized)
 				c.Abort()
 				return
 			}
-			allowed, writeRequested := mcpEndpointAllowed(c.Request.Method, path, policy.ReadOnly)
-			if !allowed {
-				if writeRequested {
-					denyMCP(c, "mcp_read_only")
-				} else {
-					denyMCP(c, "mcp_endpoint_denied")
-				}
-				return
+			if sess != nil {
+				store.TouchSession(sess.ID)
 			}
-			setPrincipal(c, Principal{Kind: "mcp", Username: "mcp", Role: "mcp"})
+			setPrincipal(c, Principal{Kind: "user", Username: user.Username, Role: user.Role})
 			c.Next()
 			return
 		}
 
-		var user model.User
-		if err := store.DB.Where("token = ?", token).First(&user).Error; err != nil || !user.IsActive {
-			log.Printf("[Security] invalid panel token from IP %s", clientIP)
-			c.Status(http.StatusUnauthorized)
-			c.Abort()
+		// No Authorization header: only WS upgrade paths may authenticate via
+		// a short-lived, single-use ?ticket= (not durable ?token=).
+		if isWSUpgradePath(path) {
+			ticket := strings.TrimSpace(c.Query("ticket"))
+			if ticket == "" {
+				// Explicitly reject durable session via query (?token=) here.
+				c.Status(http.StatusUnauthorized)
+				c.Abort()
+				return
+			}
+			purpose := purposeFromPath(path)
+			if purpose == "" {
+				c.Status(http.StatusUnauthorized)
+				c.Abort()
+				return
+			}
+			_, username, role, err := wsticket.Redeem(ticket, purpose)
+			if err != nil {
+				log.Printf("[Security] invalid WS ticket from IP %s path=%s: %v", clientIP, path, err)
+				c.Status(http.StatusUnauthorized)
+				c.Abort()
+				return
+			}
+			setPrincipal(c, Principal{Kind: "user", Username: username, Role: role})
+			c.Next()
 			return
 		}
-		setPrincipal(c, Principal{Kind: "user", Username: user.Username, Role: user.Role})
-		c.Next()
+
+		c.Status(http.StatusUnauthorized)
+		c.Abort()
 	}
 }

@@ -1,14 +1,25 @@
 package services
 
 import (
-	"cupcake-server/pkg/globals"
-	"cupcake-server/pkg/utils"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/hashicorp/yamux"
 	"io"
 	"time"
+
+	"github.com/hashicorp/yamux"
+
+	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/utils"
 )
+
+// ErrAgentOffline is returned when the agent has no live session (Yamux or command channel).
+var ErrAgentOffline = errors.New("agent offline")
+
+// ErrYamuxRequired is returned when a product path requires a live TCP Yamux session
+// (large file put/get) and the agent is missing or closed.
+var ErrYamuxRequired = errors.New("TCP Yamux session required for file transfer")
 
 // Helper: GetAgentSession retrieves the Yamux session for a TCP agent
 func GetAgentSession(agentID string) (*yamux.Session, bool) {
@@ -17,10 +28,23 @@ func GetAgentSession(agentID string) (*yamux.Session, bool) {
 		return nil, false
 	}
 	client := val.(*globals.Client)
-	if client.YamuxSession == nil {
+	if client.YamuxSession == nil || client.YamuxSession.IsClosed() {
 		return nil, false
 	}
 	return client.YamuxSession, true
+}
+
+// requireAgentYamux returns a live Yamux session or a clear product error (no control-plane fallback).
+func requireAgentYamux(agentID string) (*yamux.Session, error) {
+	val, ok := globals.Clients.Load(agentID)
+	if !ok {
+		return nil, ErrAgentOffline
+	}
+	client := val.(*globals.Client)
+	if client.YamuxSession == nil || client.YamuxSession.IsClosed() {
+		return nil, ErrYamuxRequired
+	}
+	return client.YamuxSession, nil
 }
 
 type FsRequest struct {
@@ -81,7 +105,7 @@ func callFsAgent(agentID string, req FsRequest) (*FsResponse, error) {
 	// 与 websocket.go 单帧读超时 120s 对齐 — 大文件 / 慢链路下 15s 根本来不及传完。
 	// list/read 都走 Yamux FS 0x03 全量读整 JSON(含 base64 整文件),必须放宽。
 	stream.SetReadDeadline(time.Now().Add(120 * time.Second))
-	
+
 	data, err := io.ReadAll(stream)
 	if err != nil {
 		return nil, fmt.Errorf("read stream failed: %v", err)
@@ -102,7 +126,7 @@ func callFsAgent(agentID string, req FsRequest) (*FsResponse, error) {
 func callFsAgentFallback(agentID string, req FsRequest) (*FsResponse, error) {
 	val, ok := globals.Clients.Load(agentID)
 	if !ok {
-		return nil, fmt.Errorf("agent offline")
+		return nil, ErrAgentOffline
 	}
 	client := val.(*globals.Client)
 
@@ -134,7 +158,7 @@ func callFsAgentFallback(agentID string, req FsRequest) (*FsResponse, error) {
 			ReqID:       reqID,
 		},
 	}
-	
+
 	// If it's a multi-file delete, we pass them in Content
 	if req.Action == "rm" && len(req.Paths) > 0 {
 		pathsJson, _ := json.Marshal(req.Paths)
@@ -152,10 +176,10 @@ func callFsAgentFallback(agentID string, req FsRequest) (*FsResponse, error) {
 	select {
 	case res := <-resChan:
 		pMap := res.(map[string]interface{})
-		
+
 		var fsResp FsResponse
 		fsResp.Status = "ok"
-		
+
 		// Parse based on command type
 		if cmdType == "file_ls" {
 			if stdout, ok := pMap["stdout"].(string); ok {
@@ -169,7 +193,7 @@ func callFsAgentFallback(agentID string, req FsRequest) (*FsResponse, error) {
 				fsResp.Content = stdout // Base64
 			}
 		}
-		
+
 		if stderr, ok := pMap["stderr"].(string); ok && stderr != "" {
 			return nil, fmt.Errorf("%s", stderr)
 		}
@@ -180,65 +204,19 @@ func callFsAgentFallback(agentID string, req FsRequest) (*FsResponse, error) {
 	}
 }
 
-// DownloadChunk calls the file_download_chunk command on the Agent
-func DownloadChunk(agentID, path string, offset uint64, size int) (string, bool, error) {
-	val, ok := globals.Clients.Load(agentID)
-	if !ok {
-		return "", false, fmt.Errorf("agent offline")
-	}
-	client := val.(*globals.Client)
-
-	reqID := fmt.Sprintf("FSDC-%d", globals.GetNextReqID())
-	resChan := make(chan interface{}, 1)
-	globals.PendingResponses.Store(reqID, resChan)
-	defer globals.PendingResponses.Delete(reqID)
-
-	cmdContent, _ := json.Marshal(map[string]interface{}{
-		"offset": offset,
-		"size":   size,
-	})
-
-	msg := globals.MessageWrapper{
-		MsgType: "command",
-		Payload: globals.CommandPayload{
-			CommandType:    "file_download_chunk",
-			CommandContent: string(cmdContent),
-			Path:           path,
-			ReqID:          reqID,
-		},
-	}
-
-	if err := WriteEncryptedMessage(client, msg); err != nil {
-		return "", false, err
-	}
-
-	select {
-	case res := <-resChan:
-		pMap := res.(map[string]interface{})
-		if stderr, ok := pMap["stderr"].(string); ok && stderr != "" {
-			return "", false, fmt.Errorf("%s", stderr)
-		}
-		
-		if stdout, ok := pMap["stdout"].(string); ok {
-			var chunkResp struct {
-				Data  string `json:"data"`
-				IsEOF bool   `json:"is_eof"`
-			}
-			if err := json.Unmarshal([]byte(stdout), &chunkResp); err == nil {
-				return chunkResp.Data, chunkResp.IsEOF, nil
-			}
-		}
-		return "", false, fmt.Errorf("invalid response format")
-	case <-time.After(120 * time.Second):
-		return "", false, fmt.Errorf("agent chunk response timeout")
-	}
+// HasYamux reports whether the agent has a live Yamux session (FILE 0x0E capable).
+func HasYamux(agentID string) bool {
+	_, ok := GetAgentSession(agentID)
+	return ok
 }
 
-// UploadChunk calls the file_upload_chunk command on the Agent
+// UploadChunk sends one base64 chunk over the control-plane command channel.
+// Fallback path only: agents without a Yamux session (WebSocket / DNS) cannot
+// use the FILE (0x0E) binary stream, so the panel chunks the file here.
 func UploadChunk(agentID, path, dataBase64 string, isAppend bool) error {
 	val, ok := globals.Clients.Load(agentID)
 	if !ok {
-		return fmt.Errorf("agent offline")
+		return ErrAgentOffline
 	}
 	client := val.(*globals.Client)
 
@@ -266,9 +244,7 @@ func UploadChunk(agentID, path, dataBase64 string, isAppend bool) error {
 		return fmt.Errorf("send encrypted command: %w", err)
 	}
 
-	// 与 websocket.go 单帧读超时对齐，给 Yamux 拥塞和 agent 落盘 IO 留余量。
-	// 30s 过短，250 片里任一片尾部抖动即整体失败；120s 覆盖慢链路 + 高负载。
-	timeout := 120 * time.Second
+	// 与 websocket.go 单帧读超时对齐:慢链路 / 高负载下 512KiB 片可能超过 30s。
 	select {
 	case res := <-resChan:
 		pMap, ok := res.(map[string]interface{})
@@ -279,8 +255,222 @@ func UploadChunk(agentID, path, dataBase64 string, isAppend bool) error {
 			return fmt.Errorf("%s", stderr)
 		}
 		return nil
-	case <-time.After(timeout):
-		return fmt.Errorf("agent chunk response timeout after %s (req_id=%s path=%s append=%v b64_len=%d)",
-			timeout, reqID, path, isAppend, len(dataBase64))
+	case <-time.After(120 * time.Second):
+		return fmt.Errorf("agent chunk response timeout")
 	}
+}
+
+// DownloadChunk requests one base64 chunk (offset+size) over the control-plane
+// command channel. Returns the decoded chunk payload, isEOF flag and total size.
+// Fallback path only: agents without a Yamux session (WebSocket / DNS).
+func DownloadChunk(agentID, path string, offset uint64, size int) (data []byte, isEOF bool, total uint64, err error) {
+	val, ok := globals.Clients.Load(agentID)
+	if !ok {
+		return nil, false, 0, ErrAgentOffline
+	}
+	client := val.(*globals.Client)
+
+	reqID := fmt.Sprintf("FSDC-%d", globals.GetNextReqID())
+	resChan := make(chan interface{}, 1)
+	globals.PendingResponses.Store(reqID, resChan)
+	defer globals.PendingResponses.Delete(reqID)
+
+	cmdContent, _ := json.Marshal(map[string]interface{}{
+		"offset": offset,
+		"size":   size,
+	})
+
+	msg := globals.MessageWrapper{
+		MsgType: "command",
+		Payload: globals.CommandPayload{
+			CommandType:    "file_download_chunk",
+			CommandContent: string(cmdContent),
+			Path:           path,
+			ReqID:          reqID,
+		},
+	}
+
+	if err := WriteEncryptedMessage(client, msg); err != nil {
+		return nil, false, 0, fmt.Errorf("send encrypted command: %w", err)
+	}
+
+	select {
+	case res := <-resChan:
+		pMap, ok := res.(map[string]interface{})
+		if !ok {
+			return nil, false, 0, fmt.Errorf("invalid agent response type")
+		}
+		if stderr, ok := pMap["stderr"].(string); ok && stderr != "" {
+			return nil, false, 0, fmt.Errorf("%s", stderr)
+		}
+		stdout, _ := pMap["stdout"].(string)
+		var chunkResp struct {
+			Data  string `json:"data"`
+			IsEOF bool   `json:"is_eof"`
+			Total uint64 `json:"total,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(stdout), &chunkResp); err != nil {
+			return nil, false, 0, fmt.Errorf("invalid chunk response: %v", err)
+		}
+		raw, err := base64.StdEncoding.DecodeString(chunkResp.Data)
+		if err != nil {
+			return nil, false, 0, fmt.Errorf("bad base64 in chunk response: %v", err)
+		}
+		return raw, chunkResp.IsEOF, chunkResp.Total, nil
+	case <-time.After(120 * time.Second):
+		return nil, false, 0, fmt.Errorf("agent chunk response timeout")
+	}
+}
+
+// openFileStream opens a Yamux stream and writes the FILE (0x0E) type byte.
+func openFileStream(session *yamux.Session) (io.ReadWriteCloser, error) {
+	stream, err := session.Open()
+	if err != nil {
+		return nil, fmt.Errorf("yamux open: %w", err)
+	}
+	if _, err := stream.Write([]byte{utils.YamuxStreamFILE}); err != nil {
+		_ = stream.Close()
+		return nil, fmt.Errorf("write FILE stream type: %w", err)
+	}
+	// Large transfers: clear deadlines; HTTP admin server already has ReadTimeout 0.
+	_ = stream.SetReadDeadline(time.Time{})
+	_ = stream.SetWriteDeadline(time.Time{})
+	return stream, nil
+}
+
+// UploadViaYamux streams raw body from r to agent remotePath over Yamux FILE (0x0E) put.
+// No control-plane / base64 / file_upload_chunk fallback.
+// Returns bytes the agent reported written.
+func UploadViaYamux(agentID, remotePath string, r io.Reader) (written int64, err error) {
+	if remotePath == "" {
+		return 0, fmt.Errorf("empty remote path")
+	}
+	if r == nil {
+		return 0, fmt.Errorf("nil reader")
+	}
+	session, err := requireAgentYamux(agentID)
+	if err != nil {
+		return 0, err
+	}
+	stream, err := openFileStream(session)
+	if err != nil {
+		return 0, err
+	}
+	defer stream.Close()
+
+	if err := utils.WriteFileRequestHeader(stream, utils.FileOpPut, remotePath); err != nil {
+		return 0, fmt.Errorf("write put header: %w", err)
+	}
+
+	sent, err := utils.StreamFilePutBody(stream, r, utils.DefaultFileChunkSize)
+	if err != nil {
+		return sent, fmt.Errorf("put body: %w", err)
+	}
+
+	// Response may take a while after large write (agent flush / rename).
+	if sc, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = sc.SetReadDeadline(time.Now().Add(120 * time.Second))
+	}
+	resp, err := utils.ReadFilePutResponse(stream)
+	if err != nil {
+		return sent, fmt.Errorf("put response: %w", err)
+	}
+	if resp.Status != utils.FileStatusOK {
+		msg := resp.Message
+		if msg == "" {
+			msg = fmt.Sprintf("agent put status=%d", resp.Status)
+		}
+		return int64(resp.Written), fmt.Errorf("agent put failed: %s", msg)
+	}
+	return int64(resp.Written), nil
+}
+
+// fileGetBody closes the underlying Yamux stream when the body is done or closed.
+type fileGetBody struct {
+	r      io.Reader
+	stream io.Closer
+	closed bool
+}
+
+func (b *fileGetBody) Read(p []byte) (int, error) {
+	return b.r.Read(p)
+}
+
+func (b *fileGetBody) Close() error {
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+	return b.stream.Close()
+}
+
+// OpenDownloadViaYamux starts a Yamux FILE get and returns a body reader limited to
+// the agent-reported size. Caller must Close the body. Content-Length can use size
+// before streaming. No control-plane / file_download_chunk fallback.
+func OpenDownloadViaYamux(agentID, remotePath string) (body io.ReadCloser, size uint64, err error) {
+	if remotePath == "" {
+		return nil, 0, fmt.Errorf("empty remote path")
+	}
+	session, err := requireAgentYamux(agentID)
+	if err != nil {
+		return nil, 0, err
+	}
+	stream, err := openFileStream(session)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	if err := utils.WriteFileRequestHeader(stream, utils.FileOpGet, remotePath); err != nil {
+		_ = stream.Close()
+		return nil, 0, fmt.Errorf("write get header: %w", err)
+	}
+
+	if sc, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = sc.SetReadDeadline(time.Now().Add(60 * time.Second))
+	}
+	hdr, err := utils.ReadFileGetHeader(stream)
+	if err != nil {
+		_ = stream.Close()
+		return nil, 0, fmt.Errorf("get header: %w", err)
+	}
+	if hdr.Status != utils.FileStatusOK {
+		_ = stream.Close()
+		msg := hdr.Message
+		if msg == "" {
+			msg = fmt.Sprintf("agent get status=%d", hdr.Status)
+		}
+		return nil, 0, fmt.Errorf("agent get failed: %s", msg)
+	}
+
+	// Large body: clear deadline.
+	if sc, ok := stream.(interface{ SetReadDeadline(time.Time) error }); ok {
+		_ = sc.SetReadDeadline(time.Time{})
+	}
+	return &fileGetBody{
+		r:      io.LimitReader(stream, int64(hdr.Size)),
+		stream: stream,
+	}, hdr.Size, nil
+}
+
+// DownloadViaYamux streams agent remotePath to w over Yamux FILE (0x0E) get.
+// On success returns the file size from the agent header.
+// No control-plane / file_download_chunk fallback.
+func DownloadViaYamux(agentID, remotePath string, w io.Writer) (size uint64, err error) {
+	if w == nil {
+		return 0, fmt.Errorf("nil writer")
+	}
+	body, size, err := OpenDownloadViaYamux(agentID, remotePath)
+	if err != nil {
+		return 0, err
+	}
+	defer body.Close()
+
+	written, err := io.Copy(w, body)
+	if err != nil {
+		return size, fmt.Errorf("get body: %w", err)
+	}
+	if uint64(written) != size {
+		return size, fmt.Errorf("short body: got %d want %d", written, size)
+	}
+	return size, nil
 }

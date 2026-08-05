@@ -7,15 +7,17 @@
 //
 // Remote desktop = RDP port-forward on Yamux DESKTOP (0x0D); agent requires
 // L2 module "desktop" Loaded. General SOCKS tunnels remain 0x02.
+// Large binary file put/get uses Yamux FILE (0x0E); FS (0x03) remains list/metadata.
 package utils
 
 // Yamux stream type tags (first byte on a new multiplexed stream).
 const (
 	YamuxStreamPTY      byte = 0x01 // interactive PTY / hybrid shell
 	YamuxStreamSOCKS    byte = 0x02 // SOCKS / tunnel data plane
-	YamuxStreamFS       byte = 0x03 // file manager
+	YamuxStreamFS       byte = 0x03 // file manager (list / rm / small read)
 	YamuxStreamProcess  byte = 0x04 // process list / kill
 	YamuxStreamDesktop  byte = 0x0D // RDP port-forward (L2 desktop module)
+	YamuxStreamFILE     byte = 0x0E // binary file put/get data plane
 	YamuxStreamReserved byte = 0xFF // reject / future extension
 )
 
@@ -32,5 +34,6 @@ var YamuxStreamTypeTable = []YamuxStreamTypeEntry{
 	{Name: "FS", Value: YamuxStreamFS},
 	{Name: "PROCESS", Value: YamuxStreamProcess},
 	{Name: "DESKTOP", Value: YamuxStreamDesktop},
+	{Name: "FILE", Value: YamuxStreamFILE},
 	{Name: "RESERVED", Value: YamuxStreamReserved},
 }

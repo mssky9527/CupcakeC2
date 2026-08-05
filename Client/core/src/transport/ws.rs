@@ -69,8 +69,6 @@ impl WebSocketTransport {
 #[async_trait]
 impl Transport for WebSocketTransport {
     async fn connect(&mut self) -> Result<()> {
-        use tokio_tungstenite::tungstenite::http::Request;
-
         // Bounded retries so outer fallback / backoff can run (was infinite loop).
         const MAX_ATTEMPTS: u32 = 5;
         let mut attempts = 0u32;
@@ -96,10 +94,14 @@ impl Transport for WebSocketTransport {
                 crate::transport::profile::get_ja3_hint(&profile)
             );
 
-            // Build request then apply malleable profile via shared helper
-            let mut req = Request::builder()
-                .uri(&connect_url)
-                .body(())
+            // Build request then apply malleable profile via shared helper.
+            // IntoClientRequest generates the standard WS handshake headers
+            // (Sec-WebSocket-Key/Upgrade/Connection/Sec-WebSocket-Version),
+            // which tungstenite requires when a Request is passed to connect_async.
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let mut req = connect_url
+                .as_str()
+                .into_client_request()
                 .map_err(|e| ClientError::ConnectionError(e.to_string()))?;
 
             crate::transport::profile::apply_profile_headers(&profile, &mut req);

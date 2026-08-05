@@ -19,8 +19,14 @@ import (
 )
 
 const (
-	SourceDir    = "../Client"      // Relative to server/
+	SourceDir    = "../Client"     // Relative to server/
 	BuildBaseDir = "./temp_builds" // Sandbox root
+
+	// cargoAgentBinName must match Client/core/Cargo.toml [[bin]] name.
+	// (Renamed from package-default cupcake-core to avoid Windows PDB clash with lib cupcake_core.)
+	cargoAgentBinName = "cupcake-agent"
+	// Legacy name if an old workspace still emits the package-default bin.
+	cargoAgentBinLegacy = "cupcake-core"
 )
 
 // ArtifactDir / SharedTargetDir / isolatedCargoHome resolve under CUPCAKE_DATA_DIR.
@@ -321,47 +327,22 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 	}
 
 	args := []string{"build", "-p", "cupcake-core", "--release"}
-	target := ""
-	// Determine Cargo Target based on OS and Arch Matrix
-	if conf.OSType == "windows" {
-		if runtime.GOOS == "linux" {
-			if strings.Contains(conf.Arch, "amd64") {
-				target = "x86_64-pc-windows-gnu"
-			} else if strings.Contains(conf.Arch, "i386") {
-				target = "i686-pc-windows-gnu"
-			}
-		} else {
-			if strings.Contains(conf.Arch, "amd64") {
-				target = "x86_64-pc-windows-msvc"
-			} else if strings.Contains(conf.Arch, "i386") {
-				target = "i686-pc-windows-msvc"
-			}
-		}
-	} else if conf.OSType == "linux" {
-		if strings.Contains(conf.Arch, "arm64") {
-			target = "aarch64-unknown-linux-musl"
-		} else if strings.Contains(conf.Arch, "arm") && !strings.Contains(conf.Arch, "arm64") {
-			target = "armv7-unknown-linux-musleabihf"
-		} else if strings.Contains(conf.Arch, "i386") {
-			target = "i686-unknown-linux-musl"
-		} else {
-			target = "x86_64-unknown-linux-musl"
-		}
-	} else if conf.OSType == "darwin" {
-		if strings.Contains(conf.Arch, "amd64") {
-			target = "x86_64-apple-darwin"
-		} else if strings.Contains(conf.Arch, "arm64") {
-			target = "aarch64-apple-darwin"
-		}
-	}
 
-	// Sanitize OS and Arch to prevent path traversal
-	conf.OSType = filepath.Base(conf.OSType)
-	conf.Arch = filepath.Base(conf.Arch)
+	// Sanitize OS and Arch to prevent path traversal, then normalize arch aliases.
+	conf.OSType = filepath.Base(strings.TrimSpace(conf.OSType))
+	conf.Arch = filepath.Base(strings.TrimSpace(conf.Arch))
+	normArch := normalizeBuildArch(conf.Arch)
+	target := resolveCargoTarget(conf.OSType, normArch, runtime.GOOS)
+	cross := isCargoCrossCompile(conf.OSType, normArch, runtime.GOOS, runtime.GOARCH)
 
-	// Only append --target if cross-compiling
-	if target != "" && (runtime.GOOS != conf.OSType || runtime.GOARCH != strings.Replace(conf.Arch, conf.OSType+"_", "", 1)) {
+	// Only append --target when cross-compiling (native host uses default host triple).
+	if target != "" && cross {
 		args = append(args, "--target", target)
+		if logChan != nil {
+			logChan <- fmt.Sprintf("[Builder] cross-compile --target %s (os=%s arch=%s→%s)", target, conf.OSType, conf.Arch, normArch)
+		}
+	} else if logChan != nil {
+		logChan <- fmt.Sprintf("[Builder] host-native build (os=%s arch=%s→%s, cargo target empty/default)", conf.OSType, conf.Arch, normArch)
 	}
 
 	// Sole product cargo tier: always minimal (ignore legacy standard/full/beacon names).
@@ -428,19 +409,13 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 		}
 	}
 
-	binaryName := "cupcake-core"
-	if conf.OSType == "windows" { binaryName += ".exe" }
-
-	// 🔍 Find the built binary
-	var builtPath string
-	if target != "" && (runtime.GOOS != conf.OSType || runtime.GOARCH != strings.Replace(conf.Arch, conf.OSType+"_", "", 1)) {
-		builtPath = filepath.Join(absTargetDir, target, "release", binaryName)
-	} else {
-		builtPath = filepath.Join(absTargetDir, "release", binaryName)
+	// 🔍 Locate cargo [[bin]] artifact (cupcake-agent; legacy cupcake-core fallback).
+	builtPath, err := findCargoAgentBinary(absTargetDir, target, cross, conf.OSType == "windows")
+	if err != nil {
+		return "", err
 	}
-
-	if _, err := os.Stat(builtPath); err != nil {
-		return "", fmt.Errorf("binary not found at %s: ensure 'cupcake-core' package is correctly configured", builtPath)
+	if logChan != nil {
+		logChan <- fmt.Sprintf("[Builder] located agent binary: %s", builtPath)
 	}
 
 	ext := ""
@@ -474,6 +449,146 @@ func BuildAgentWithLogger(conf PayloadConfig, logChan chan<- string) (string, er
 func RunUPX(path string) error {
 	cmd := exec.Command("upx", "-9", "--force", path)
 	return cmd.Run()
+}
+
+// normalizeBuildArch maps UI/API arch aliases to Go-like tokens: amd64, 386, arm64, arm.
+// Accepts: x64, amd64, x86_64, windows_amd64, i386, x86, arm64, aarch64, arm, ...
+func normalizeBuildArch(arch string) string {
+	a := strings.ToLower(strings.TrimSpace(arch))
+	a = strings.ReplaceAll(a, "-", "_")
+	// Strip OS_ prefix if present (windows_amd64 → amd64).
+	for _, prefix := range []string{"windows_", "linux_", "darwin_", "macos_"} {
+		if strings.HasPrefix(a, prefix) {
+			a = strings.TrimPrefix(a, prefix)
+			break
+		}
+	}
+	if a == "" {
+		return "amd64"
+	}
+	// Order matters: x86_64 / amd64 / x64 before bare x86.
+	switch {
+	case a == "x64" || a == "amd64" || a == "x86_64" || a == "x86_64_v2" ||
+		strings.Contains(a, "amd64") || strings.Contains(a, "x86_64") || strings.Contains(a, "x64"):
+		return "amd64"
+	case a == "arm64" || a == "aarch64" || strings.Contains(a, "arm64") || strings.Contains(a, "aarch64"):
+		return "arm64"
+	case a == "x86" || a == "i386" || a == "i686" || a == "386" ||
+		strings.Contains(a, "i386") || strings.Contains(a, "i686") ||
+		(strings.Contains(a, "x86") && !strings.Contains(a, "x64") && !strings.Contains(a, "amd64")):
+		return "386"
+	case a == "arm" || a == "armv7" || (strings.Contains(a, "arm") && !strings.Contains(a, "arm64")):
+		return "arm"
+	default:
+		return a
+	}
+}
+
+// resolveCargoTarget picks a rustc target triple for the desired OS + normalized arch.
+// hostGOOS is used only to choose windows-gnu vs windows-msvc when building on Linux vs Windows.
+func resolveCargoTarget(osType, normArch, hostGOOS string) string {
+	osType = strings.ToLower(strings.TrimSpace(osType))
+	switch osType {
+	case "windows":
+		if hostGOOS == "linux" {
+			switch normArch {
+			case "amd64":
+				return "x86_64-pc-windows-gnu"
+			case "386":
+				return "i686-pc-windows-gnu"
+			default:
+				return "x86_64-pc-windows-gnu"
+			}
+		}
+		switch normArch {
+		case "amd64":
+			return "x86_64-pc-windows-msvc"
+		case "386":
+			return "i686-pc-windows-msvc"
+		default:
+			return "x86_64-pc-windows-msvc"
+		}
+	case "linux":
+		switch normArch {
+		case "arm64":
+			return "aarch64-unknown-linux-musl"
+		case "arm":
+			return "armv7-unknown-linux-musleabihf"
+		case "386":
+			return "i686-unknown-linux-musl"
+		default:
+			return "x86_64-unknown-linux-musl"
+		}
+	case "darwin", "macos":
+		switch normArch {
+		case "arm64":
+			return "aarch64-apple-darwin"
+		default:
+			return "x86_64-apple-darwin"
+		}
+	default:
+		return ""
+	}
+}
+
+// isCargoCrossCompile reports whether cargo needs an explicit --target.
+func isCargoCrossCompile(osType, normArch, hostGOOS, hostGOARCH string) bool {
+	osType = strings.ToLower(strings.TrimSpace(osType))
+	if osType == "macos" {
+		osType = "darwin"
+	}
+	if hostGOOS != osType {
+		return true
+	}
+	// Map host GOARCH to same vocabulary as normalizeBuildArch.
+	host := hostGOARCH
+	switch host {
+	case "amd64", "arm64", "arm", "386":
+		// ok
+	default:
+		host = normalizeBuildArch(host)
+	}
+	return host != normArch
+}
+
+// agentBinaryCandidates returns preferred then legacy cargo bin basenames (with optional .exe).
+func agentBinaryCandidates(windows bool) []string {
+	names := []string{cargoAgentBinName, cargoAgentBinLegacy}
+	if !windows {
+		return names
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, n+".exe")
+	}
+	return out
+}
+
+// findCargoAgentBinary locates the built Stage0 binary under CARGO_TARGET_DIR.
+// When cross is true, looks under target/<triple>/release; else target/release.
+// Tries cupcake-agent first, then legacy cupcake-core.
+func findCargoAgentBinary(absTargetDir, cargoTarget string, cross, windows bool) (string, error) {
+	var dirs []string
+	if cross && cargoTarget != "" {
+		dirs = append(dirs, filepath.Join(absTargetDir, cargoTarget, "release"))
+	}
+	// Always also try host-native path (covers mis-detected cross and default builds).
+	dirs = append(dirs, filepath.Join(absTargetDir, "release"))
+
+	var tried []string
+	for _, dir := range dirs {
+		for _, name := range agentBinaryCandidates(windows) {
+			p := filepath.Join(dir, name)
+			tried = append(tried, p)
+			if st, err := os.Stat(p); err == nil && !st.IsDir() {
+				return p, nil
+			}
+		}
+	}
+	return "", fmt.Errorf(
+		"binary not found (looked for %s / %s under release). tried: %s — ensure Client/core Cargo.toml [[bin]] name matches builder (%s)",
+		cargoAgentBinName, cargoAgentBinLegacy, strings.Join(tried, "; "), cargoAgentBinName,
+	)
 }
 
 // RebuildTemplates rebuilds all platform templates (always cargo **minimal**) into server/assets

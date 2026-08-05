@@ -1,8 +1,6 @@
 package services
 
 import (
-	"cupcake-server/pkg/globals"
-	"cupcake-server/pkg/store"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
@@ -16,6 +14,10 @@ import (
 	"sync"
 
 	"github.com/google/uuid"
+
+	"cupcake-server/pkg/globals"
+	"cupcake-server/pkg/store"
+	"cupcake-server/pkg/trustchain"
 )
 
 var (
@@ -123,16 +125,132 @@ func bytesContains(hay, needle []byte) bool {
 
 // PluginMetadata matches the manifest.json structure
 type PluginMetadata struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	Description string        `json:"description"`
-	FileName    string        `json:"file_name"`
-	Type        string        `json:"type"` // "execute-assembly", "native-exec", "powershell", "memfd-exec", etc.
-	Category    string        `json:"category"`
-	RequiredOS  string        `json:"required_os"`
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	FileName    string `json:"file_name"`
+	Type        string `json:"type"` // "execute-assembly", "native-exec", "powershell", "memfd-exec", etc.
+	Category    string `json:"category"`
+	RequiredOS  string `json:"required_os"`
 	// Hash is lowercase hex SHA-256 of the plugin file bytes (trust chain).
-	Hash   string        `json:"hash,omitempty"`
-	Params []interface{} `json:"params"`
+	Hash string `json:"hash,omitempty"`
+	// Cryptographic trust fields (HMAC package signature).
+	Version    string `json:"version,omitempty"`
+	Signature  string `json:"signature,omitempty"`
+	Signer     string `json:"signer,omitempty"`
+	ABIVersion int    `json:"abi_version,omitempty"`
+	Target     string `json:"target,omitempty"`
+	Params     []interface{} `json:"params"`
+}
+
+// pluginRollback is process-wide anti-rollback for signed plugins.
+var pluginRollback = trustchain.NewRollbackGuard()
+
+// GetTrustKey resolves the HMAC key for a signer (see trustchain.HMACKeyForSigner).
+func GetTrustKey(signer string) []byte {
+	return trustchain.HMACKeyForSigner(signer)
+}
+
+func allowUnsignedPlugin() bool {
+	return os.Getenv("CUPCAKE_ALLOW_UNSIGNED_PLUGIN") == "1" ||
+		os.Getenv("CUPCAKE_TRUST_REQUIRE_SIG") == "0"
+}
+
+// VerifyPluginTrust runs hash integrity then package signature + anti-rollback.
+//
+//  1. VerifyPluginHash
+//  2. Empty Signature → error unless CUPCAKE_ALLOW_UNSIGNED_PLUGIN=1 or CUPCAKE_TRUST_REQUIRE_SIG=0
+//  3. trustchain.Verify with GetTrustKey(signer)
+//  4. RollbackGuard CheckAndCommit(plugin id, version)
+//
+// Signed packages require a non-empty Version.
+func VerifyPluginTrust(meta *PluginMetadata, fileBytes []byte) error {
+	if meta == nil {
+		return fmt.Errorf("nil plugin metadata")
+	}
+	if err := VerifyPluginHash(meta, fileBytes); err != nil {
+		return err
+	}
+	sig := strings.TrimSpace(meta.Signature)
+	if sig == "" {
+		if allowUnsignedPlugin() {
+			log.Printf("[plugin] warning: unsigned plugin allowed via env for %s", meta.ID)
+			return nil
+		}
+		return fmt.Errorf("plugin signature missing: refuse deploy (set CUPCAKE_ALLOW_UNSIGNED_PLUGIN=1 or CUPCAKE_TRUST_REQUIRE_SIG=0 for lab)")
+	}
+	ver := strings.TrimSpace(meta.Version)
+	if ver == "" {
+		return fmt.Errorf("plugin version missing: signed packages require version (refuse empty)")
+	}
+	// Prefer on-disk hash (already matched) for the signed payload field.
+	sha := strings.ToLower(strings.TrimSpace(meta.Hash))
+	if sha == "" {
+		sha = PluginFileSHA256(fileBytes)
+	}
+	signer := strings.TrimSpace(meta.Signer)
+	if signer == "" {
+		signer = "default"
+	}
+	pm := trustchain.PackageMeta{
+		ModuleID:   meta.ID,
+		Version:    ver,
+		SHA256:     sha,
+		Target:     meta.Target,
+		ABIVersion: meta.ABIVersion,
+		Signer:     signer,
+		Signature:  sig,
+	}
+	key := GetTrustKey(signer)
+	if err := trustchain.Verify(pm, key); err != nil {
+		return fmt.Errorf("plugin signature verify failed: %w", err)
+	}
+	if err := pluginRollback.CheckAndCommit(meta.ID, ver); err != nil {
+		return err
+	}
+	return nil
+}
+
+// SignPluginMetadata fills Signature (and default Signer) when a trust key is available.
+// No-op when no key is configured. Returns error only if Sign itself fails with a key present.
+func SignPluginMetadata(meta *PluginMetadata, fileBytes []byte) error {
+	if meta == nil {
+		return fmt.Errorf("nil plugin metadata")
+	}
+	if strings.TrimSpace(meta.Hash) == "" && len(fileBytes) > 0 {
+		meta.Hash = PluginFileSHA256(fileBytes)
+	}
+	signer := strings.TrimSpace(meta.Signer)
+	if signer == "" {
+		signer = "default"
+	}
+	key := GetTrustKey(signer)
+	if len(key) == 0 {
+		return nil
+	}
+	meta.Signer = signer
+	if strings.TrimSpace(meta.Version) == "" {
+		meta.Version = "0.0.1"
+	}
+	pm := trustchain.PackageMeta{
+		ModuleID:   meta.ID,
+		Version:    meta.Version,
+		SHA256:     strings.ToLower(strings.TrimSpace(meta.Hash)),
+		Target:     meta.Target,
+		ABIVersion: meta.ABIVersion,
+		Signer:     signer,
+	}
+	sig, err := trustchain.Sign(pm, key)
+	if err != nil {
+		return err
+	}
+	meta.Signature = sig
+	return nil
+}
+
+// ResetPluginRollbackForTest clears anti-rollback state (unit tests only).
+func ResetPluginRollbackForTest() {
+	pluginRollback.Reset()
 }
 
 // PluginFileSHA256 returns lowercase hex SHA-256 of data.
@@ -141,16 +259,20 @@ func PluginFileSHA256(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// VerifyPluginHash checks that fileBytes match the manifest Hash when set.
-// Empty Hash is accepted for legacy plugins (no fail-open on new uploads).
+// VerifyPluginHash checks that fileBytes match the manifest Hash.
+// Fail-closed: empty Hash is rejected unless CUPCAKE_ALLOW_LEGACY_PLUGIN_HASH=1
+// is set (lab / migration only). Production deploys must pin SHA-256 digests.
 func VerifyPluginHash(meta *PluginMetadata, fileBytes []byte) error {
 	if meta == nil {
 		return fmt.Errorf("nil plugin metadata")
 	}
 	want := strings.ToLower(strings.TrimSpace(meta.Hash))
 	if want == "" {
-		// Legacy entry without hash — allow but log; new uploads always set Hash.
-		return nil
+		if os.Getenv("CUPCAKE_ALLOW_LEGACY_PLUGIN_HASH") == "1" {
+			log.Printf("[plugin] warning: empty hash allowed via CUPCAKE_ALLOW_LEGACY_PLUGIN_HASH for %s", meta.ID)
+			return nil
+		}
+		return fmt.Errorf("plugin hash missing: refuse deploy without SHA-256 (set CUPCAKE_ALLOW_LEGACY_PLUGIN_HASH=1 only for legacy lab migration)")
 	}
 	got := PluginFileSHA256(fileBytes)
 	if got != want {
@@ -233,8 +355,8 @@ func DeployPlugin(agentID string, pluginID string, args string) (string, error) 
 		manifestMutex.Unlock()
 	}
 
-	// Trust chain: refuse deploy when on-disk/cache bytes diverge from manifest hash.
-	if err := VerifyPluginHash(meta, binData); err != nil {
+	// Trust chain: hash integrity + HMAC signature + anti-rollback.
+	if err := VerifyPluginTrust(meta, binData); err != nil {
 		// Drop poisoned cache entry
 		manifestMutex.Lock()
 		delete(pluginCache, pluginID)

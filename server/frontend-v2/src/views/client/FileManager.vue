@@ -223,10 +223,33 @@ const processUpload = async (event) => {
     transferStatus.value = ''
     transferVisible.value = true
 
-    await uploadFile(formData, (progressEvent) => {
-      transferProgress.value = Math.round((progressEvent.loaded * 100) / progressEvent.total)
-    })
+    // Browser→C2 body progress only goes to ~100% of HTTP upload; agent still
+    // receives many file_upload_chunk commands after that (looks like "卡在 98%").
+    // Cap network phase at 90%, then pulse 90–99% while waiting for server/agent.
+    let networkDone = false
+    const waitPulse = setInterval(() => {
+      if (!networkDone) return
+      if (transferProgress.value < 99) {
+        transferProgress.value = Math.min(99, transferProgress.value + 1)
+      }
+    }, 400)
 
+    try {
+      await uploadFile(formData, (progressEvent) => {
+        if (!progressEvent.total) return
+        const pct = Math.round((progressEvent.loaded * 100) / progressEvent.total)
+        // Reserve last 10% for C2→agent chunking + disk commit
+        transferProgress.value = Math.min(90, Math.round(pct * 0.9))
+        if (progressEvent.loaded >= progressEvent.total) {
+          networkDone = true
+          transferTitle.value = '上传: ' + file.name + '（目标机写入中…）'
+        }
+      })
+    } finally {
+      clearInterval(waitPulse)
+    }
+
+    transferProgress.value = 100
     transferStatus.value = 'success'
     setTimeout(() => {
       transferVisible.value = false
@@ -236,11 +259,21 @@ const processUpload = async (event) => {
   } catch (e) {
     transferStatus.value = 'exception'
     setTimeout(() => { transferVisible.value = false }, 1500)
-    const detail =
+    let detail =
       e?.response?.data?.error ||
       e?.response?.data?.msg ||
       e?.message ||
       '未知错误'
+    // Axios "Network Error" / no response: often server closed the long upload
+    // (old ReadTimeout) or agent Migrating mid-stream — not a random browser glitch.
+    if (!e?.response && /network error/i.test(String(detail))) {
+      detail =
+        'Network Error（连接被中断）。常见原因：① C2 请求超时已切断 ② Agent 重连/Migrating ③ 浏览器/代理断开。请看 C2 日志 [upload] 进度，并确认目标机只运行一个 Agent。'
+    }
+    const bytesHint = e?.response?.data?.bytes_sent
+    if (bytesHint != null) {
+      detail += ` (已转发约 ${bytesHint} 字节)`
+    }
     ElMessage.error('上传失败: ' + detail)
     console.error('[FileManager] upload failed', e)
   } finally {

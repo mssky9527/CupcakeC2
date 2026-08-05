@@ -101,6 +101,7 @@ fn yamux_stream_type_constants_match_design_table() {
     assert_eq!(YAMUX_STREAM_FS, 0x03);
     assert_eq!(YAMUX_STREAM_PROCESS, 0x04);
     assert_eq!(YAMUX_STREAM_DESKTOP, 0x0D);
+    assert_eq!(YAMUX_STREAM_FILE, 0x0E);
     assert_eq!(YAMUX_STREAM_RESERVED, 0xFF);
 }
 

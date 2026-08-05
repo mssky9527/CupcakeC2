@@ -57,7 +57,21 @@ func HandleUploadModule(c *gin.Context) {
 	}
 	defer os.Remove(tmp)
 	ms := services.GetModuleService()
-	if err := ms.LoadFromFile(id, tmp); err != nil {
+	raw, err := os.ReadFile(tmp)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	version := strings.TrimSpace(c.PostForm("version"))
+	signer := strings.TrimSpace(c.PostForm("signer"))
+	trust := services.ModulePackageMeta{
+		ID:      id,
+		Version: version,
+		Signer:  signer,
+	}
+	// Always auto-sign + persist {id}.trust.json next to the binary.
+	signed, err := ms.RegisterRawWithTrust(id, raw, trust)
+	if err != nil {
 		if errors.Is(err, services.ErrModuleForbidden) {
 			c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 			return
@@ -67,11 +81,17 @@ func HandleUploadModule(c *gin.Context) {
 	}
 	name, desc, kind := services.ModuleDescribe(id)
 	c.JSON(http.StatusOK, gin.H{
-		"msg":         "module registered",
+		"msg":         "module registered and signed",
 		"id":          id,
 		"name":        name,
 		"description": desc,
 		"kind":        kind,
+		"sha256":      signed.SHA256,
+		"version":     signed.Version,
+		"signer":      signed.Signer,
+		"signature":   signed.Signature,
+		"signed":      signed.Signature != "",
+		"trust_file":  id + ".trust.json",
 	})
 }
 

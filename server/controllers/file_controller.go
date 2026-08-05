@@ -2,16 +2,50 @@ package controllers
 
 import (
 	"encoding/base64"
+	"errors"
+	"fmt"
 	"io"
+	"log"
 	"mime/multipart"
 	"net/http"
-	"strconv"
+	"strings"
 
 	"cupcake-server/pkg/globals"
 	"cupcake-server/services"
 
 	"github.com/gin-gonic/gin"
 )
+
+func isAgentOfflineMsg(msg string) bool {
+	m := strings.ToLower(strings.TrimSpace(msg))
+	return m == "offline" || m == "agent offline" || strings.Contains(m, "agent offline")
+}
+
+func writeAgentFSError(c *gin.Context, err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, services.ErrAgentOffline) || isAgentOfflineMsg(err.Error()) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "agent offline", "code": "offline"})
+		return
+	}
+	if errors.Is(err, services.ErrYamuxRequired) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": "TCP Yamux session required for file transfer (no control-plane chunk fallback)",
+			"code":  "yamux_required",
+		})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+}
+
+func writeAgentFSResponseError(c *gin.Context, msg string) {
+	if isAgentOfflineMsg(msg) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "agent offline", "code": "offline"})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": msg})
+}
 
 func ReadFileController(c *gin.Context) {
 	uuid := c.Query("uuid")
@@ -23,16 +57,12 @@ func ReadFileController(c *gin.Context) {
 
 	resp, err := services.ReadFile(uuid, path)
 	if err != nil {
-		if err.Error() == "offline" {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Agent offline"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		}
+		writeAgentFSError(c, err)
 		return
 	}
 
 	if resp.Status == "error" {
-		c.JSON(500, gin.H{"error": resp.Error})
+		writeAgentFSResponseError(c, resp.Error)
 		return
 	}
 
@@ -58,16 +88,12 @@ func DeleteFilesController(c *gin.Context) {
 
 	resp, err := services.DeleteFiles(req.UUID, req.Paths)
 	if err != nil {
-		if err.Error() == "offline" {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Agent offline"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		}
+		writeAgentFSError(c, err)
 		return
 	}
 
 	if resp.Status == "error" {
-		c.JSON(500, gin.H{"error": resp.Error})
+		writeAgentFSResponseError(c, resp.Error)
 		return
 	}
 
@@ -112,16 +138,12 @@ func ListFilesController(c *gin.Context) {
 
 	resp, err := services.GetFileList(uuid, path)
 	if err != nil {
-		if err.Error() == "offline" {
-			c.JSON(http.StatusNotFound, gin.H{"error": "Agent offline"})
-		} else {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		}
+		writeAgentFSError(c, err)
 		return
 	}
 
 	if resp.Status == "error" {
-		c.JSON(500, gin.H{"error": resp.Error})
+		writeAgentFSResponseError(c, resp.Error)
 		return
 	}
 
@@ -129,9 +151,8 @@ func ListFilesController(c *gin.Context) {
 }
 
 func Upload(c *gin.Context) {
-	// 真流式:用 c.Request.MultipartReader() 边从浏览器收边切片发 agent,
-	// 避免 c.FormFile 必须先收完整个 multipart body 才返回的阻塞(慢链路下前端 timeout 先断)。
-	// 也不落临时盘,512KiB raw → 683KiB base64 一片一路发 agent。
+	// True streaming: MultipartReader pipes the file part over Yamux FILE (0x0E).
+	// No FormFile full-buffer, no temp disk, no control-plane file_upload_chunk / base64.
 	reader, err := c.Request.MultipartReader()
 	if err != nil {
 		c.JSON(400, gin.H{"error": "multipart read: " + err.Error()})
@@ -161,7 +182,7 @@ func Upload(c *gin.Context) {
 			targetPath = string(b)
 		case "file":
 			filePart = part
-			// file 字段通常是最后一个,留住句柄立即切片走,不等后续 part
+			// file field is usually last; keep handle and stream immediately
 			goto fileFound
 		}
 	}
@@ -181,11 +202,52 @@ fileFound:
 	}
 
 	if _, ok := globals.Clients.Load(uuid); !ok {
-		c.JSON(404, gin.H{"error": "Agent Offline"})
+		c.JSON(404, gin.H{"error": "Agent Offline", "code": "offline"})
 		return
 	}
 
-	// 512 KiB raw chunks → ~683 KiB base64 — safer for encrypt/obfuscate frames than 2 MiB.
+	log.Printf("[upload] start yamux-FILE agent=%s path=%s", uuid, targetPath)
+
+	written, errUp := services.UploadViaYamux(uuid, targetPath, filePart)
+	if errUp != nil {
+		if errors.Is(errUp, services.ErrYamuxRequired) {
+			// ⚡ FALLBACK: WebSocket / DNS agents have no Yamux session — stream the
+			// multipart body over the control-plane command channel (base64 chunks).
+			log.Printf("[upload] yamux unavailable for agent=%s, using control-plane chunk fallback path=%s", uuid, targetPath)
+			written, errUp = uploadViaControlPlane(uuid, targetPath, filePart)
+		}
+		if errUp != nil {
+			log.Printf("[upload] FAIL agent=%s path=%s: %v", uuid, targetPath, errUp)
+			if errors.Is(errUp, services.ErrAgentOffline) || isAgentOfflineMsg(errUp.Error()) {
+				c.JSON(http.StatusNotFound, gin.H{"error": "agent offline", "code": "offline", "path": targetPath})
+				return
+			}
+			if errors.Is(errUp, services.ErrYamuxRequired) {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error": "TCP Yamux session required for file upload (no control-plane chunk fallback)",
+					"code":  "yamux_required",
+					"path":  targetPath,
+				})
+				return
+			}
+			c.JSON(500, gin.H{
+				"error":      "Agent upload failed: " + errUp.Error(),
+				"bytes_sent": written,
+				"path":       targetPath,
+			})
+			return
+		}
+	}
+
+	log.Printf("[upload] OK agent=%s path=%s bytes=%d", uuid, targetPath, written)
+	c.JSON(200, gin.H{"status": "upload_success", "bytes": written, "path": targetPath})
+}
+
+// uploadViaControlPlane streams a multipart file part to the agent as base64
+// chunks over the command channel (WS/DNS fallback; no Yamux session needed).
+// is_append=false on the first chunk, true afterwards.
+func uploadViaControlPlane(uuid, targetPath string, filePart *multipart.Part) (int64, error) {
+	// 512 KiB raw → ~683 KiB base64 — safe for encrypt/obfuscate frames.
 	const chunkSize = 512 * 1024
 	buffer := make([]byte, chunkSize)
 	isAppend := false
@@ -196,27 +258,17 @@ fileFound:
 		if n > 0 {
 			b64Data := base64.StdEncoding.EncodeToString(buffer[:n])
 			if errSend := services.UploadChunk(uuid, targetPath, b64Data, isAppend); errSend != nil {
-				c.JSON(500, gin.H{
-					"error": "Agent upload failed at offset " + strconv.FormatInt(total, 10) + ": " + errSend.Error(),
-				})
-				return
+				return total, fmt.Errorf("agent upload failed at offset %d: %w", total, errSend)
 			}
 			total += int64(n)
 			isAppend = true
 		}
-
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
-			c.JSON(500, gin.H{"error": "Read stream error: " + readErr.Error()})
-			return
+			return total, fmt.Errorf("read stream error: %w", readErr)
 		}
 	}
-
-	c.JSON(200, gin.H{"status": "upload_success", "bytes": total, "path": targetPath})
-}
-
-func formatInt64(n int64) string {
-	return strconv.FormatInt(n, 10)
+	return total, nil
 }

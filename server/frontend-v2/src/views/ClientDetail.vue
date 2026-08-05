@@ -139,11 +139,21 @@ const handleReturnToList = () => {
   router.push('/clients')
 }
 
-const initSocket = () => {
+const initSocket = async () => {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   const host = window.location.host
-  const token = localStorage.getItem('cupcake_token')
-  const wsUrl = `${protocol}//${host}/api/shell/${clientId.value}?token=${encodeURIComponent(token)}`
+  let ticket = ''
+  try {
+    const res = await api.post('/api/auth/ws-ticket', { purpose: 'shell' })
+    ticket = res?.data?.ticket || ''
+  } catch (_) {
+    ticket = ''
+  }
+  if (!ticket) {
+    ElMessage.error('无法获取 shell WebSocket 升级票据，请重新登录')
+    return
+  }
+  const wsUrl = `${protocol}//${host}/api/shell/${clientId.value}?ticket=${encodeURIComponent(ticket)}`
 
   socket.value = new WebSocket(wsUrl)
 
